@@ -9,7 +9,7 @@ import (
 	"github.com/zhixiongdu/olricstack/internal/store"
 )
 
-func TestSetWritesWALBeforeOlricAndFlushableMySQLRecord(t *testing.T) {
+func TestSetDelegatesToOlricWithoutIngressBackingWrite(t *testing.T) {
 	backing := newRecordingStore()
 	dmap := newFakeDMap()
 	service := newTestService(t, newFakeProvider(dmap), backing)
@@ -17,36 +17,32 @@ func TestSetWritesWALBeforeOlricAndFlushableMySQLRecord(t *testing.T) {
 	if err := service.Set(context.Background(), "users", "alice", "A", time.Minute); err != nil {
 		t.Fatalf("set: %v", err)
 	}
-	if len(backing.calls) != 1 || backing.calls[0] != "store" {
-		t.Fatalf("expected backing store before olric set, got %v", backing.calls)
-	}
-	record := backing.records[HKey("users", "alice")]
-	if record.DMap != "users" || record.Key != "alice" || string(record.EncodedEntry) != "A" {
-		t.Fatalf("unexpected record: %#v", record)
-	}
-	if record.Origin != "client_set" || !record.FlushMySQL {
-		t.Fatalf("expected client_set flushable record, got %#v", record)
+	if len(backing.calls) != 0 {
+		t.Fatalf("ingress service must not write backing store, got %v", backing.calls)
 	}
 	if got := dmap.values["alice"]; got != "A" {
 		t.Fatalf("expected olric value A, got %q", got)
 	}
 }
 
-func TestSetDoesNotApplyOlricWhenWALFails(t *testing.T) {
+func TestSetIgnoresIngressBackingFailure(t *testing.T) {
 	backing := newRecordingStore()
 	backing.storeErr = errors.New("wal failed")
 	dmap := newFakeDMap()
 	service := newTestService(t, newFakeProvider(dmap), backing)
 
-	if err := service.Set(context.Background(), "users", "alice", "A", 0); !errors.Is(err, backing.storeErr) {
-		t.Fatalf("expected wal error, got %v", err)
+	if err := service.Set(context.Background(), "users", "alice", "A", 0); err != nil {
+		t.Fatalf("set: %v", err)
 	}
-	if got := dmap.values["alice"]; got != "" {
-		t.Fatalf("olric should not be updated after wal failure, got %q", got)
+	if got := dmap.values["alice"]; got != "A" {
+		t.Fatalf("expected olric write to proceed through owner path, got %q", got)
+	}
+	if len(backing.calls) != 0 {
+		t.Fatalf("ingress service must not touch backing store, got %v", backing.calls)
 	}
 }
 
-func TestDeleteWritesTombstoneEvenWhenOlricMisses(t *testing.T) {
+func TestDeleteDelegatesToOlricWithoutIngressTombstone(t *testing.T) {
 	backing := newRecordingStore()
 	dmap := newFakeDMap()
 	service := newTestService(t, newFakeProvider(dmap), backing)
@@ -54,47 +50,26 @@ func TestDeleteWritesTombstoneEvenWhenOlricMisses(t *testing.T) {
 	if err := service.Delete(context.Background(), "users", "missing"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	record := backing.records[HKey("users", "missing")]
-	if !record.Tombstone || record.DMap != "users" || record.Key != "missing" {
-		t.Fatalf("expected tombstone record, got %#v", record)
-	}
-	if len(backing.calls) != 1 || backing.calls[0] != "delete" {
-		t.Fatalf("expected backing delete, got %v", backing.calls)
+	if len(backing.calls) != 0 {
+		t.Fatalf("ingress service must not write tombstone, got %v", backing.calls)
 	}
 }
 
-func TestGetRefillsFromBackingOnOlricMiss(t *testing.T) {
+func TestGetDoesNotIngressRefillOnOlricMiss(t *testing.T) {
 	backing := newRecordingStore()
-	backing.records[HKey("users", "alice")] = store.EntryRecord{
-		DMap:         "users",
-		Key:          "alice",
-		HKey:         HKey("users", "alice"),
-		EncodedEntry: []byte("A"),
-		TTL:          time.Now().Add(time.Minute).UnixMilli(),
-	}
 	dmap := newFakeDMap()
 	service := newTestService(t, newFakeProvider(dmap), backing)
 
-	value, err := service.Get(context.Background(), "users", "alice")
-	if err != nil {
-		t.Fatalf("get: %v", err)
+	_, err := service.Get(context.Background(), "users", "alice")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected olric miss without ingress refill, got %v", err)
 	}
-	if value != "A" {
-		t.Fatalf("expected A, got %q", value)
-	}
-	if got := dmap.values["alice"]; got != "A" {
-		t.Fatalf("expected olric refill A, got %q", got)
-	}
-	if len(backing.calls) != 2 || backing.calls[0] != "load" || backing.calls[1] != "store" {
-		t.Fatalf("expected backing load then local refill store, got %v", backing.calls)
-	}
-	record := backing.records[HKey("users", "alice")]
-	if record.Origin != "mysql_refill" || record.FlushMySQL {
-		t.Fatalf("expected local-only mysql_refill record, got %#v", record)
+	if len(backing.calls) != 0 {
+		t.Fatalf("ingress service must not load backing store, got %v", backing.calls)
 	}
 }
 
-func TestExpirePersistsTTLBeforeOlricExpire(t *testing.T) {
+func TestExpireDelegatesToOlricWithoutIngressBackingWrite(t *testing.T) {
 	backing := newRecordingStore()
 	dmap := newFakeDMap()
 	dmap.values["alice"] = "A"
@@ -103,12 +78,11 @@ func TestExpirePersistsTTLBeforeOlricExpire(t *testing.T) {
 	if err := service.Expire(context.Background(), "users", "alice", time.Minute); err != nil {
 		t.Fatalf("expire: %v", err)
 	}
-	record := backing.records[HKey("users", "alice")]
-	if string(record.EncodedEntry) != "A" || record.TTL == 0 || record.Origin != "client_expire" || !record.FlushMySQL {
-		t.Fatalf("unexpected ttl record: %#v", record)
-	}
 	if dmap.ttls["alice"] != time.Minute {
 		t.Fatalf("expected olric ttl update, got %s", dmap.ttls["alice"])
+	}
+	if len(backing.calls) != 0 {
+		t.Fatalf("ingress service must not write ttl backing record, got %v", backing.calls)
 	}
 }
 
@@ -241,7 +215,7 @@ type testService struct {
 func newTestService(t *testing.T, provider DMapProvider, backing store.CacheStore) *testService {
 	t.Helper()
 	lease := &fakeLease{allowed: true}
-	service, err := NewService(provider, backing, lease)
+	service, err := NewService(provider, lease)
 	if err != nil {
 		t.Fatalf("new service: %v", err)
 	}

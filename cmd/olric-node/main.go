@@ -63,7 +63,7 @@ func main() {
 		if err != nil {
 			log.Fatalf("create string kv olric provider: %v", err)
 		}
-		if _, err := stringkv.NewService(provider, leaseGatedStore, topologyLease); err != nil {
+		if _, err := stringkv.NewService(provider, topologyLease); err != nil {
 			log.Fatalf("create string kv service: %v", err)
 		}
 		log.Printf("durable string kv service initialized; external API binding is pending")
@@ -212,6 +212,13 @@ func startOlric(ctx context.Context, cacheStore store.CacheStore) (*olric.Olric,
 	cfg.LogVerbosity = int32(envInt("OLRIC_LOG_VERBOSITY", 3))
 	cfg.DMaps.Engine = olricconfig.NewEngine()
 	cfg.DMaps.Engine.Implementation = olricstore.New(cacheStore)
+	if cacheStore != nil {
+		hook, err := stringkv.NewDurableHook(cacheStore)
+		if err != nil {
+			return nil, err
+		}
+		cfg.DurableHook = hook
+	}
 
 	started := make(chan struct{})
 	cfg.Started = func() {
