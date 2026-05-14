@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -22,26 +23,52 @@ var (
 )
 
 type CacheStore interface {
-	Load(ctx context.Context, key string) ([]byte, error)
-	Store(ctx context.Context, key string, value []byte) error
+	LoadEntry(ctx context.Context, ref EntryRef) (EntryRecord, error)
+	StoreEntry(ctx context.Context, record EntryRecord) error
+	DeleteEntry(ctx context.Context, ref EntryRef) error
 	Close(ctx context.Context) error
 }
 
-type VersionedCacheStore interface {
-	CacheStore
-	StoreVersioned(ctx context.Context, key string, value []byte, version int64) error
+type Starter interface {
+	Start(ctx context.Context) error
 }
 
-type Record struct {
-	Key       string `gorm:"primaryKey;size:512;column:key"`
-	Value     []byte `gorm:"column:value;type:longblob;not null"`
-	Version   int64  `gorm:"column:version;not null;index:idx_cache_version_writer"`
-	WriterID  string `gorm:"column:writer_id;size:128;not null;index:idx_cache_version_writer"`
-	UpdatedAt time.Time
+type ReplayStore interface {
+	Replay(ctx context.Context, f func(EntryRecord) error) error
 }
 
-func (Record) TableName() string {
+type EntryRef struct {
+	DMap string
+	Key  string
+	HKey uint64
+}
+
+type EntryRecord struct {
+	DMap         string    `gorm:"primaryKey;size:256;column:dmap" json:"dmap"`
+	Key          string    `gorm:"column:key;size:512;not null;index:idx_olric_entry_lookup" json:"key"`
+	HKey         uint64    `gorm:"primaryKey;column:hkey" json:"hkey"`
+	EncodedEntry []byte    `gorm:"column:encoded_entry;type:longblob" json:"encoded_entry"`
+	TTL          int64     `gorm:"column:ttl;not null" json:"ttl"`
+	Timestamp    int64     `gorm:"column:timestamp;not null" json:"timestamp"`
+	Tombstone    bool      `gorm:"column:tombstone;not null" json:"tombstone"`
+	Version      int64     `gorm:"column:version;not null;index:idx_cache_version_writer" json:"version"`
+	WriterID     string    `gorm:"column:writer_id;size:128;not null;index:idx_cache_version_writer" json:"writer_id"`
+	UpdatedAt    time.Time `gorm:"column:updated_at" json:"updated_at"`
+	Origin       string    `gorm:"-" json:"origin,omitempty"`
+	FlushMySQL   bool      `gorm:"-" json:"flush_mysql,omitempty"`
+}
+
+func (EntryRecord) TableName() string {
 	return "olric_cache_records"
+}
+
+func (r EntryRecord) Ref() EntryRef {
+	return EntryRef{DMap: r.DMap, Key: r.Key, HKey: r.HKey}
+}
+
+func (r EntryRecord) Clone() EntryRecord {
+	r.EncodedEntry = append([]byte(nil), r.EncodedEntry...)
+	return r
 }
 
 type Config struct {
@@ -76,11 +103,7 @@ func (c Config) withDefaults() Config {
 }
 
 type dirtyEntry struct {
-	Key       string    `json:"key"`
-	Value     []byte    `json:"value"`
-	Version   int64     `json:"version"`
-	WriterID  string    `json:"writer_id"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Record EntryRecord `json:"record"`
 }
 
 var (
@@ -99,23 +122,34 @@ type MySQLStore struct {
 
 	mu          sync.Mutex
 	closeOnce   sync.Once
+	startOnce   sync.Once
 	closing     bool
+	started     bool
 	nextFlushAt time.Time
 	workerErrMu sync.Mutex
 	workerErr   error
 }
 
 var _ CacheStore = (*MySQLStore)(nil)
-var _ VersionedCacheStore = (*MySQLStore)(nil)
 
 func NewMySQLStore(db *gorm.DB, cfg Config) (*MySQLStore, error) {
 	if db == nil {
 		return nil, errors.New("gorm db is nil")
 	}
 
+	return newStore(db, cfg)
+}
+
+func NewWALStore(cfg Config) (*MySQLStore, error) {
+	return newStore(nil, cfg)
+}
+
+func newStore(db *gorm.DB, cfg Config) (*MySQLStore, error) {
 	cfg = cfg.withDefaults()
-	if err := db.AutoMigrate(&Record{}); err != nil {
-		return nil, fmt.Errorf("migrate cache table: %w", err)
+	if db != nil {
+		if err := db.AutoMigrate(&EntryRecord{}); err != nil {
+			return nil, fmt.Errorf("migrate cache table: %w", err)
+		}
 	}
 
 	s := &MySQLStore{
@@ -130,43 +164,114 @@ func NewMySQLStore(db *gorm.DB, cfg Config) (*MySQLStore, error) {
 		return nil, err
 	}
 	s.wal = wal
-	s.notifyFlush()
-	go s.flushLoop()
 	return s, nil
 }
 
-func (s *MySQLStore) Load(ctx context.Context, key string) ([]byte, error) {
-	if value, ok, err := s.loadDirty(key); err != nil {
-		return nil, err
-	} else if ok {
-		return value, nil
+func (s *MySQLStore) Start(context.Context) error {
+	if s.db == nil {
+		return nil
 	}
+	s.startOnce.Do(func() {
+		s.mu.Lock()
+		s.started = true
+		s.mu.Unlock()
+		s.notifyFlush()
+		go s.flushLoop()
+	})
+	return nil
+}
 
-	var rec Record
-	if err := s.db.WithContext(ctx).First(&rec, "key = ?", key).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, ErrNotFound
+func (s *MySQLStore) Replay(ctx context.Context, f func(EntryRecord) error) error {
+	expired := make([]EntryRef, 0)
+	err := s.wal.View(func(tx *bolt.Tx) error {
+		cursor := tx.Bucket(walDirtyBucket).Cursor()
+		for _, encoded := cursor.First(); encoded != nil; _, encoded = cursor.Next() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			var entry dirtyEntry
+			if err := json.Unmarshal(encoded, &entry); err != nil {
+				return err
+			}
+			record := entry.Record.Clone()
+			if record.Tombstone {
+				continue
+			}
+			if isExpired(record.TTL, time.Now()) {
+				expired = append(expired, record.Ref())
+				continue
+			}
+			if err := f(record); err != nil {
+				return err
+			}
 		}
-		return nil, fmt.Errorf("load key %q: %w", key, err)
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("replay wal: %w", err)
+	}
+	for _, ref := range expired {
+		if err := s.DeleteEntry(ctx, ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *MySQLStore) LoadEntry(ctx context.Context, ref EntryRef) (EntryRecord, error) {
+	if record, ok, err := s.loadDirty(ref); err != nil {
+		return EntryRecord{}, err
+	} else if ok {
+		if record.Tombstone {
+			return EntryRecord{}, ErrNotFound
+		}
+		if isExpired(record.TTL, time.Now()) {
+			_ = s.DeleteEntry(context.Background(), record.Ref())
+			return EntryRecord{}, ErrNotFound
+		}
+		return record, nil
 	}
 
-	value := make([]byte, len(rec.Value))
-	copy(value, rec.Value)
-	return value, nil
-}
-
-func (s *MySQLStore) Store(ctx context.Context, key string, value []byte) error {
-	return s.store(ctx, key, value, 0)
-}
-
-func (s *MySQLStore) StoreVersioned(ctx context.Context, key string, value []byte, version int64) error {
-	if version <= 0 {
-		return errors.New("version must be positive")
+	if s.db == nil {
+		return EntryRecord{}, ErrNotFound
 	}
-	return s.store(ctx, key, value, version)
+
+	var rec EntryRecord
+	if err := s.db.WithContext(ctx).First(&rec, "dmap = ? AND hkey = ?", ref.DMap, ref.HKey).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return EntryRecord{}, ErrNotFound
+		}
+		return EntryRecord{}, fmt.Errorf("load entry %s: %w", walKey(ref), err)
+	}
+	if rec.Tombstone {
+		return EntryRecord{}, ErrNotFound
+	}
+	if isExpired(rec.TTL, time.Now()) {
+		_ = s.DeleteEntry(context.Background(), rec.Ref())
+		return EntryRecord{}, ErrNotFound
+	}
+
+	return rec.Clone(), nil
 }
 
-func (s *MySQLStore) store(ctx context.Context, key string, value []byte, version int64) error {
+func (s *MySQLStore) StoreEntry(ctx context.Context, record EntryRecord) error {
+	record.Tombstone = false
+	return s.store(ctx, record, 0)
+}
+
+func (s *MySQLStore) DeleteEntry(ctx context.Context, ref EntryRef) error {
+	return s.store(ctx, EntryRecord{
+		DMap:       ref.DMap,
+		Key:        ref.Key,
+		HKey:       ref.HKey,
+		Tombstone:  true,
+		UpdatedAt:  time.Now().UTC(),
+		Origin:     "client_delete",
+		FlushMySQL: true,
+	}, 0)
+}
+
+func (s *MySQLStore) store(ctx context.Context, record EntryRecord, version int64) error {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
@@ -176,7 +281,7 @@ func (s *MySQLStore) store(ctx context.Context, key string, value []byte, versio
 		s.mu.Unlock()
 		return err
 	}
-	depth, err := s.appendDirty(key, value, version)
+	depth, err := s.appendDirty(record, version)
 	if err != nil {
 		s.mu.Unlock()
 		return err
@@ -190,12 +295,18 @@ func (s *MySQLStore) store(ctx context.Context, key string, value []byte, versio
 }
 
 func (s *MySQLStore) Close(ctx context.Context) error {
+	var started bool
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
 		s.closing = true
+		started = s.started
 		close(s.done)
 		s.mu.Unlock()
 	})
+
+	if !started {
+		return s.wal.Close()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -236,7 +347,16 @@ func (s *MySQLStore) flushPending(pending map[string][]byte) bool {
 	entries := make([]dirtyEntry, 0, len(pending))
 	now := time.Now().UTC()
 	for key, value := range pending {
-		entries = append(entries, dirtyEntry{Key: key, Value: value, Version: now.UnixNano(), WriterID: s.cfg.NodeID, UpdatedAt: now})
+		entries = append(entries, dirtyEntry{Record: EntryRecord{
+			Key:          key,
+			HKey:         uint64(len(key)),
+			EncodedEntry: value,
+			Version:      now.UnixNano(),
+			WriterID:     s.cfg.NodeID,
+			UpdatedAt:    now,
+			Origin:       "legacy_pending",
+			FlushMySQL:   true,
+		}})
 	}
 	return s.flushEntries(entries)
 }
@@ -245,7 +365,7 @@ func (s *MySQLStore) flushWAL(force bool) bool {
 	if !force && !s.flushReady(time.Now()) {
 		return false
 	}
-	entries, err := s.loadDirtyBatch(s.cfg.BatchSize)
+	entries, err := s.loadFlushableBatch(s.cfg.BatchSize)
 	if err != nil {
 		s.setWorkerError(fmt.Errorf("load dirty wal: %w", err))
 		return false
@@ -281,16 +401,23 @@ func (s *MySQLStore) deferFlush() {
 }
 
 func (s *MySQLStore) flushEntries(entries []dirtyEntry) bool {
-	records := make([]Record, 0, len(entries))
+	if s.db == nil {
+		s.setWorkerError(nil)
+		return true
+	}
+	records := make([]EntryRecord, 0, len(entries))
 	now := time.Now().UTC()
 	for _, entry := range entries {
-		records = append(records, Record{
-			Key:       entry.Key,
-			Value:     entry.Value,
-			Version:   entry.Version,
-			WriterID:  entry.WriterID,
-			UpdatedAt: now,
-		})
+		if !entry.Record.FlushMySQL {
+			continue
+		}
+		record := entry.Record.Clone()
+		record.UpdatedAt = now
+		records = append(records, record)
+	}
+	if len(records) == 0 {
+		s.setWorkerError(nil)
+		return true
 	}
 
 	err := s.db.Clauses(s.versionedUpsertClause()).CreateInBatches(records, s.cfg.BatchSize).Error
@@ -326,26 +453,30 @@ func openWAL(path string) (*bolt.DB, error) {
 	return db, nil
 }
 
-func (s *MySQLStore) appendDirty(key string, value []byte, version int64) (int, error) {
-	entry := dirtyEntry{
-		Key:       key,
-		Value:     append([]byte(nil), value...),
-		WriterID:  s.cfg.NodeID,
-		UpdatedAt: time.Now().UTC(),
+func (s *MySQLStore) appendDirty(record EntryRecord, version int64) (int, error) {
+	now := time.Now().UTC()
+	record = record.Clone()
+	if record.UpdatedAt.IsZero() {
+		record.UpdatedAt = now
 	}
+	if record.WriterID == "" {
+		record.WriterID = s.cfg.NodeID
+	}
+	entry := dirtyEntry{Record: record}
 	var depth int
 	err := s.wal.Update(func(tx *bolt.Tx) error {
 		dirty := tx.Bucket(walDirtyBucket)
-		if dirty.Get([]byte(key)) == nil && dirty.Stats().KeyN >= s.cfg.QueueSize {
+		key := []byte(walKey(record.Ref()))
+		if dirty.Get(key) == nil && dirty.Stats().KeyN >= s.cfg.QueueSize {
 			return ErrQueueFull
 		}
 		meta := tx.Bucket(walMetaBucket)
-		entry.Version = nextVersion(meta, entry.UpdatedAt, version)
+		entry.Record.Version = nextVersion(meta, entry.Record.UpdatedAt, version)
 		encoded, err := json.Marshal(entry)
 		if err != nil {
 			return err
 		}
-		if err := dirty.Put([]byte(key), encoded); err != nil {
+		if err := dirty.Put(key, encoded); err != nil {
 			return err
 		}
 		depth = dirty.Stats().KeyN
@@ -354,11 +485,11 @@ func (s *MySQLStore) appendDirty(key string, value []byte, version int64) (int, 
 	return depth, err
 }
 
-func (s *MySQLStore) loadDirty(key string) ([]byte, bool, error) {
-	var value []byte
+func (s *MySQLStore) loadDirty(ref EntryRef) (EntryRecord, bool, error) {
+	var record EntryRecord
 	var ok bool
 	err := s.wal.View(func(tx *bolt.Tx) error {
-		encoded := tx.Bucket(walDirtyBucket).Get([]byte(key))
+		encoded := tx.Bucket(walDirtyBucket).Get([]byte(walKey(ref)))
 		if encoded == nil {
 			return nil
 		}
@@ -366,14 +497,14 @@ func (s *MySQLStore) loadDirty(key string) ([]byte, bool, error) {
 		if err := json.Unmarshal(encoded, &entry); err != nil {
 			return err
 		}
-		value = append([]byte(nil), entry.Value...)
+		record = entry.Record.Clone()
 		ok = true
 		return nil
 	})
 	if err != nil {
-		return nil, false, fmt.Errorf("load dirty wal key %q: %w", key, err)
+		return EntryRecord{}, false, fmt.Errorf("load dirty wal entry %s: %w", walKey(ref), err)
 	}
-	return value, ok, nil
+	return record, ok, nil
 }
 
 func (s *MySQLStore) loadDirtyBatch(limit int) ([]dirtyEntry, error) {
@@ -392,11 +523,31 @@ func (s *MySQLStore) loadDirtyBatch(limit int) ([]dirtyEntry, error) {
 	return entries, err
 }
 
+func (s *MySQLStore) loadFlushableBatch(limit int) ([]dirtyEntry, error) {
+	entries := make([]dirtyEntry, 0, limit)
+	err := s.wal.View(func(tx *bolt.Tx) error {
+		cursor := tx.Bucket(walDirtyBucket).Cursor()
+		for key, encoded := cursor.First(); key != nil && len(entries) < limit; key, encoded = cursor.Next() {
+			var entry dirtyEntry
+			if err := json.Unmarshal(encoded, &entry); err != nil {
+				return err
+			}
+			if !entry.Record.FlushMySQL {
+				continue
+			}
+			entries = append(entries, entry)
+		}
+		return nil
+	})
+	return entries, err
+}
+
 func (s *MySQLStore) deleteFlushed(entries []dirtyEntry) error {
 	return s.wal.Update(func(tx *bolt.Tx) error {
 		dirty := tx.Bucket(walDirtyBucket)
 		for _, flushed := range entries {
-			encoded := dirty.Get([]byte(flushed.Key))
+			key := []byte(walKey(flushed.Record.Ref()))
+			encoded := dirty.Get(key)
 			if encoded == nil {
 				continue
 			}
@@ -404,8 +555,8 @@ func (s *MySQLStore) deleteFlushed(entries []dirtyEntry) error {
 			if err := json.Unmarshal(encoded, &current); err != nil {
 				return err
 			}
-			if current.Version == flushed.Version {
-				if err := dirty.Delete([]byte(flushed.Key)); err != nil {
+			if current.Record.Version == flushed.Record.Version {
+				if err := dirty.Delete(key); err != nil {
 					return err
 				}
 			}
@@ -436,26 +587,42 @@ func (s *MySQLStore) versionedUpsertClause() clause.OnConflict {
 	if s.db.Dialector.Name() == "mysql" {
 		newer := "VALUES(version) > version OR (VALUES(version) = version AND VALUES(writer_id) > writer_id)"
 		return clause.OnConflict{
-			Columns: []clause.Column{{Name: "key"}},
+			Columns: []clause.Column{{Name: "dmap"}, {Name: "hkey"}},
 			DoUpdates: clause.Assignments(map[string]interface{}{
-				"value":      gorm.Expr("CASE WHEN " + newer + " THEN VALUES(value) ELSE value END"),
-				"version":    gorm.Expr("GREATEST(version, VALUES(version))"),
-				"writer_id":  gorm.Expr("CASE WHEN " + newer + " THEN VALUES(writer_id) ELSE writer_id END"),
-				"updated_at": gorm.Expr("CASE WHEN " + newer + " THEN VALUES(updated_at) ELSE updated_at END"),
+				"key":           gorm.Expr("CASE WHEN " + newer + " THEN VALUES(`key`) ELSE `key` END"),
+				"encoded_entry": gorm.Expr("CASE WHEN " + newer + " THEN VALUES(encoded_entry) ELSE encoded_entry END"),
+				"ttl":           gorm.Expr("CASE WHEN " + newer + " THEN VALUES(ttl) ELSE ttl END"),
+				"timestamp":     gorm.Expr("CASE WHEN " + newer + " THEN VALUES(timestamp) ELSE timestamp END"),
+				"tombstone":     gorm.Expr("CASE WHEN " + newer + " THEN VALUES(tombstone) ELSE tombstone END"),
+				"version":       gorm.Expr("GREATEST(version, VALUES(version))"),
+				"writer_id":     gorm.Expr("CASE WHEN " + newer + " THEN VALUES(writer_id) ELSE writer_id END"),
+				"updated_at":    gorm.Expr("CASE WHEN " + newer + " THEN VALUES(updated_at) ELSE updated_at END"),
 			}),
 		}
 	}
 
 	newer := "excluded.version > version OR (excluded.version = version AND excluded.writer_id > writer_id)"
 	return clause.OnConflict{
-		Columns: []clause.Column{{Name: "key"}},
+		Columns: []clause.Column{{Name: "dmap"}, {Name: "hkey"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
-			"value":      gorm.Expr("CASE WHEN " + newer + " THEN excluded.value ELSE value END"),
-			"version":    gorm.Expr("MAX(version, excluded.version)"),
-			"writer_id":  gorm.Expr("CASE WHEN " + newer + " THEN excluded.writer_id ELSE writer_id END"),
-			"updated_at": gorm.Expr("CASE WHEN " + newer + " THEN excluded.updated_at ELSE updated_at END"),
+			"key":           gorm.Expr("CASE WHEN " + newer + " THEN excluded.key ELSE key END"),
+			"encoded_entry": gorm.Expr("CASE WHEN " + newer + " THEN excluded.encoded_entry ELSE encoded_entry END"),
+			"ttl":           gorm.Expr("CASE WHEN " + newer + " THEN excluded.ttl ELSE ttl END"),
+			"timestamp":     gorm.Expr("CASE WHEN " + newer + " THEN excluded.timestamp ELSE timestamp END"),
+			"tombstone":     gorm.Expr("CASE WHEN " + newer + " THEN excluded.tombstone ELSE tombstone END"),
+			"version":       gorm.Expr("MAX(version, excluded.version)"),
+			"writer_id":     gorm.Expr("CASE WHEN " + newer + " THEN excluded.writer_id ELSE writer_id END"),
+			"updated_at":    gorm.Expr("CASE WHEN " + newer + " THEN excluded.updated_at ELSE updated_at END"),
 		}),
 	}
+}
+
+func walKey(ref EntryRef) string {
+	return ref.DMap + "\x00" + strconv.FormatUint(ref.HKey, 10)
+}
+
+func isExpired(ttl int64, now time.Time) bool {
+	return ttl > 0 && now.UnixMilli() >= ttl
 }
 
 func (s *MySQLStore) notifyFlush() {

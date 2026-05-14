@@ -4,9 +4,10 @@ OlricStack is a stack-based distributed KV platform prototype. Each stack is int
 
 ## Current Components
 
-- `cmd/olric-node`: data-plane bootstrap with a MySQL-backed cache store and a Watchdog topology subscription.
+- `cmd/olric-node`: real `github.com/olric-data/olric` data-plane process with Watchdog topology subscription, local WAL/MySQL bootstrap, and an in-process durable string KV service boundary. The native Olric RESP/TCP port remains a cache/development endpoint until the durable proxy API is bound.
 - `cmd/watchdog`: per-stack controller and gRPC topology service; it reconciles its own Olric StatefulSet/headless Service and tracks membership by heartbeat subscriptions.
 - `cmd/operator`: bootstrap Operator that reconciles one `OlricStack` into an isolated Watchdog Deployment/Service.
+- `internal/stringkv`: front-door string KV business layer. It gates client operations on the topology lease, writes WAL before applying Olric mutations, records tombstones/TTL metadata, and performs MySQL read-through refill on Olric misses.
 - `internal/store`: synchronous MySQL `Load` plus WAL-backed asynchronous coalesced `Store` flushes using version-fenced upserts.
 - `internal/topology`: in-memory topology state with per-stack isolation and monotonic epochs.
 - `internal/operator`: bootstrap reconciliation logic for Watchdog lifecycle.
@@ -29,6 +30,17 @@ OlricStack is a stack-based distributed KV platform prototype. Each stack is int
 - `WAL_PATH`: local durable dirty-write log path, default `/var/lib/olricstack/cache.wal` in `olric-node`.
 - `HEARTBEAT_INTERVAL`: optional Watchdog heartbeat interval, default `10s`.
 - `WATCHDOG_RECONNECT_INTERVAL`: optional retry interval after subscription disconnect, default `3s`.
+- `OLRIC_BIND_ADDR`: Olric RESP/TCP bind address, default `0.0.0.0`.
+- `OLRIC_BIND_PORT`: Olric RESP/TCP bind port, default `3320`.
+- `OLRIC_MEMBERLIST_BIND_ADDR`: memberlist bind address, default `OLRIC_BIND_ADDR`.
+- `OLRIC_MEMBERLIST_BIND_PORT`: memberlist bind port, default `3322`.
+- `OLRIC_ADVERTISE_ADDR`: memberlist advertise address, default `POD_IP`.
+- `OLRIC_ADVERTISE_PORT`: memberlist advertise port, default `OLRIC_MEMBERLIST_BIND_PORT`.
+- `OLRIC_PEERS`: optional comma-separated initial memberlist peers in `host:port` form.
+- `OLRIC_REPLICA_COUNT`: optional Olric replica count, default `1`.
+- `OLRIC_READ_QUORUM`: optional Olric read quorum, default `1`.
+- `OLRIC_WRITE_QUORUM`: optional Olric write quorum, default `1`.
+- `OLRIC_MEMBER_COUNT_QUORUM`: optional Olric member-count quorum, default `1`.
 
 `watchdog`:
 
@@ -41,8 +53,7 @@ OlricStack is a stack-based distributed KV platform prototype. Each stack is int
 - `BOOKWORM_INTERVAL`: interval for pushing full versioned topology snapshots even when membership has not changed, default `10s`.
 - `TOPOLOGY_LEASE_TTL`: validity window sent to nodes in each topology envelope, default `30s`.
 - `WATCHDOG_ID`: identity of this Watchdog process, default `HOSTNAME`.
-- `WATCHDOG_ROLE`: static role, `primary` or `standby`; default `primary`.
-- `WATCHDOG_GENERATION`: monotonic generation for this Watchdog process, default process start timestamp.
+- `WATCHDOG_GENERATION`: in Kubernetes leader-election mode this is allocated from stack-local persistent state; standalone mode falls back to process start timestamp.
 - `WATCHDOG_LEASE_DURATION`: Kubernetes Lease duration for primary election, default `15s`.
 - `WATCHDOG_LEASE_RENEW_DEADLINE`: official leader-election renew deadline, default `10s`.
 - `WATCHDOG_LEASE_RETRY_PERIOD`: official leader-election retry period, default `2s`.
@@ -52,11 +63,13 @@ OlricStack is a stack-based distributed KV platform prototype. Each stack is int
 
 Olric nodes do not expose a topology control port. Each node dials Watchdog and opens `Watch`, then keeps that stream alive with periodic `Heartbeat` messages. Watchdog pushes `TopologyEnvelope` updates only on the existing node-owned stream.
 
+The durable data-plane business API is the OlricStack string KV proxy layer running in the same process as Olric. It receives client `GET`, `SET`, `DEL`, and `EXPIRE` requests, writes the local WAL before applying Olric mutations, and lets the asynchronous flusher write MySQL. The native Olric RESP/TCP server on port `3320` remains available for cache/development use, but native DMap commands are not the durable MySQL contract. Memberlist gossip uses port `3322`.
+
 This keeps the control plane decoupled from node network reachability and gives Watchdog a direct liveness signal. If heartbeats stop for the configured TTL, Watchdog prunes the node and advances the topology epoch.
 
 The Watchdog also runs a bookworm loop: it periodically pushes the complete structured member topology with the current epoch even when membership has not changed. Nodes can use the epoch and `valid_until` to distinguish unchanged anti-entropy refreshes from real topology transitions and stale leases.
 
-Watchdog is designed for primary/standby operation using Kubernetes client-go leader election. When `STACK_ID` is set, a Watchdog process does not start topology gRPC, topology reaping/bookworm loops, or stack reconciliation until the official leader-election callback grants leadership. When leadership is lost, the business context is canceled and the gRPC server is stopped. The bootstrap Operator creates two Watchdog replicas by default so they can compete for the Lease.
+Watchdog is designed for primary/standby operation using Kubernetes client-go leader election. When `STACK_ID` is set, a Watchdog process does not start topology gRPC, topology reaping/bookworm loops, or stack reconciliation until the official leader-election callback grants leadership. When leadership is lost, the Watchdog immediately reports not ready, stops the gRPC server to break existing node streams, and exits so Kubernetes restarts the Pod instead of keeping a demoted standby in place. The bootstrap Operator creates two Watchdog replicas by default so they can compete for the Lease.
 
 The Watchdog Deployment exposes gRPC health as readiness and reports `SERVING` only while primary. Kubernetes Services therefore route node topology streams to the current primary instead of load-balancing equally across primary and standby replicas. The Deployment rolling update allows one unavailable replica because standby Pods are intentionally not ready.
 
@@ -70,19 +83,25 @@ See [Watchdog State And Protocol Review](docs/watchdog-state-protocol-review.md)
 
 The primary Watchdog persists the latest topology epoch into a stack-local ConfigMap and reloads it after failover. This prevents topology epoch rollback across primary changes.
 
+The same stack-local ConfigMap also allocates `watchdog_generation` before a primary starts serving. This keeps primary fencing monotonic across Pod restarts and avoids relying on local node clocks.
+
 ## Persistence Contract
 
-`Store` durably records the latest dirty value for a key into a local bbolt WAL before returning success. The background flusher reads WAL batches and writes MySQL with a version-fenced upsert. A successful flush deletes a WAL entry only if the WAL still contains the exact flushed version, so a newer local write for the same key cannot be removed by an older flush.
+The target durable product contract is a MySQL-backed string KV, not arbitrary native Olric DMap persistence. Olric remains responsible for routing, ownership, backup replication, read-repair, migration, and in-memory eviction. MySQL is the durable source of truth only for the string KV business API.
 
-`Load` first checks the local WAL, then reads MySQL. This prevents a node from reading stale MySQL while it still owns an unflushed local write.
+The design supports three working modes:
 
-Olric node Pods mount a StatefulSet `ReadWriteOnce` PVC at `/var/lib/olricstack`; the WAL path defaults to `/var/lib/olricstack/cache.wal`, so accepted dirty writes survive container restarts and normal Pod rescheduling for the same ordinal.
+- memory only;
+- evictable cache;
+- durable read-through string KV, where Olric may evict entries internally but business `GET` can refill from MySQL on a current-primary miss.
 
-The MySQL row stores `version` and `writer_id`; stale flushes cannot overwrite a newer row. This closes the common split line where node A flushes an old value after node B has already persisted a newer value. Strong cross-node write ordering still depends on the data-plane routing/fencing layer: the same key must have one active write owner at a time, or callers must provide a stronger domain version.
+MySQL read-through must not be wired into the generic Olric storage engine `Get` path. Generic storage reads are also used by internal replica lookup, previous-owner lookup, read-repair, migration, and maintenance paths. Durable MySQL refill belongs in the current primary owner's business `GET` miss path, with serving-lease checks and operation-origin metadata.
 
-The store also exposes `StoreVersioned` so the data plane can pass a fencing/owner version instead of relying on local node wall-clock time for final MySQL conflict ordering.
+The preferred implementation keeps Olric as a black-box in-process engine behind the string KV proxy layer. Olric source changes are optional escape hatches for future owner-context hooks, not the primary persistence mechanism.
 
-Watchdog reconciles Pod observations by Pod name first and only falls back to Pod IP for nodes without a known Pod name. This avoids marking an old member terminal when Kubernetes rapidly reuses an IP for a different Pod. If a primary Watchdog loses its Kubernetes Lease, it demotes itself and closes existing topology streams so nodes reconnect or let their local topology lease expire before accepting more writes.
+See [Durable String KV Design](docs/durable-string-kv-design.md) for the authoritative persistence architecture, proxy-layer persistence boundary, operation-origin matrix, WAL model, and failure tests.
+
+Watchdog reconciles Pod observations by Pod name first and only falls back to Pod IP for nodes without a known Pod name. This avoids marking an old member terminal when Kubernetes rapidly reuses an IP for a different Pod. If a primary Watchdog loses its Kubernetes Lease, it marks itself not ready, closes existing topology streams, and terminates the process so nodes reconnect to the newly promoted primary.
 
 ## Kubernetes
 

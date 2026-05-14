@@ -2,16 +2,23 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	olric "github.com/olric-data/olric"
+	olricconfig "github.com/olric-data/olric/config"
 	topologypb "github.com/zhixiongdu/olricstack/api/topology/v1"
 	"github.com/zhixiongdu/olricstack/internal/node"
+	"github.com/zhixiongdu/olricstack/internal/olricstore"
 	"github.com/zhixiongdu/olricstack/internal/store"
+	"github.com/zhixiongdu/olricstack/internal/stringkv"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"gorm.io/driver/mysql"
@@ -23,38 +30,60 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	dsn := os.Getenv("MYSQL_DSN")
-	if dsn == "" {
-		log.Fatal("MYSQL_DSN is required")
-	}
-
-	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	cacheStore, err := buildCacheStore()
 	if err != nil {
-		log.Fatalf("open mysql: %v", err)
+		log.Fatalf("create backing store: %v", err)
 	}
+	topologyLease := node.NewLeaseTracker()
+	var leaseGatedStore store.CacheStore
+	if cacheStore != nil {
+		leaseGatedStore, err = node.NewLeaseGatedStore(cacheStore, topologyLease)
+		if err != nil {
+			log.Fatalf("create lease-gated store: %v", err)
+		}
+	}
+	defer func() {
+		if leaseGatedStore != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := leaseGatedStore.Close(shutdownCtx); err != nil {
+				log.Printf("close cache store: %v", err)
+			}
+		}
+	}()
 
-	cacheStore, err := store.NewMySQLStore(db, store.Config{
-		QueueSize:     envInt("DIRTY_QUEUE_SIZE", 1024),
-		FlushInterval: envDuration("FLUSH_INTERVAL", time.Second),
-		BatchSize:     envInt("FLUSH_BATCH_SIZE", 256),
-		WALPath:       envString("WAL_PATH", "/var/lib/olricstack/cache.wal"),
-		NodeID:        envString("NODE_ID", os.Getenv("POD_NAME")),
-		FlushBackoff:  envDuration("FLUSH_BACKOFF", time.Second),
-	})
+	go runTopologySubscription(ctx, topologyLease)
+
+	olricDB, err := startOlric(ctx, leaseGatedStore)
 	if err != nil {
-		log.Fatalf("create cache store: %v", err)
+		log.Fatalf("start olric: %v", err)
+	}
+	if leaseGatedStore != nil {
+		provider, err := stringkv.NewOlricProvider(olricDB.NewEmbeddedClient())
+		if err != nil {
+			log.Fatalf("create string kv olric provider: %v", err)
+		}
+		if _, err := stringkv.NewService(provider, leaseGatedStore, topologyLease); err != nil {
+			log.Fatalf("create string kv service: %v", err)
+		}
+		log.Printf("durable string kv service initialized; external API binding is pending")
 	}
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := cacheStore.Close(shutdownCtx); err != nil {
-			log.Printf("close cache store: %v", err)
+		if err := olricDB.Shutdown(shutdownCtx); err != nil {
+			log.Printf("shutdown olric: %v", err)
 		}
 	}()
 
-	go runTopologySubscription(ctx)
-
-	log.Printf("olric node bootstrap complete stack_id=%q watchdog=%q", os.Getenv("STACK_ID"), os.Getenv("WATCHDOG_SVC_NAME"))
+	log.Printf("olric node bootstrap complete stack_id=%q watchdog=%q olric_addr=%s:%d memberlist=%s:%d",
+		os.Getenv("STACK_ID"),
+		os.Getenv("WATCHDOG_SVC_NAME"),
+		envString("OLRIC_BIND_ADDR", "0.0.0.0"),
+		envInt("OLRIC_BIND_PORT", 3320),
+		envString("OLRIC_MEMBERLIST_BIND_ADDR", envString("OLRIC_BIND_ADDR", "0.0.0.0")),
+		envInt("OLRIC_MEMBERLIST_BIND_PORT", 3322),
+	)
 	<-ctx.Done()
 }
 
@@ -71,7 +100,7 @@ func (logJoiner) Join(ctx context.Context, envelope *topologypb.TopologyEnvelope
 	return nil
 }
 
-func runTopologySubscription(ctx context.Context) {
+func runTopologySubscription(ctx context.Context, lease *node.LeaseTracker) {
 	stackID := os.Getenv("STACK_ID")
 	watchdogAddr := os.Getenv("WATCHDOG_SVC_NAME")
 	podIP := os.Getenv("POD_IP")
@@ -88,6 +117,7 @@ func runTopologySubscription(ctx context.Context) {
 		Incarnation:       envInt64("NODE_INCARNATION", time.Now().UnixNano()),
 		ProtocolVersion:   "v2",
 		HeartbeatInterval: envDuration("HEARTBEAT_INTERVAL", 10*time.Second),
+		Lease:             lease,
 		Joiner:            logJoiner{},
 	})
 	if err != nil {
@@ -123,6 +153,94 @@ func subscribeOnce(ctx context.Context, watchdogAddr string, subscriber *node.Su
 	return subscriber.Run(ctx, client)
 }
 
+func buildCacheStore() (store.CacheStore, error) {
+	mode := strings.ToLower(envString("STORAGE_MODE", ""))
+	dsn := os.Getenv("MYSQL_DSN")
+	if mode == "" {
+		if dsn == "" && os.Getenv("WAL_PATH") == "" {
+			mode = "memory"
+		} else if dsn == "" {
+			mode = "wal"
+		} else {
+			mode = "mysql"
+		}
+	}
+	if mode == "memory" {
+		log.Printf("storage mode: memory only")
+		return nil, nil
+	}
+	cfg := store.Config{
+		QueueSize:     envInt("DIRTY_QUEUE_SIZE", 1024),
+		FlushInterval: envDuration("FLUSH_INTERVAL", time.Second),
+		BatchSize:     envInt("FLUSH_BATCH_SIZE", 256),
+		WALPath:       envString("WAL_PATH", "/var/lib/olricstack/cache.wal"),
+		NodeID:        envString("NODE_ID", os.Getenv("POD_NAME")),
+		FlushBackoff:  envDuration("FLUSH_BACKOFF", time.Second),
+	}
+	if mode == "wal" {
+		log.Printf("storage mode: memory + local wal")
+		return store.NewWALStore(cfg)
+	}
+	if mode != "mysql" {
+		return nil, fmt.Errorf("unknown STORAGE_MODE %q", mode)
+	}
+	if dsn == "" {
+		return nil, errors.New("MYSQL_DSN is required when STORAGE_MODE=mysql")
+	}
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		return nil, fmt.Errorf("open mysql: %w", err)
+	}
+	log.Printf("storage mode: memory + local wal + mysql")
+	return store.NewMySQLStore(db, cfg)
+}
+
+func startOlric(ctx context.Context, cacheStore store.CacheStore) (*olric.Olric, error) {
+	cfg := olricconfig.New(envString("OLRIC_MEMBERLIST_ENV", "lan"))
+	cfg.BindAddr = envString("OLRIC_BIND_ADDR", "0.0.0.0")
+	cfg.BindPort = envInt("OLRIC_BIND_PORT", 3320)
+	cfg.MemberlistConfig.BindAddr = envString("OLRIC_MEMBERLIST_BIND_ADDR", cfg.BindAddr)
+	cfg.MemberlistConfig.BindPort = envInt("OLRIC_MEMBERLIST_BIND_PORT", 3322)
+	cfg.MemberlistConfig.AdvertiseAddr = envString("OLRIC_ADVERTISE_ADDR", os.Getenv("POD_IP"))
+	cfg.MemberlistConfig.AdvertisePort = envInt("OLRIC_ADVERTISE_PORT", cfg.MemberlistConfig.BindPort)
+	cfg.Peers = envCSV("OLRIC_PEERS")
+	cfg.ReplicaCount = envInt("OLRIC_REPLICA_COUNT", 1)
+	cfg.WriteQuorum = envInt("OLRIC_WRITE_QUORUM", 1)
+	cfg.ReadQuorum = envInt("OLRIC_READ_QUORUM", 1)
+	cfg.MemberCountQuorum = int32(envInt("OLRIC_MEMBER_COUNT_QUORUM", 1))
+	cfg.LogLevel = envString("OLRIC_LOG_LEVEL", "WARN")
+	cfg.LogVerbosity = int32(envInt("OLRIC_LOG_VERBOSITY", 3))
+	cfg.DMaps.Engine = olricconfig.NewEngine()
+	cfg.DMaps.Engine.Implementation = olricstore.New(cacheStore)
+
+	started := make(chan struct{})
+	cfg.Started = func() {
+		close(started)
+	}
+
+	db, err := olric.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- db.Start()
+	}()
+
+	select {
+	case <-started:
+		return db, nil
+	case err := <-errCh:
+		return nil, err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = db.Shutdown(shutdownCtx)
+		return nil, ctx.Err()
+	}
+}
+
 func envInt(name string, fallback int) int {
 	value := os.Getenv(name)
 	if value == "" {
@@ -155,6 +273,22 @@ func envString(name, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func envCSV(name string) []string {
+	value := os.Getenv(name)
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func envInt64(name string, fallback int64) int64 {
