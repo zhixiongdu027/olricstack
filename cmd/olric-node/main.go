@@ -36,6 +36,8 @@ func main() {
 		QueueSize:     envInt("DIRTY_QUEUE_SIZE", 1024),
 		FlushInterval: envDuration("FLUSH_INTERVAL", time.Second),
 		BatchSize:     envInt("FLUSH_BATCH_SIZE", 256),
+		WALPath:       envString("WAL_PATH", "/var/lib/olricstack/cache.wal"),
+		NodeID:        envString("NODE_ID", os.Getenv("POD_NAME")),
 	})
 	if err != nil {
 		log.Fatalf("create cache store: %v", err)

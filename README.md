@@ -7,7 +7,7 @@ OlricStack is a stack-based distributed KV platform prototype. Each stack is int
 - `cmd/olric-node`: data-plane bootstrap with a MySQL-backed cache store and a Watchdog topology subscription.
 - `cmd/watchdog`: per-stack controller and gRPC topology service; it reconciles its own Olric StatefulSet/headless Service and tracks membership by heartbeat subscriptions.
 - `cmd/operator`: bootstrap Operator that reconciles one `OlricStack` into an isolated Watchdog Deployment/Service.
-- `internal/store`: synchronous MySQL `Load` plus asynchronous coalesced `Store` flushes using `INSERT ... ON DUPLICATE KEY UPDATE`.
+- `internal/store`: synchronous MySQL `Load` plus WAL-backed asynchronous coalesced `Store` flushes using version-fenced upserts.
 - `internal/topology`: in-memory topology state with per-stack isolation and monotonic epochs.
 - `internal/operator`: bootstrap reconciliation logic for Watchdog lifecycle.
 - `internal/watchdog`: per-stack Olric reconciliation logic and heartbeat-first cluster state owned by Watchdog.
@@ -25,6 +25,7 @@ OlricStack is a stack-based distributed KV platform prototype. Each stack is int
 - `DIRTY_QUEUE_SIZE`: optional queue capacity, default `1024`.
 - `FLUSH_INTERVAL`: optional Go duration, default `1s`.
 - `FLUSH_BATCH_SIZE`: optional batch size, default `256`.
+- `WAL_PATH`: local durable dirty-write log path, default `/var/lib/olricstack/cache.wal` in `olric-node`.
 - `HEARTBEAT_INTERVAL`: optional Watchdog heartbeat interval, default `10s`.
 - `WATCHDOG_RECONNECT_INTERVAL`: optional retry interval after subscription disconnect, default `3s`.
 
@@ -66,9 +67,13 @@ See [Watchdog State And Protocol Review](docs/watchdog-state-protocol-review.md)
 
 The primary Watchdog persists the latest topology epoch into a stack-local ConfigMap and reloads it after failover. This prevents topology epoch rollback across primary changes.
 
-## Persistence Caveat
+## Persistence Contract
 
-The current MySQL write-behind path retries failed flushes in memory, but it is not yet durable across node process death. Production durability requires a local WAL or synchronous durable-write mode before acknowledging writes.
+`Store` durably records the latest dirty value for a key into a local bbolt WAL before returning success. The background flusher reads WAL batches and writes MySQL with a version-fenced upsert. A successful flush deletes a WAL entry only if the WAL still contains the exact flushed version, so a newer local write for the same key cannot be removed by an older flush.
+
+`Load` first checks the local WAL, then reads MySQL. This prevents a node from reading stale MySQL while it still owns an unflushed local write.
+
+The MySQL row stores `version` and `writer_id`; stale flushes cannot overwrite a newer row. This closes the common split line where node A flushes an old value after node B has already persisted a newer value. Strong cross-node write ordering still depends on the data-plane routing/fencing layer: the same key must have one active write owner at a time, or callers must provide a stronger domain version.
 
 ## Kubernetes
 

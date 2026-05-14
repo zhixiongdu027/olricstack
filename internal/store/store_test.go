@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -21,7 +22,10 @@ func TestMySQLStoreLoadMiss(t *testing.T) {
 }
 
 func TestMySQLStoreCoalescesAndFlushesLatestValue(t *testing.T) {
-	cacheStore := newTestStore(t, Config{
+	db := newTestDB(t)
+	walPath := filepath.Join(t.TempDir(), "cache.wal")
+	cacheStore := newTestStoreWithDB(t, db, Config{
+		WALPath:       walPath,
 		FlushInterval: time.Hour,
 		BatchSize:     16,
 	})
@@ -36,7 +40,9 @@ func TestMySQLStoreCoalescesAndFlushesLatestValue(t *testing.T) {
 
 	closeStore(t, cacheStore)
 
-	value, err := cacheStore.Load(ctx, "user:1")
+	reopened := newTestStoreWithDB(t, db, Config{WALPath: filepath.Join(t.TempDir(), "reopen.wal")})
+	defer closeStore(t, reopened)
+	value, err := reopened.Load(ctx, "user:1")
 	if err != nil {
 		t.Fatalf("load flushed value: %v", err)
 	}
@@ -157,7 +163,8 @@ func TestMySQLStoreRejectsStoreAfterClose(t *testing.T) {
 }
 
 func TestMySQLStoreCloseFlushesAcceptedWrites(t *testing.T) {
-	cacheStore := newTestStore(t, Config{
+	db := newTestDB(t)
+	cacheStore := newTestStoreWithDB(t, db, Config{
 		QueueSize:     128,
 		FlushInterval: time.Hour,
 		BatchSize:     1024,
@@ -172,7 +179,9 @@ func TestMySQLStoreCloseFlushesAcceptedWrites(t *testing.T) {
 	}
 	closeStore(t, cacheStore)
 
-	value, err := cacheStore.Load(ctx, "key-0")
+	reopened := newTestStoreWithDB(t, db, Config{WALPath: filepath.Join(t.TempDir(), "reopen.wal")})
+	defer closeStore(t, reopened)
+	value, err := reopened.Load(ctx, "key-0")
 	if err != nil {
 		t.Fatalf("load flushed value: %v", err)
 	}
@@ -181,19 +190,169 @@ func TestMySQLStoreCloseFlushesAcceptedWrites(t *testing.T) {
 	}
 }
 
+func TestMySQLStoreWALSurvivesProcessRestart(t *testing.T) {
+	db := newTestDB(t)
+	walPath := filepath.Join(t.TempDir(), "cache.wal")
+
+	first, err := NewMySQLStore(db, Config{
+		WALPath:       walPath,
+		NodeID:        "node-a",
+		FlushInterval: time.Hour,
+		BatchSize:     128,
+	})
+	if err != nil {
+		t.Fatalf("new first store: %v", err)
+	}
+	if err := first.Store(context.Background(), "durable", []byte("value")); err != nil {
+		t.Fatalf("store dirty value: %v", err)
+	}
+	first.mu.Lock()
+	first.closing = true
+	first.mu.Unlock()
+	if err := first.wal.Close(); err != nil {
+		t.Fatalf("simulate process death closing wal: %v", err)
+	}
+
+	second, err := NewMySQLStore(db, Config{
+		WALPath:       walPath,
+		NodeID:        "node-a",
+		FlushInterval: time.Hour,
+		BatchSize:     128,
+	})
+	if err != nil {
+		t.Fatalf("new second store: %v", err)
+	}
+	closeStore(t, second)
+
+	reader := newTestStoreWithDB(t, db, Config{WALPath: filepath.Join(t.TempDir(), "reader.wal")})
+	defer closeStore(t, reader)
+	value, err := reader.Load(context.Background(), "durable")
+	if err != nil {
+		t.Fatalf("load recovered value: %v", err)
+	}
+	if string(value) != "value" {
+		t.Fatalf("expected recovered value, got %q", value)
+	}
+}
+
+func TestMySQLStoreLoadPrefersLocalWALBeforeMySQL(t *testing.T) {
+	cacheStore := newTestStore(t, Config{FlushInterval: time.Hour})
+	if err := cacheStore.flushEntries([]dirtyEntry{{
+		Key:       "split",
+		Value:     []byte("mysql"),
+		Version:   time.Now().Add(-time.Second).UnixNano(),
+		WriterID:  "node-a",
+		UpdatedAt: time.Now().Add(-time.Second),
+	}}); !err {
+		t.Fatalf("seed mysql: %v", cacheStore.workerError())
+	}
+	if err := cacheStore.Store(context.Background(), "split", []byte("wal")); err != nil {
+		t.Fatalf("store wal value: %v", err)
+	}
+
+	value, err := cacheStore.Load(context.Background(), "split")
+	if err != nil {
+		t.Fatalf("load value: %v", err)
+	}
+	if string(value) != "wal" {
+		t.Fatalf("expected WAL value, got %q", value)
+	}
+	closeStore(t, cacheStore)
+}
+
+func TestMySQLStoreVersionedFlushDoesNotOverwriteNewerValue(t *testing.T) {
+	cacheStore := newTestStore(t, Config{NodeID: "node-a"})
+	now := time.Now()
+
+	if !cacheStore.flushEntries([]dirtyEntry{{
+		Key:       "conflict",
+		Value:     []byte("new"),
+		Version:   now.UnixNano(),
+		WriterID:  "node-b",
+		UpdatedAt: now,
+	}}) {
+		t.Fatalf("seed newer value: %v", cacheStore.workerError())
+	}
+	if !cacheStore.flushEntries([]dirtyEntry{{
+		Key:       "conflict",
+		Value:     []byte("old"),
+		Version:   now.Add(-time.Second).UnixNano(),
+		WriterID:  "node-a",
+		UpdatedAt: now.Add(-time.Second),
+	}}) {
+		t.Fatalf("flush older value: %v", cacheStore.workerError())
+	}
+
+	value, err := cacheStore.Load(context.Background(), "conflict")
+	if err != nil {
+		t.Fatalf("load conflict value: %v", err)
+	}
+	if string(value) != "new" {
+		t.Fatalf("older flush overwrote newer value: %q", value)
+	}
+	closeStore(t, cacheStore)
+}
+
+func TestMySQLStoreDeleteFlushedKeepsNewerWALValue(t *testing.T) {
+	cacheStore := newTestStore(t, Config{FlushInterval: time.Hour})
+	if err := cacheStore.Store(context.Background(), "race", []byte("old")); err != nil {
+		t.Fatalf("store old value: %v", err)
+	}
+	entries, err := cacheStore.loadDirtyBatch(1)
+	if err != nil {
+		t.Fatalf("load dirty batch: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one dirty entry, got %d", len(entries))
+	}
+	if err := cacheStore.Store(context.Background(), "race", []byte("new")); err != nil {
+		t.Fatalf("store new value: %v", err)
+	}
+	if err := cacheStore.deleteFlushed(entries); err != nil {
+		t.Fatalf("delete flushed old entry: %v", err)
+	}
+
+	value, err := cacheStore.Load(context.Background(), "race")
+	if err != nil {
+		t.Fatalf("load dirty value: %v", err)
+	}
+	if string(value) != "new" {
+		t.Fatalf("new WAL value was deleted by old flush: %q", value)
+	}
+	closeStore(t, cacheStore)
+}
+
 func newTestStore(t *testing.T, cfg Config) *MySQLStore {
 	t.Helper()
 
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
+	db := newTestDB(t)
+	return newTestStoreWithDB(t, db, cfg)
+}
 
+func newTestStoreWithDB(t *testing.T, db *gorm.DB, cfg Config) *MySQLStore {
+	t.Helper()
+
+	if cfg.WALPath == "" {
+		cfg.WALPath = filepath.Join(t.TempDir(), "cache.wal")
+	}
+	if cfg.NodeID == "" {
+		cfg.NodeID = "node-a"
+	}
 	cacheStore, err := NewMySQLStore(db, cfg)
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
 	return cacheStore
+}
+
+func newTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+
+	db, err := gorm.Open(sqlite.Open("file:"+filepath.Join(t.TempDir(), "cache.db")+"?cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	return db
 }
 
 func closeStore(t *testing.T, cacheStore *MySQLStore) {

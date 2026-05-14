@@ -8,7 +8,7 @@
 *   **架构范式**: “Stack-based Operator” (一个 CRD 对象 = 一套完整的自治集群)。
 *   **核心特性**:
     *   **透明回源**: 缓存 Miss 自动触发 MySQL `Load`。
-    *   **异步落盘**: 脏写通过合并与异步队列 (`Write-Behind`) 批量落入 MySQL。
+    *   **异步落盘**: 脏写先进入本地持久 WAL，再通过合并与异步队列 (`Write-Behind`) 批量落入 MySQL。
     *   **高可用控制**: 通过独立 Watchdog 组件管理集群拓扑，解耦 K8s API 压力。
 
 ## 2. 核心架构模型 (The "Stack" Concept)
@@ -43,9 +43,9 @@
 ### C. Olric Node (高性能载体)
 *   **持久化层 (`CacheStore` 接口)**:
     *   `Load`: 同步回源查询 MySQL。
-    *   `Store`: 将数据丢入带锁的 `dirtyQueue` (Channel)。
+    *   `Store`: ack 前先写入本地持久 WAL，再通知后台 flusher。
 *   **异步落盘 (Write-Coalescing)**: 
-    *   由 `dirtyQueue` 消费者定时合并数据 (`INSERT ... ON DUPLICATE KEY UPDATE`)。
+    *   由 WAL flusher 定时合并数据，通过带版本裁决的 upsert 写入 MySQL。
 *   **拓扑更新**: 主动建立到 Watchdog 的 gRPC 订阅流，发送心跳并接收拓扑更新；收到新 IP 列表后执行 `olric.Memberlist().Join(nodes)`。
 
 ## 5. 核心协议定义 (gRPC)
@@ -81,7 +81,7 @@ message TopologyEnvelope {
 ## 6. 开发路径与优先级
 1.  **Phase 1: 核心存储引擎 (The Engine)**
     *   实现 `olric.CacheStore` 接口，打通内存与 MySQL 的双向链路。
-    *   验证 `dirtyQueue` 批量合并写入 MySQL 的稳定性。
+    *   验证 WAL flusher 批量合并写入 MySQL 的稳定性。
 2.  **Phase 2: 动态集群发现 (The Join)**
     *   实现 Olric 节点到 Watchdog 的订阅流与心跳保活，验证动态 `Join` 对集群稳定性的影响。
 3.  **Phase 3: 云原生编排 (The Operator)**
@@ -90,7 +90,7 @@ message TopologyEnvelope {
 
 ## 7. 架构指导原则
 *   **最终一致性优先**: 集群扩容时的视图延迟由 Olric 的 Gossip 协议和 Watchdog 的巡检机制兜底。
-*   **压力熔断**: 当 `dirtyQueue` 堆积超过阈值，直接触发 `503`，保护 MySQL 不被击穿。
+*   **压力熔断**: 当 WAL dirty 集合超过阈值，直接触发 `503`，保护 MySQL 不被击穿。
 *   **零耦合**: Olric Pod 不应该感知 Kubernetes 的存在，所有外部信息均由 Watchdog 经 gRPC 下发。
 
 ---
