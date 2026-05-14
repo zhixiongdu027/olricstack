@@ -82,6 +82,24 @@ func TestLeaseTrackerServingAllowed(t *testing.T) {
 	}
 }
 
+func TestLeaseTrackerWaitExpired(t *testing.T) {
+	tracker := NewLeaseTracker()
+	now := time.Now()
+	if err := tracker.Apply(&topologypb.TopologyEnvelope{
+		WatchdogRole:       topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY,
+		WatchdogGeneration: 1,
+		ValidUntilUnixMs:   now.Add(20 * time.Millisecond).UnixMilli(),
+	}, now); err != nil {
+		t.Fatalf("apply lease: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := tracker.WaitExpired(ctx, 5*time.Millisecond); !errors.Is(err, ErrTopologyLeaseExpired) {
+		t.Fatalf("expected lease expiry, got %v", err)
+	}
+}
+
 type recordingJoiner struct {
 	envelope *topologypb.TopologyEnvelope
 }

@@ -214,6 +214,25 @@ func TestServiceClearsEpochPersistenceFailureAfterSuccess(t *testing.T) {
 	}
 }
 
+func TestServiceDemotionClosesSubscribers(t *testing.T) {
+	service := NewServiceWithConfig(Config{Role: topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY, Generation: 1})
+	sub := &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1), done: make(chan struct{})}
+	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), sub)
+
+	service.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, 1)
+
+	select {
+	case <-sub.done:
+	default:
+		t.Fatal("expected subscriber to be closed on leadership demotion")
+	}
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if got := len(service.stateFor("stack-a").subscribers); got != 0 {
+		t.Fatalf("expected subscribers to be cleared, got %d", got)
+	}
+}
+
 func heartbeat(stackID, nodeID, podName, podIP string, incarnation int64) *topologypb.Heartbeat {
 	return &topologypb.Heartbeat{
 		StackId:         stackID,

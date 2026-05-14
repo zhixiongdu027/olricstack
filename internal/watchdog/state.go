@@ -124,20 +124,26 @@ func (s *ClusterState) ApplyPodObservations(observations []PodObservation, expir
 		now = time.Now()
 	}
 
+	observedByName := make(map[string]PodObservation, len(observations))
 	observedByIP := make(map[string]PodObservation, len(observations))
 	for _, obs := range observations {
-		if obs.PodIP == "" {
-			continue
-		}
 		if obs.SeenAt.IsZero() {
 			obs.SeenAt = now
 		}
-		observedByIP[obs.PodIP] = obs
+		if obs.PodName != "" {
+			observedByName[obs.PodName] = obs
+		}
+		if obs.PodIP != "" {
+			observedByIP[obs.PodIP] = obs
+		}
 	}
 
 	var changed bool
 	for _, node := range s.nodes {
-		obs, exists := observedByIP[node.PodIP]
+		obs, exists := observedByName[node.PodName]
+		if !exists && node.PodName == "" && node.PodIP != "" {
+			obs, exists = observedByIP[node.PodIP]
+		}
 		if !exists {
 			if now.Sub(node.LastHeartbeat) > expireAfter {
 				delete(s.nodes, node.NodeID)

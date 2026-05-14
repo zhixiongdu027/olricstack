@@ -160,3 +160,22 @@ func (l *LeaseTracker) ServingAllowed(now time.Time) bool {
 	validUntil := l.validUntilUnixMs.Load()
 	return validUntil > now.UnixMilli()
 }
+
+func (l *LeaseTracker) WaitExpired(ctx context.Context, pollInterval time.Duration) error {
+	if pollInterval <= 0 {
+		pollInterval = time.Second
+	}
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		if !l.ServingAllowed(time.Now()) {
+			return ErrTopologyLeaseExpired
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}

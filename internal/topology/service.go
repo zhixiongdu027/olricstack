@@ -402,11 +402,31 @@ func (s *Service) isPrimary() bool {
 }
 
 func (s *Service) SetLeadership(role topologypb.WatchdogRole, generation int64) {
+	var demoted bool
 	s.cfgMu.Lock()
-	defer s.cfgMu.Unlock()
+	if s.cfg.Role == topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY && role != topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY {
+		demoted = true
+	}
 	s.cfg.Role = role
 	if generation > 0 {
 		s.cfg.Generation = generation
+	}
+	s.cfgMu.Unlock()
+
+	if demoted {
+		s.closeSubscribersForLeadershipChange()
+	}
+}
+
+func (s *Service) closeSubscribersForLeadershipChange() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, state := range s.stacks {
+		for nodeID, sub := range state.subscribers {
+			closeSubscriber(sub)
+			delete(state.subscribers, nodeID)
+		}
 	}
 }
 

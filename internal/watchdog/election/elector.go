@@ -10,6 +10,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -73,7 +74,7 @@ func (e *Elector) Run(ctx context.Context) {
 		case <-ctx.Done():
 			e.publish(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, 0)
 			return
-		case <-time.After(wait):
+		case <-time.After(jitter(wait)):
 		}
 	}
 }
@@ -178,4 +179,8 @@ func value[T comparable](ptr *T) T {
 		return zero
 	}
 	return *ptr
+}
+
+func jitter(duration time.Duration) time.Duration {
+	return wait.Jitter(duration, 0.2)
 }

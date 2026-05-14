@@ -73,7 +73,11 @@ The primary Watchdog persists the latest topology epoch into a stack-local Confi
 
 `Load` first checks the local WAL, then reads MySQL. This prevents a node from reading stale MySQL while it still owns an unflushed local write.
 
+Olric node Pods mount a StatefulSet `ReadWriteOnce` PVC at `/var/lib/olricstack`; the WAL path defaults to `/var/lib/olricstack/cache.wal`, so accepted dirty writes survive container restarts and normal Pod rescheduling for the same ordinal.
+
 The MySQL row stores `version` and `writer_id`; stale flushes cannot overwrite a newer row. This closes the common split line where node A flushes an old value after node B has already persisted a newer value. Strong cross-node write ordering still depends on the data-plane routing/fencing layer: the same key must have one active write owner at a time, or callers must provide a stronger domain version.
+
+Watchdog reconciles Pod observations by Pod name first and only falls back to Pod IP for nodes without a known Pod name. This avoids marking an old member terminal when Kubernetes rapidly reuses an IP for a different Pod. If a primary Watchdog loses its Kubernetes Lease, it demotes itself and closes existing topology streams so nodes reconnect or let their local topology lease expire before accepting more writes.
 
 ## Kubernetes
 

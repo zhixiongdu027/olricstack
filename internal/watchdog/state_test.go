@@ -204,3 +204,28 @@ func TestClusterStateNewIncarnationReplacesTerminalPod(t *testing.T) {
 		t.Fatalf("expected new ready incarnation, got %v", members)
 	}
 }
+
+func TestClusterStatePodObservationPrefersPodNameOverReusedIP(t *testing.T) {
+	state := NewClusterState()
+	now := time.Now()
+	state.ApplyHeartbeat(HeartbeatObservation{NodeID: "node-a", PodName: "pod-a", PodIP: "10.0.0.2", Incarnation: 1, SeenAt: now})
+
+	changed := state.ApplyPodObservations([]PodObservation{{
+		PodName: "pod-b",
+		PodIP:   "10.0.0.2",
+		Ready:   false,
+		Phase:   "Failed",
+		SeenAt:  now.Add(time.Second),
+	}}, time.Minute, now.Add(time.Second))
+	if changed {
+		t.Fatal("reused IP from another pod must not mark existing pod terminal")
+	}
+
+	members, epoch := state.Members(time.Minute, now.Add(time.Second))
+	if epoch != 1 {
+		t.Fatalf("expected epoch to remain 1, got %d", epoch)
+	}
+	if len(members) != 1 || members[0].GetState() != topologypb.NodeState_NODE_STATE_READY {
+		t.Fatalf("expected original ready member to remain, got %v", members)
+	}
+}

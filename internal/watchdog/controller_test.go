@@ -55,6 +55,16 @@ func TestControllerReconcilesOlricResourcesForOwnStack(t *testing.T) {
 	if got := statefulSet.Labels[workloads.LabelStackID]; got != "demo" {
 		t.Fatalf("expected stack label demo, got %q", got)
 	}
+	if len(statefulSet.Spec.VolumeClaimTemplates) != 1 {
+		t.Fatalf("expected one WAL persistent volume claim, got %d", len(statefulSet.Spec.VolumeClaimTemplates))
+	}
+	if got := statefulSet.Spec.VolumeClaimTemplates[0].Name; got != workloads.OlricDataVolumeName {
+		t.Fatalf("expected WAL volume claim %q, got %q", workloads.OlricDataVolumeName, got)
+	}
+	mounts := statefulSet.Spec.Template.Spec.Containers[0].VolumeMounts
+	if len(mounts) != 1 || mounts[0].Name != workloads.OlricDataVolumeName || mounts[0].MountPath != workloads.OlricDataMountPath {
+		t.Fatalf("expected WAL volume mount, got %#v", mounts)
+	}
 
 	var service corev1.Service
 	if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "demo-olric", Namespace: "default"}, &service); err != nil {
