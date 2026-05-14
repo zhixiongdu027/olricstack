@@ -1,0 +1,87 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: olricstacks.olric.io
+spec:
+  group: olric.io
+  names:
+    kind: OlricStack
+    listKind: OlricStackList
+    plural: olricstacks
+    singular: olricstack
+    shortNames:
+      - ols
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              required:
+                - mysqlDsnSecret
+              properties:
+                replicas:
+                  type: integer
+                  format: int32
+                  minimum: 0
+                  default: 3
+                watchdogReplicas:
+                  type: integer
+                  format: int32
+                  minimum: 1
+                  default: 2
+                image:
+                  type: string
+                watchdogImage:
+                  type: string
+                mysqlDsnSecret:
+                  type: object
+                  required:
+                    - name
+                    - key
+                  properties:
+                    name:
+                      type: string
+                    key:
+                      type: string
+                    optional:
+                      type: boolean
+                resources:
+                  x-kubernetes-preserve-unknown-fields: true
+                  type: object
+            status:
+              type: object
+              properties:
+                readyReplicas:
+                  type: integer
+                  format: int32
+                podIPs:
+                  type: array
+                  items:
+                    type: string
+                topologyEpoch:
+                  type: integer
+                  format: int64
+      additionalPrinterColumns:
+        - name: Replicas
+          type: integer
+          jsonPath: .spec.replicas
+        - name: Ready
+          type: integer
+          jsonPath: .status.readyReplicas
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp

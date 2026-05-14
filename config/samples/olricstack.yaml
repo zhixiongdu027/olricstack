@@ -1,0 +1,12 @@
+apiVersion: olric.io/v1alpha1
+kind: OlricStack
+metadata:
+  name: demo
+  namespace: default
+spec:
+  replicas: 3
+  image: olricstack/olric-node:latest
+  watchdogImage: olricstack/watchdog:latest
+  mysqlDsnSecret:
+    name: demo-mysql
+    key: dsn

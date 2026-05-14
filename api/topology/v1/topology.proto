@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package topology.v1;
+
+option go_package = "github.com/zhixiongdu/olricstack/api/topology/v1;topologypb";
+
+service TopologyControl {
+  rpc GetTopology(TopologyQuery) returns (TopologyEnvelope);
+  rpc Watch(stream Heartbeat) returns (stream TopologyEnvelope);
+}
+
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_STATE_JOINING = 1;
+  NODE_STATE_READY = 2;
+  NODE_STATE_SUSPECT = 3;
+  NODE_STATE_UNREACHABLE = 4;
+  NODE_STATE_DRAINING = 5;
+  NODE_STATE_LEAVING = 6;
+  NODE_STATE_REMOVED = 7;
+}
+
+enum WatchdogRole {
+  WATCHDOG_ROLE_UNSPECIFIED = 0;
+  WATCHDOG_ROLE_PRIMARY = 1;
+  WATCHDOG_ROLE_STANDBY = 2;
+}
+
+enum TopologyReason {
+  TOPOLOGY_REASON_UNSPECIFIED = 0;
+  TOPOLOGY_REASON_EVENT = 1;
+  TOPOLOGY_REASON_BOOKWORM = 2;
+  TOPOLOGY_REASON_PRUNE = 3;
+  TOPOLOGY_REASON_RECONCILE = 4;
+  TOPOLOGY_REASON_PRIMARY_CHANGE = 5;
+}
+
+message TopologyQuery {
+  string stack_id = 1;
+  int64 observed_epoch = 2;
+}
+
+message Heartbeat {
+  string stack_id = 1;
+  string node_id = 2;
+  string pod_name = 3;
+  string pod_ip = 4;
+  int64 incarnation = 5;
+  int64 observed_epoch = 6;
+  NodeState state = 7;
+  string protocol_version = 8;
+}
+
+message Member {
+  string node_id = 1;
+  string pod_name = 2;
+  string pod_ip = 3;
+  int64 incarnation = 4;
+  NodeState state = 5;
+  int64 last_seen_unix_ms = 6;
+}
+
+message TopologyEnvelope {
+  string stack_id = 1;
+  repeated Member members = 2;
+  int64 epoch = 3;
+  TopologyReason reason = 4;
+  int64 valid_until_unix_ms = 5;
+  string watchdog_id = 6;
+  int64 watchdog_generation = 7;
+  WatchdogRole watchdog_role = 8;
+}
