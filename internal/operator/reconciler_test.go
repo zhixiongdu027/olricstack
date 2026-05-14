@@ -69,6 +69,10 @@ func TestReconcileCreatesStackResources(t *testing.T) {
 	if watchdogEnv["BOOKWORM_INTERVAL"].Value != "10s" {
 		t.Fatalf("expected BOOKWORM_INTERVAL 10s, got %q", watchdogEnv["BOOKWORM_INTERVAL"].Value)
 	}
+	readiness := watchdog.Spec.Template.Spec.Containers[0].ReadinessProbe
+	if readiness == nil || readiness.GRPC == nil || readiness.GRPC.Port != int32(8081) {
+		t.Fatalf("expected watchdog gRPC readiness probe, got %#v", readiness)
+	}
 
 	var statefulSet appsv1.StatefulSet
 	if err := client.Get(context.Background(), types.NamespacedName{Name: "demo-olric", Namespace: "default"}, &statefulSet); err == nil {

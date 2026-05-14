@@ -71,12 +71,18 @@ type Service struct {
 
 	epochErrMu sync.RWMutex
 	epochErr   error
+
+	leadershipObservers []LeadershipObserver
 }
 
 type stackState struct {
 	cluster     *stackwatchdog.ClusterState
 	subscribers map[string]*subscriber
 	loadedEpoch bool
+}
+
+type LeadershipObserver interface {
+	SetLeadership(role topologypb.WatchdogRole, generation int64)
 }
 
 type subscriber struct {
@@ -414,11 +420,28 @@ func (s *Service) SetLeadership(role topologypb.WatchdogRole, generation int64) 
 	if generation > 0 {
 		s.cfg.Generation = generation
 	}
+	currentGeneration := s.cfg.Generation
+	observers := append([]LeadershipObserver(nil), s.leadershipObservers...)
 	s.cfgMu.Unlock()
 
 	if demoted {
 		s.closeSubscribersForLeadershipChange()
 	}
+	for _, observer := range observers {
+		observer.SetLeadership(role, currentGeneration)
+	}
+}
+
+func (s *Service) AddLeadershipObserver(observer LeadershipObserver) {
+	if observer == nil {
+		return
+	}
+	s.cfgMu.Lock()
+	s.leadershipObservers = append(s.leadershipObservers, observer)
+	role := s.cfg.Role
+	generation := s.cfg.Generation
+	s.cfgMu.Unlock()
+	observer.SetLeadership(role, generation)
 }
 
 func (s *Service) closeSubscribersForLeadershipChange() {

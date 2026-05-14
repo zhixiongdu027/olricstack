@@ -59,6 +59,9 @@ func main() {
 
 	server := grpc.NewServer()
 	topologypb.RegisterTopologyControlServer(server, topologyService)
+	leadershipHealth := stackwatchdog.NewLeadershipHealth()
+	leadershipHealth.Register(server)
+	topologyService.AddLeadershipObserver(leadershipHealth)
 	go func() {
 		<-ctx.Done()
 		server.GracefulStop()

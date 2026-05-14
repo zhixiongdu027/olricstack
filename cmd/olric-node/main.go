@@ -16,6 +16,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 func main() {
@@ -103,7 +104,7 @@ func runTopologySubscription(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(retryInterval):
+		case <-time.After(wait.Jitter(retryInterval, 0.2)):
 		}
 	}
 }

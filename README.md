@@ -58,6 +58,8 @@ The Watchdog also runs a bookworm loop: it periodically pushes the complete stru
 
 Watchdog is designed for primary/standby operation. Only the primary accepts node membership and pushes topology. Standby instances expose their role and generation but do not own topology. When `STACK_ID` is set, Watchdog starts as standby and must win the per-stack Kubernetes Lease before becoming primary; `WATCHDOG_ROLE` is only a local fallback when election is not enabled. The bootstrap Operator creates two Watchdog replicas by default so they can compete for the Lease.
 
+The Watchdog Deployment exposes gRPC health as readiness and reports `SERVING` only while primary. Kubernetes Services therefore route node topology streams to the current primary instead of load-balancing equally across primary and standby replicas.
+
 ## Watchdog State Model
 
 Watchdog keeps one state machine per stack. Node heartbeats are the primary source of membership: a node is not added to topology until it reports through the subscription stream. Kubernetes Pod observations are secondary: they never create membership by themselves, but they can enrich node state and exclude a heartbeating node if Kubernetes reports the pod as terminal (`Failed` or `Succeeded`).

@@ -89,6 +89,13 @@ func WatchdogDeployment(stack *olricv1alpha1.OlricStack) *appsv1.Deployment {
 							Name:          "grpc",
 							ContainerPort: WatchdogPort,
 						}},
+						ReadinessProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								GRPC: &corev1.GRPCAction{Port: WatchdogPort},
+							},
+							PeriodSeconds:    2,
+							FailureThreshold: 1,
+						},
 						Env: []corev1.EnvVar{
 							{Name: "WATCHDOG_ADDR", Value: fmt.Sprintf(":%d", WatchdogPort)},
 							{Name: "STACK_ID", Value: stack.Name},
