@@ -124,6 +124,47 @@ func TestControllerReportsPodObservations(t *testing.T) {
 	}
 }
 
+func TestControllerPreservesExistingStatefulSetImmutableFields(t *testing.T) {
+	scheme := newTestScheme(t)
+	replicas := int32(2)
+	stack := &olricv1alpha1.OlricStack{
+		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "default"},
+		Spec: olricv1alpha1.OlricStackSpec{
+			Replicas: &replicas,
+			MySQLDSNSecret: corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "mysql"},
+				Key:                  "dsn",
+			},
+		},
+	}
+	existing := workloads.OlricStatefulSet(stack)
+	existing.Spec.ServiceName = "legacy-service"
+	existing.Spec.VolumeClaimTemplates = nil
+
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(stack, existing).Build()
+	controller, err := NewController(k8sClient, scheme, ControllerConfig{StackID: "demo", Namespace: "default"})
+	if err != nil {
+		t.Fatalf("new controller: %v", err)
+	}
+	if err := controller.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+
+	var updated appsv1.StatefulSet
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "demo-olric", Namespace: "default"}, &updated); err != nil {
+		t.Fatalf("get statefulset: %v", err)
+	}
+	if updated.Spec.ServiceName != "legacy-service" {
+		t.Fatalf("expected existing service name to be preserved, got %q", updated.Spec.ServiceName)
+	}
+	if len(updated.Spec.VolumeClaimTemplates) != 0 {
+		t.Fatalf("expected existing volume claim templates to be preserved, got %#v", updated.Spec.VolumeClaimTemplates)
+	}
+	if got := *updated.Spec.Replicas; got != replicas {
+		t.Fatalf("expected mutable replicas to update to %d, got %d", replicas, got)
+	}
+}
+
 type recordingObserver struct {
 	stackID      string
 	observations []PodObservation

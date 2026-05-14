@@ -162,6 +162,7 @@ func OlricStatefulSet(stack *olricv1alpha1.OlricStack) *appsv1.StatefulSet {
 							{Name: "WATCHDOG_RECONNECT_INTERVAL", Value: "3s"},
 							{Name: "DIRTY_QUEUE_SIZE", Value: "1024"},
 							{Name: "FLUSH_INTERVAL", Value: "1s"},
+							{Name: "FLUSH_BACKOFF", Value: "1s"},
 							{Name: "FLUSH_BATCH_SIZE", Value: "256"},
 							{Name: "WAL_PATH", Value: "/var/lib/olricstack/cache.wal"},
 							{Name: "MYSQL_DSN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &stack.Spec.MySQLDSNSecret}},

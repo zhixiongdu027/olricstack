@@ -152,6 +152,30 @@ func TestMySQLStoreCloseReportsFinalFlushFailure(t *testing.T) {
 	}
 }
 
+func TestMySQLStoreFlushBackoffAfterFailure(t *testing.T) {
+	cacheStore := newTestStore(t, Config{
+		FlushBackoff:  time.Hour,
+		FlushInterval: time.Hour,
+	})
+	pending := map[string][]byte{"a": []byte("1")}
+
+	sqlDB, err := cacheStore.db.DB()
+	if err != nil {
+		t.Fatalf("get sql db: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close sql db: %v", err)
+	}
+
+	if cacheStore.flushPending(pending) {
+		t.Fatal("expected flush failure")
+	}
+	cacheStore.deferFlush()
+	if cacheStore.flushWAL(false) {
+		t.Fatal("flush should be deferred after failure")
+	}
+}
+
 func TestMySQLStoreRejectsStoreAfterClose(t *testing.T) {
 	cacheStore := newTestStore(t, Config{})
 	closeStore(t, cacheStore)
@@ -318,6 +342,33 @@ func TestMySQLStoreDeleteFlushedKeepsNewerWALValue(t *testing.T) {
 	}
 	if string(value) != "new" {
 		t.Fatalf("new WAL value was deleted by old flush: %q", value)
+	}
+	closeStore(t, cacheStore)
+}
+
+func TestMySQLStoreStoreVersionedUsesCallerVersion(t *testing.T) {
+	cacheStore := newTestStore(t, Config{FlushInterval: time.Hour})
+	if err := cacheStore.StoreVersioned(context.Background(), "versioned", []byte("v10"), 10); err != nil {
+		t.Fatalf("store versioned: %v", err)
+	}
+	entries, err := cacheStore.loadDirtyBatch(1)
+	if err != nil {
+		t.Fatalf("load dirty batch: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one entry, got %d", len(entries))
+	}
+	if entries[0].Version != 10 {
+		t.Fatalf("expected caller version 10, got %d", entries[0].Version)
+	}
+	closeStore(t, cacheStore)
+}
+
+func TestMySQLStoreStoreVersionedRejectsInvalidVersion(t *testing.T) {
+	cacheStore := newTestStore(t, Config{})
+	err := cacheStore.StoreVersioned(context.Background(), "versioned", []byte("bad"), 0)
+	if err == nil {
+		t.Fatal("expected invalid version error")
 	}
 	closeStore(t, cacheStore)
 }

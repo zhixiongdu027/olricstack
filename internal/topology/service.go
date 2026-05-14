@@ -145,6 +145,9 @@ func (s *Service) GetTopology(ctx context.Context, req *topologypb.TopologyQuery
 	if req.GetStackId() == "" {
 		return nil, errors.New("stack_id is required")
 	}
+	if !s.isPrimary() {
+		return s.standbyEnvelope(req.GetStackId()), nil
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

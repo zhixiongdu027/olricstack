@@ -24,6 +24,7 @@ OlricStack is a stack-based distributed KV platform prototype. Each stack is int
 - `POD_IP`: current pod IP.
 - `DIRTY_QUEUE_SIZE`: optional queue capacity, default `1024`.
 - `FLUSH_INTERVAL`: optional Go duration, default `1s`.
+- `FLUSH_BACKOFF`: optional retry backoff after a failed MySQL flush, default `1s`.
 - `FLUSH_BATCH_SIZE`: optional batch size, default `256`.
 - `WAL_PATH`: local durable dirty-write log path, default `/var/lib/olricstack/cache.wal` in `olric-node`.
 - `HEARTBEAT_INTERVAL`: optional Watchdog heartbeat interval, default `10s`.
@@ -76,6 +77,8 @@ The primary Watchdog persists the latest topology epoch into a stack-local Confi
 Olric node Pods mount a StatefulSet `ReadWriteOnce` PVC at `/var/lib/olricstack`; the WAL path defaults to `/var/lib/olricstack/cache.wal`, so accepted dirty writes survive container restarts and normal Pod rescheduling for the same ordinal.
 
 The MySQL row stores `version` and `writer_id`; stale flushes cannot overwrite a newer row. This closes the common split line where node A flushes an old value after node B has already persisted a newer value. Strong cross-node write ordering still depends on the data-plane routing/fencing layer: the same key must have one active write owner at a time, or callers must provide a stronger domain version.
+
+The store also exposes `StoreVersioned` so the data plane can pass a fencing/owner version instead of relying on local node wall-clock time for final MySQL conflict ordering.
 
 Watchdog reconciles Pod observations by Pod name first and only falls back to Pod IP for nodes without a known Pod name. This avoids marking an old member terminal when Kubernetes rapidly reuses an IP for a different Pod. If a primary Watchdog loses its Kubernetes Lease, it demotes itself and closes existing topology streams so nodes reconnect or let their local topology lease expire before accepting more writes.
 

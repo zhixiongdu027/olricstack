@@ -27,6 +27,11 @@ type CacheStore interface {
 	Close(ctx context.Context) error
 }
 
+type VersionedCacheStore interface {
+	CacheStore
+	StoreVersioned(ctx context.Context, key string, value []byte, version int64) error
+}
+
 type Record struct {
 	Key       string `gorm:"primaryKey;size:512;column:key"`
 	Value     []byte `gorm:"column:value;type:longblob;not null"`
@@ -45,6 +50,7 @@ type Config struct {
 	BatchSize     int
 	WALPath       string
 	NodeID        string
+	FlushBackoff  time.Duration
 }
 
 func (c Config) withDefaults() Config {
@@ -59,6 +65,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.WALPath == "" {
 		c.WALPath = filepath.Join(os.TempDir(), "olricstack-cache.wal")
+	}
+	if c.FlushBackoff <= 0 {
+		c.FlushBackoff = c.FlushInterval
 	}
 	if c.NodeID == "" {
 		c.NodeID = "unknown"
@@ -91,11 +100,13 @@ type MySQLStore struct {
 	mu          sync.Mutex
 	closeOnce   sync.Once
 	closing     bool
+	nextFlushAt time.Time
 	workerErrMu sync.Mutex
 	workerErr   error
 }
 
 var _ CacheStore = (*MySQLStore)(nil)
+var _ VersionedCacheStore = (*MySQLStore)(nil)
 
 func NewMySQLStore(db *gorm.DB, cfg Config) (*MySQLStore, error) {
 	if db == nil {
@@ -145,6 +156,17 @@ func (s *MySQLStore) Load(ctx context.Context, key string) ([]byte, error) {
 }
 
 func (s *MySQLStore) Store(ctx context.Context, key string, value []byte) error {
+	return s.store(ctx, key, value, 0)
+}
+
+func (s *MySQLStore) StoreVersioned(ctx context.Context, key string, value []byte, version int64) error {
+	if version <= 0 {
+		return errors.New("version must be positive")
+	}
+	return s.store(ctx, key, value, version)
+}
+
+func (s *MySQLStore) store(ctx context.Context, key string, value []byte, version int64) error {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
@@ -154,7 +176,7 @@ func (s *MySQLStore) Store(ctx context.Context, key string, value []byte) error 
 		s.mu.Unlock()
 		return err
 	}
-	depth, err := s.appendDirty(key, value)
+	depth, err := s.appendDirty(key, value, version)
 	if err != nil {
 		s.mu.Unlock()
 		return err
@@ -197,14 +219,14 @@ func (s *MySQLStore) flushLoop() {
 		select {
 		case _, ok := <-s.notify:
 			if !ok {
-				s.flushWAL()
+				s.flushWAL(true)
 				return
 			}
-			s.flushWAL()
+			s.flushWAL(false)
 		case <-ticker.C:
-			s.flushWAL()
+			s.flushWAL(false)
 		case <-s.done:
-			s.flushWAL()
+			s.flushWAL(true)
 			return
 		}
 	}
@@ -219,7 +241,10 @@ func (s *MySQLStore) flushPending(pending map[string][]byte) bool {
 	return s.flushEntries(entries)
 }
 
-func (s *MySQLStore) flushWAL() bool {
+func (s *MySQLStore) flushWAL(force bool) bool {
+	if !force && !s.flushReady(time.Now()) {
+		return false
+	}
 	entries, err := s.loadDirtyBatch(s.cfg.BatchSize)
 	if err != nil {
 		s.setWorkerError(fmt.Errorf("load dirty wal: %w", err))
@@ -230,6 +255,7 @@ func (s *MySQLStore) flushWAL() bool {
 		return true
 	}
 	if !s.flushEntries(entries) {
+		s.deferFlush()
 		return false
 	}
 	if err := s.deleteFlushed(entries); err != nil {
@@ -240,6 +266,18 @@ func (s *MySQLStore) flushWAL() bool {
 		s.notifyFlush()
 	}
 	return true
+}
+
+func (s *MySQLStore) flushReady(now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.nextFlushAt.IsZero() || !now.Before(s.nextFlushAt)
+}
+
+func (s *MySQLStore) deferFlush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextFlushAt = time.Now().Add(s.cfg.FlushBackoff)
 }
 
 func (s *MySQLStore) flushEntries(entries []dirtyEntry) bool {
@@ -261,6 +299,9 @@ func (s *MySQLStore) flushEntries(entries []dirtyEntry) bool {
 		return false
 	}
 	s.setWorkerError(nil)
+	s.mu.Lock()
+	s.nextFlushAt = time.Time{}
+	s.mu.Unlock()
 	return true
 }
 
@@ -285,7 +326,7 @@ func openWAL(path string) (*bolt.DB, error) {
 	return db, nil
 }
 
-func (s *MySQLStore) appendDirty(key string, value []byte) (int, error) {
+func (s *MySQLStore) appendDirty(key string, value []byte, version int64) (int, error) {
 	entry := dirtyEntry{
 		Key:       key,
 		Value:     append([]byte(nil), value...),
@@ -299,7 +340,7 @@ func (s *MySQLStore) appendDirty(key string, value []byte) (int, error) {
 			return ErrQueueFull
 		}
 		meta := tx.Bucket(walMetaBucket)
-		entry.Version = nextVersion(meta, entry.UpdatedAt)
+		entry.Version = nextVersion(meta, entry.UpdatedAt, version)
 		encoded, err := json.Marshal(entry)
 		if err != nil {
 			return err
@@ -373,12 +414,15 @@ func (s *MySQLStore) deleteFlushed(entries []dirtyEntry) error {
 	})
 }
 
-func nextVersion(bucket *bolt.Bucket, now time.Time) int64 {
+func nextVersion(bucket *bolt.Bucket, now time.Time, requested int64) int64 {
 	var current uint64
 	if encoded := bucket.Get(walVersionKey); len(encoded) == 8 {
 		current = binary.BigEndian.Uint64(encoded)
 	}
 	next := uint64(now.UnixNano())
+	if requested > 0 {
+		next = uint64(requested)
+	}
 	if next <= current {
 		next = current + 1
 	}

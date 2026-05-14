@@ -8,6 +8,7 @@ import (
 
 	olricv1alpha1 "github.com/zhixiongdu/olricstack/api/olric/v1alpha1"
 	"github.com/zhixiongdu/olricstack/internal/workloads"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -155,6 +156,11 @@ func (c *Controller) applyOwned(ctx context.Context, desired client.Object) erro
 		typed.Spec.ClusterIPs = currentSvc.Spec.ClusterIPs
 		typed.Spec.IPFamilies = currentSvc.Spec.IPFamilies
 		typed.Spec.IPFamilyPolicy = currentSvc.Spec.IPFamilyPolicy
+	case *appsv1.StatefulSet:
+		currentStatefulSet := current.(*appsv1.StatefulSet)
+		typed.Spec.ServiceName = currentStatefulSet.Spec.ServiceName
+		typed.Spec.Selector = currentStatefulSet.Spec.Selector
+		typed.Spec.VolumeClaimTemplates = currentStatefulSet.Spec.VolumeClaimTemplates
 	}
 	return c.Update(ctx, desired)
 }

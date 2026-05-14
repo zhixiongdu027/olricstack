@@ -144,6 +144,23 @@ func TestStandbyRejectsTopologyOwnership(t *testing.T) {
 	}
 }
 
+func TestStandbyGetTopologyDoesNotReturnOwnedMembers(t *testing.T) {
+	service := NewServiceWithConfig(Config{Role: topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY})
+	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1)})
+	service.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, 1)
+
+	resp, err := service.GetTopology(context.Background(), &topologypb.TopologyQuery{StackId: "stack-a"})
+	if err != nil {
+		t.Fatalf("get topology: %v", err)
+	}
+	if len(resp.GetMembers()) != 0 {
+		t.Fatalf("standby must not return stale owned members, got %v", resp.GetMembers())
+	}
+	if resp.GetWatchdogRole() != topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY {
+		t.Fatalf("expected standby role")
+	}
+}
+
 func TestServiceReplacesOlderSubscriberWithNewerIncarnation(t *testing.T) {
 	service := NewService()
 	oldSub := &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1), done: make(chan struct{})}
