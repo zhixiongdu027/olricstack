@@ -223,3 +223,54 @@ func newTestService(t *testing.T, provider DMapProvider, backing store.CacheStor
 }
 
 var _ store.CacheStore = (*recordingStore)(nil)
+
+type recordingCommitStore struct {
+	*recordingStore
+	nextVersion int64
+}
+
+func newRecordingCommitStore() *recordingCommitStore {
+	return &recordingCommitStore{
+		recordingStore: newRecordingStore(),
+		nextVersion:    1,
+	}
+}
+
+func (s *recordingCommitStore) PrepareEntry(ctx context.Context, record store.EntryRecord) (store.EntryRecord, error) {
+	record.WALState = store.WALStatePrepared
+	record.FlushMySQL = false
+	return s.storePrepared(record)
+}
+
+func (s *recordingCommitStore) PrepareDelete(ctx context.Context, ref store.EntryRef) (store.EntryRecord, error) {
+	return s.storePrepared(store.EntryRecord{
+		DMap:      ref.DMap,
+		Key:       ref.Key,
+		HKey:      ref.HKey,
+		Tombstone: true,
+		WALState:  store.WALStatePrepared,
+	})
+}
+
+func (s *recordingCommitStore) CommitEntry(ctx context.Context, ref store.EntryRef, version int64) error {
+	record, ok := s.records[ref.HKey]
+	if !ok || record.Version != version {
+		return store.ErrNotFound
+	}
+	record.WALState = store.WALStateCommitted
+	record.FlushMySQL = true
+	s.records[ref.HKey] = record.Clone()
+	return nil
+}
+
+func (s *recordingCommitStore) storePrepared(record store.EntryRecord) (store.EntryRecord, error) {
+	if s.storeErr != nil {
+		return store.EntryRecord{}, s.storeErr
+	}
+	record.Version = s.nextVersion
+	s.nextVersion++
+	s.records[record.HKey] = record.Clone()
+	return record.Clone(), nil
+}
+
+var _ store.CommitStore = (*recordingCommitStore)(nil)

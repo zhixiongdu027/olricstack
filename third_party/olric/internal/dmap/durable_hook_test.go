@@ -132,18 +132,30 @@ type recordingDurableHook struct {
 	loadErr error
 }
 
-func (h *recordingDurableHook) BeforeSet(ctx context.Context, op config.DurableOperation) error {
+func (h *recordingDurableHook) BeforeSet(ctx context.Context, op config.DurableOperation) (config.DurableOperation, error) {
 	h.record(op.Origin)
+	return op, nil
+}
+
+func (h *recordingDurableHook) AfterSet(ctx context.Context, op config.DurableOperation) error {
 	return nil
 }
 
-func (h *recordingDurableHook) BeforeDelete(ctx context.Context, op config.DurableOperation) error {
+func (h *recordingDurableHook) BeforeDelete(ctx context.Context, op config.DurableOperation) (config.DurableOperation, error) {
 	h.record(op.Origin)
+	return op, nil
+}
+
+func (h *recordingDurableHook) AfterDelete(ctx context.Context, op config.DurableOperation) error {
 	return nil
 }
 
-func (h *recordingDurableHook) BeforeExpire(ctx context.Context, op config.DurableOperation) error {
+func (h *recordingDurableHook) BeforeExpire(ctx context.Context, op config.DurableOperation) (config.DurableOperation, error) {
 	h.record(op.Origin)
+	return op, nil
+}
+
+func (h *recordingDurableHook) AfterExpire(ctx context.Context, op config.DurableOperation) error {
 	return nil
 }
 

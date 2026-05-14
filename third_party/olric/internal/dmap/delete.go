@@ -133,7 +133,7 @@ func (dm *DMap) deleteKey(ctx context.Context, key string) error {
 	// Check the HKey before trying to delete it.
 	if !f.storage.Check(hkey) {
 		if dm.s.config.DurableHook != nil {
-			err := dm.s.config.DurableHook.BeforeDelete(ctx, config.DurableOperation{
+			op, err := dm.s.config.DurableHook.BeforeDelete(ctx, config.DurableOperation{
 				DMap:        dm.name,
 				Key:         key,
 				HKey:        hkey,
@@ -143,13 +143,16 @@ func (dm *DMap) deleteKey(ctx context.Context, key string) error {
 			if err != nil {
 				return err
 			}
+			if err := dm.s.config.DurableHook.AfterDelete(ctx, op); err != nil {
+				return err
+			}
 		}
 		// DeleteMisses is the number of deletions reqs for missing keys
 		DeleteMisses.Increase(1)
 		return nil
 	}
 	if dm.s.config.DurableHook != nil {
-		err := dm.s.config.DurableHook.BeforeDelete(ctx, config.DurableOperation{
+		op, err := dm.s.config.DurableHook.BeforeDelete(ctx, config.DurableOperation{
 			DMap:        dm.name,
 			Key:         key,
 			HKey:        hkey,
@@ -159,6 +162,10 @@ func (dm *DMap) deleteKey(ctx context.Context, key string) error {
 		if err != nil {
 			return err
 		}
+		if err := dm.deleteOnCluster(hkey, key, f); err != nil {
+			return err
+		}
+		return dm.s.config.DurableHook.AfterDelete(ctx, op)
 	}
 
 	return dm.deleteOnCluster(hkey, key, f)

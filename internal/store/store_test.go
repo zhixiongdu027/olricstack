@@ -299,6 +299,46 @@ func TestMySQLStoreDoesNotFlushLocalOnlyEntries(t *testing.T) {
 	}
 }
 
+func TestMySQLStoreDoesNotFlushPreparedEntriesBeforeCommit(t *testing.T) {
+	db := newTestDB(t)
+	walPath := filepath.Join(t.TempDir(), "cache.wal")
+	cacheStore := newTestStoreWithDB(t, db, Config{
+		WALPath:       walPath,
+		FlushInterval: time.Hour,
+		BatchSize:     16,
+	})
+
+	prepared, err := cacheStore.PrepareEntry(context.Background(), testFlushableRecord("prepared", 32, []byte("value")))
+	if err != nil {
+		t.Fatalf("prepare entry: %v", err)
+	}
+	if prepared.WALState != WALStatePrepared || prepared.FlushMySQL {
+		t.Fatalf("expected unflushable prepared record, got %#v", prepared)
+	}
+	if cacheStore.flushWAL(true) {
+		reader := newTestStoreWithDB(t, db, Config{WALPath: filepath.Join(t.TempDir(), "reader-before.wal")})
+		if _, err := reader.LoadEntry(context.Background(), testRef("prepared", 32)); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("prepared record flushed before commit: %v", err)
+		}
+		closeStore(t, reader)
+	}
+
+	if err := cacheStore.CommitEntry(context.Background(), prepared.Ref(), prepared.Version); err != nil {
+		t.Fatalf("commit entry: %v", err)
+	}
+	closeStore(t, cacheStore)
+
+	reader := newTestStoreWithDB(t, db, Config{WALPath: filepath.Join(t.TempDir(), "reader-after.wal")})
+	defer closeStore(t, reader)
+	record, err := reader.LoadEntry(context.Background(), testRef("prepared", 32))
+	if err != nil {
+		t.Fatalf("load committed value: %v", err)
+	}
+	if string(record.EncodedEntry) != "value" {
+		t.Fatalf("unexpected committed value: %q", record.EncodedEntry)
+	}
+}
+
 func TestMySQLStoreVersionedFlushDoesNotOverwriteNewerValue(t *testing.T) {
 	cacheStore := newTestStore(t, Config{NodeID: "node-a"})
 	now := time.Now()

@@ -110,40 +110,43 @@ The storage engine can safely provide local memory and local WAL behavior. Globa
 MySQL source-of-truth behavior needs operation context from the DMap/business
 layer.
 
-## In-Process Proxy Boundary
+## Owner-Side Durable Hook Boundary
 
-The preferred implementation keeps Olric as an in-process black box behind an
-OlricStack string KV proxy. The proxy receives the client request, enforces the
-serving lease, writes the local WAL before applying client-visible Olric
-mutations, and lets the asynchronous flusher write MySQL.
+The preferred implementation keeps Olric's routing and partition ownership as the
+single authority. The client-facing string KV layer receives the request and
+enforces the serving lease, but it must not write the WAL directly. The request is
+then applied through Olric's DMap API. If the first ingress node is not the
+primary owner for `(dmap, key)`, Olric routes the operation to the owner through
+its internal protocol.
 
-This preserves the durable contract without teaching Olric's generic storage
-engine about MySQL. Native Olric APIs can still exist for cache/development use,
-but they are not part of the durable MySQL contract unless they are routed
-through the proxy.
+The WAL/MySQL contract starts only inside owner-side DMap business paths. This is
+the boundary that prevents WAL drift on a non-owner ingress node. Native Olric
+APIs can still exist for cache/development use, but durable MySQL semantics only
+apply to operations that reach these owner-side durable hooks.
 
 Write ordering for durable operations:
 
 1. Validate the topology lease.
-2. Append the client operation to local WAL with `FlushMySQL=true`.
-3. Apply the operation to Olric through its public DMap API.
-4. Acknowledge the client only after the WAL append and Olric mutation succeed.
-5. Flush MySQL asynchronously from WAL.
+2. Apply the operation through Olric's DMap API.
+3. Olric routes the operation to the current primary owner.
+4. The owner-side durable hook records the operation in local WAL.
+5. Olric applies the in-memory mutation and replication/quorum path.
+6. Acknowledge the client only after the owner-side path returns success.
+7. Flush MySQL asynchronously from WAL.
 
-If the WAL append fails, Olric must not be mutated. If the WAL append succeeds
-but the Olric mutation fails, the request should fail to the client while the WAL
-entry remains available for replay/recovery. This is safer than acknowledging a
-write that has no durable record.
+This ordering still needs a commit protocol. A pre-mutation WAL append can create
+a durable record for an Olric mutation that later fails. The production target is
+therefore a two-phase WAL state such as `prepared -> committed`, where the
+flusher only exports committed records. Until this exists, the implementation is
+a correctness prototype rather than a production-complete durable write protocol.
 
-`GET` read-through also belongs in the proxy: on an Olric miss, the proxy checks
-the lease again, loads MySQL by `(dmap, hkey)`, rejects tombstones/expired
-records, refills Olric without marking the refill as MySQL-flushable, and returns
-the string value.
+`GET` read-through also belongs in the owner-side miss path. On an owner-side
+Olric miss, the durable hook may load MySQL by `(dmap, hkey)`, reject tombstones
+or expired records, and refill Olric without marking the refill as
+MySQL-flushable. The refill must be conditional so that stale MySQL data cannot
+overwrite a concurrent successful write.
 
 ## Minimal Olric Fork Boundary
-
-This is an optional fallback for future owner-context hooks, not the default
-persistence implementation.
 
 Forking Olric is acceptable, but the fork must avoid algorithm changes. The fork
 should only add context and hooks around existing algorithm decisions.
@@ -242,21 +245,24 @@ and maintenance reads must not execute step 7.
 Client primary `SET` must:
 
 1. Check serving lease.
-2. Route to the current primary owner.
-3. Build a string KV record with value, TTL, timestamp, and tombstone=false.
-4. Append the record to local WAL before acknowledging.
-5. Apply the normal Olric write path.
-6. Let the asynchronous flusher write the primary-origin record to MySQL.
+2. Enter Olric's normal write path.
+3. Route to the current primary owner through Olric if ingress is not the owner.
+4. Build a string KV record with value, TTL, timestamp, and tombstone=false in
+   the owner-side hook.
+5. Append a prepared WAL record before the memory mutation.
+6. Commit the WAL record only after the Olric write/quorum path succeeds.
+7. Let the asynchronous flusher write committed primary-origin records to MySQL.
 
 ### DEL
 
 Client primary `DEL` must:
 
 1. Check serving lease.
-2. Route to the current primary owner.
-3. Append a tombstone record to local WAL even if Olric memory misses.
-4. Delete from Olric memory and replicas through the normal Olric path if present.
-5. Flush the tombstone to MySQL asynchronously.
+2. Enter Olric's normal delete path.
+3. Route to the current primary owner through Olric if ingress is not the owner.
+4. Append a tombstone WAL record on the owner even if Olric memory misses.
+5. Delete from Olric memory and replicas through the normal Olric path if present.
+6. Commit and flush the tombstone to MySQL asynchronously.
 
 This prevents MySQL refill from resurrecting a previously deleted key.
 
@@ -265,10 +271,12 @@ This prevents MySQL refill from resurrecting a previously deleted key.
 Client primary `EXPIRE` must:
 
 1. Check serving lease.
-2. Route to the current primary owner.
-3. Update Olric TTL if the key is resident.
-4. Persist the TTL update to local WAL/MySQL.
-5. If Olric misses but MySQL has a live key, either persist the new TTL directly
+2. Enter Olric's normal expire path.
+3. Route to the current primary owner through Olric if ingress is not the owner.
+4. Persist the TTL update in owner-local WAL only after confirming the key is
+   resident.
+5. Update Olric TTL.
+6. If Olric misses but MySQL has a live key, either persist the new TTL directly
    or refill then update TTL. The behavior must be explicit and tested.
 
 ## WAL Model
@@ -281,11 +289,13 @@ and TTL updates.
 The WAL must record:
 
 - operation origin;
+- operation state (`prepared`, `committed`, `local_refill`, or `tombstone`);
 - dmap/key/hkey;
 - value for string SET/refill;
 - TTL and timestamp;
 - tombstone flag;
 - local WAL sequence;
+- owner fence (`watchdog_generation`, topology epoch, partition ID, owner ID);
 - MySQL flush eligibility.
 
 WAL replay should restore only local state that belongs to the local fragment
@@ -307,9 +317,17 @@ The durable string record should contain:
 - `writer_id`
 - `updated_at`
 
-`version` should be derived from a logical write sequence or entry timestamp for
-primary-origin business operations. Local wall-clock flush time is not sufficient
-as the primary correctness mechanism.
+`version` must be derived from owner fencing, not local wall-clock time. The
+minimum production fence is:
+
+- stack ID;
+- partition ID;
+- Watchdog generation;
+- topology epoch;
+- owner/member incarnation;
+- per-owner monotonic write sequence.
+
+MySQL last-write-wins is only valid inside this fenced ordering.
 
 ## Serving Lease And Read Safety
 
@@ -335,23 +353,41 @@ Minimum policy:
 - Document that native Olric APIs are cache/development paths unless routed
   through the durable string KV proxy.
 
-### Phase 1: String KV Proxy API
+### Phase 1: Owner-Side Durable Hook API
 
 - Add the string KV business entry point.
 - Add serving lease checks at the business entry point.
-- Add primary-owner `GET` miss MySQL refill hook.
-- Add client primary `SET/DEL/EXPIRE` persistence hooks.
+- Add owner-side `GET` miss MySQL refill hook.
+- Add owner-side `SET/DEL/EXPIRE` persistence hooks.
 - Add origin metadata and persistence eligibility.
 
-### Phase 2: Owner Context Hardening
+### Phase 2: Owner Context Hardening And WAL State
 
-- Route or reject proxy requests so only the current owner accepts writes for a
-  key.
+- Keep Olric routing as the only owner routing authority.
+- Prove non-owner ingress does not write WAL.
+- Add WAL `prepared -> committed` state.
+- Ensure only committed records are MySQL-flushable.
+- Ensure failed Olric writes cannot later become visible in MySQL.
 - Ensure WAL replay is fragment-scoped.
 - Keep backup/read-repair/migration operations local-only.
 - Keep Olric routing/quorum/read-repair/migration algorithms unchanged.
 
-### Phase 3: Failure Testing
+### Phase 3: Read-Through And Refill Hardening
+
+- Make MySQL refill conditional on the key still being absent under the fragment
+  lock.
+- Prevent local-only refill records from overwriting flushable dirty WAL records.
+- Add singleflight for concurrent MySQL loads.
+- Add checkpoint cleanup for local-only refill records.
+
+### Phase 4: Owner Fence And Handoff
+
+- Replace wall-clock MySQL versions with owner-fenced versions.
+- Prevent stale previous-owner flushes from overwriting newer owner writes.
+- Define durable handoff during fragment migration/rebalance.
+- Ensure new owner readiness requires equivalent durable recovery source.
+
+### Phase 5: Failure Testing
 
 Add tests for:
 
@@ -363,6 +399,10 @@ Add tests for:
 - Old owner with memory-resident data cannot serve client `GET` after lease loss.
 - MySQL outage after accepted WAL write does not lose the write.
 - MySQL refill does not participate in read quorum as an extra replica.
+- Failed Olric mutation after prepared WAL does not flush to MySQL.
+- Read-through refill cannot overwrite a concurrent successful write.
+- Previous owner delayed flush cannot overwrite a newer fenced owner write.
+- Fragment migration cannot lose unflushed owner-local WAL state.
 
 ## Non-Goals
 

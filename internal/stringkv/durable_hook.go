@@ -26,22 +26,55 @@ func NewDurableHook(backing store.CacheStore) (*DurableHook, error) {
 	}, nil
 }
 
-func (h *DurableHook) BeforeSet(ctx context.Context, op olricconfig.DurableOperation) error {
+func (h *DurableHook) BeforeSet(ctx context.Context, op olricconfig.DurableOperation) (olricconfig.DurableOperation, error) {
 	if op.Entry == nil {
-		return errors.New("durable set entry is nil")
+		return op, errors.New("durable set entry is nil")
 	}
-	return h.store.StoreEntry(ctx, h.record(op, op.Entry, "client_set", true))
+	record := h.record(op, op.Entry, "client_set", true)
+	if committer, ok := h.store.(store.CommitStore); ok {
+		prepared, err := committer.PrepareEntry(ctx, record)
+		op.Version = prepared.Version
+		return op, err
+	}
+	err := h.store.StoreEntry(ctx, record)
+	return op, err
 }
 
-func (h *DurableHook) BeforeDelete(ctx context.Context, op olricconfig.DurableOperation) error {
-	return h.store.DeleteEntry(ctx, store.EntryRef{DMap: op.DMap, Key: op.Key, HKey: op.HKey})
+func (h *DurableHook) AfterSet(ctx context.Context, op olricconfig.DurableOperation) error {
+	return h.commit(ctx, op)
 }
 
-func (h *DurableHook) BeforeExpire(ctx context.Context, op olricconfig.DurableOperation) error {
-	if op.Entry == nil {
-		return errors.New("durable expire entry is nil")
+func (h *DurableHook) BeforeDelete(ctx context.Context, op olricconfig.DurableOperation) (olricconfig.DurableOperation, error) {
+	ref := store.EntryRef{DMap: op.DMap, Key: op.Key, HKey: op.HKey}
+	if committer, ok := h.store.(store.CommitStore); ok {
+		prepared, err := committer.PrepareDelete(ctx, ref)
+		op.Version = prepared.Version
+		return op, err
 	}
-	return h.store.StoreEntry(ctx, h.record(op, op.Entry, "client_expire", true))
+	err := h.store.DeleteEntry(ctx, ref)
+	return op, err
+}
+
+func (h *DurableHook) AfterDelete(ctx context.Context, op olricconfig.DurableOperation) error {
+	return h.commit(ctx, op)
+}
+
+func (h *DurableHook) BeforeExpire(ctx context.Context, op olricconfig.DurableOperation) (olricconfig.DurableOperation, error) {
+	if op.Entry == nil {
+		return op, errors.New("durable expire entry is nil")
+	}
+	record := h.record(op, op.Entry, "client_expire", true)
+	if committer, ok := h.store.(store.CommitStore); ok {
+		prepared, err := committer.PrepareEntry(ctx, record)
+		op.Version = prepared.Version
+		return op, err
+	}
+	err := h.store.StoreEntry(ctx, record)
+	return op, err
+}
+
+func (h *DurableHook) AfterExpire(ctx context.Context, op olricconfig.DurableOperation) error {
+	return h.commit(ctx, op)
 }
 
 func (h *DurableHook) LoadOnMiss(ctx context.Context, op olricconfig.DurableOperation) (olricstorage.Entry, error) {
@@ -78,6 +111,17 @@ func (h *DurableHook) record(op olricconfig.DurableOperation, entry olricstorage
 		FlushMySQL:   flush,
 		UpdatedAt:    now.UTC(),
 	}
+}
+
+func (h *DurableHook) commit(ctx context.Context, op olricconfig.DurableOperation) error {
+	if op.Version == 0 {
+		return nil
+	}
+	committer, ok := h.store.(store.CommitStore)
+	if !ok {
+		return nil
+	}
+	return committer.CommitEntry(ctx, store.EntryRef{DMap: op.DMap, Key: op.Key, HKey: op.HKey}, op.Version)
 }
 
 var _ olricconfig.DurableHook = (*DurableHook)(nil)

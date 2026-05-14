@@ -29,6 +29,12 @@ type CacheStore interface {
 	Close(ctx context.Context) error
 }
 
+type CommitStore interface {
+	PrepareEntry(ctx context.Context, record EntryRecord) (EntryRecord, error)
+	PrepareDelete(ctx context.Context, ref EntryRef) (EntryRecord, error)
+	CommitEntry(ctx context.Context, ref EntryRef, version int64) error
+}
+
 type Starter interface {
 	Start(ctx context.Context) error
 }
@@ -56,7 +62,14 @@ type EntryRecord struct {
 	UpdatedAt    time.Time `gorm:"column:updated_at" json:"updated_at"`
 	Origin       string    `gorm:"-" json:"origin,omitempty"`
 	FlushMySQL   bool      `gorm:"-" json:"flush_mysql,omitempty"`
+	WALState     string    `gorm:"-" json:"wal_state,omitempty"`
 }
+
+const (
+	WALStatePrepared  = "prepared"
+	WALStateCommitted = "committed"
+	WALStateLocal     = "local_refill"
+)
 
 func (EntryRecord) TableName() string {
 	return "olric_cache_records"
@@ -256,6 +269,13 @@ func (s *MySQLStore) LoadEntry(ctx context.Context, ref EntryRef) (EntryRecord, 
 
 func (s *MySQLStore) StoreEntry(ctx context.Context, record EntryRecord) error {
 	record.Tombstone = false
+	if record.WALState == "" {
+		if record.FlushMySQL {
+			record.WALState = WALStateCommitted
+		} else {
+			record.WALState = WALStateLocal
+		}
+	}
 	return s.store(ctx, record, 0)
 }
 
@@ -268,10 +288,31 @@ func (s *MySQLStore) DeleteEntry(ctx context.Context, ref EntryRef) error {
 		UpdatedAt:  time.Now().UTC(),
 		Origin:     "client_delete",
 		FlushMySQL: true,
+		WALState:   WALStateCommitted,
 	}, 0)
 }
 
-func (s *MySQLStore) store(ctx context.Context, record EntryRecord, version int64) error {
+func (s *MySQLStore) PrepareEntry(ctx context.Context, record EntryRecord) (EntryRecord, error) {
+	record.Tombstone = false
+	record.FlushMySQL = false
+	record.WALState = WALStatePrepared
+	return s.storeAndReturn(ctx, record, 0)
+}
+
+func (s *MySQLStore) PrepareDelete(ctx context.Context, ref EntryRef) (EntryRecord, error) {
+	return s.storeAndReturn(ctx, EntryRecord{
+		DMap:       ref.DMap,
+		Key:        ref.Key,
+		HKey:       ref.HKey,
+		Tombstone:  true,
+		UpdatedAt:  time.Now().UTC(),
+		Origin:     "client_delete",
+		FlushMySQL: false,
+		WALState:   WALStatePrepared,
+	}, 0)
+}
+
+func (s *MySQLStore) CommitEntry(ctx context.Context, ref EntryRef, version int64) error {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
@@ -281,7 +322,7 @@ func (s *MySQLStore) store(ctx context.Context, record EntryRecord, version int6
 		s.mu.Unlock()
 		return err
 	}
-	depth, err := s.appendDirty(record, version)
+	depth, err := s.commitDirty(ref, version)
 	if err != nil {
 		s.mu.Unlock()
 		return err
@@ -292,6 +333,34 @@ func (s *MySQLStore) store(ctx context.Context, record EntryRecord, version int6
 		s.notifyFlush()
 	}
 	return nil
+}
+
+func (s *MySQLStore) store(ctx context.Context, record EntryRecord, version int64) error {
+	_, err := s.storeAndReturn(ctx, record, version)
+	return err
+}
+
+func (s *MySQLStore) storeAndReturn(ctx context.Context, record EntryRecord, version int64) (EntryRecord, error) {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return EntryRecord{}, errors.New("cache store is closed")
+	}
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return EntryRecord{}, err
+	}
+	entry, depth, err := s.appendDirty(record, version)
+	if err != nil {
+		s.mu.Unlock()
+		return EntryRecord{}, err
+	}
+	s.mu.Unlock()
+
+	if depth >= s.cfg.BatchSize {
+		s.notifyFlush()
+	}
+	return entry.Record.Clone(), nil
 }
 
 func (s *MySQLStore) Close(ctx context.Context) error {
@@ -356,6 +425,7 @@ func (s *MySQLStore) flushPending(pending map[string][]byte) bool {
 			UpdatedAt:    now,
 			Origin:       "legacy_pending",
 			FlushMySQL:   true,
+			WALState:     WALStateCommitted,
 		}})
 	}
 	return s.flushEntries(entries)
@@ -408,7 +478,7 @@ func (s *MySQLStore) flushEntries(entries []dirtyEntry) bool {
 	records := make([]EntryRecord, 0, len(entries))
 	now := time.Now().UTC()
 	for _, entry := range entries {
-		if !entry.Record.FlushMySQL {
+		if !isFlushable(entry.Record) {
 			continue
 		}
 		record := entry.Record.Clone()
@@ -453,7 +523,7 @@ func openWAL(path string) (*bolt.DB, error) {
 	return db, nil
 }
 
-func (s *MySQLStore) appendDirty(record EntryRecord, version int64) (int, error) {
+func (s *MySQLStore) appendDirty(record EntryRecord, version int64) (dirtyEntry, int, error) {
 	now := time.Now().UTC()
 	record = record.Clone()
 	if record.UpdatedAt.IsZero() {
@@ -472,6 +542,37 @@ func (s *MySQLStore) appendDirty(record EntryRecord, version int64) (int, error)
 		}
 		meta := tx.Bucket(walMetaBucket)
 		entry.Record.Version = nextVersion(meta, entry.Record.UpdatedAt, version)
+		encoded, err := json.Marshal(entry)
+		if err != nil {
+			return err
+		}
+		if err := dirty.Put(key, encoded); err != nil {
+			return err
+		}
+		depth = dirty.Stats().KeyN
+		return nil
+	})
+	return entry, depth, err
+}
+
+func (s *MySQLStore) commitDirty(ref EntryRef, version int64) (int, error) {
+	var depth int
+	err := s.wal.Update(func(tx *bolt.Tx) error {
+		dirty := tx.Bucket(walDirtyBucket)
+		key := []byte(walKey(ref))
+		encoded := dirty.Get(key)
+		if encoded == nil {
+			return ErrNotFound
+		}
+		var entry dirtyEntry
+		if err := json.Unmarshal(encoded, &entry); err != nil {
+			return err
+		}
+		if entry.Record.Version != version {
+			return ErrNotFound
+		}
+		entry.Record.WALState = WALStateCommitted
+		entry.Record.FlushMySQL = true
 		encoded, err := json.Marshal(entry)
 		if err != nil {
 			return err
@@ -532,7 +633,7 @@ func (s *MySQLStore) loadFlushableBatch(limit int) ([]dirtyEntry, error) {
 			if err := json.Unmarshal(encoded, &entry); err != nil {
 				return err
 			}
-			if !entry.Record.FlushMySQL {
+			if !isFlushable(entry.Record) {
 				continue
 			}
 			entries = append(entries, entry)
@@ -623,6 +724,10 @@ func walKey(ref EntryRef) string {
 
 func isExpired(ttl int64, now time.Time) bool {
 	return ttl > 0 && now.UnixMilli() >= ttl
+}
+
+func isFlushable(record EntryRecord) bool {
+	return record.FlushMySQL && (record.WALState == "" || record.WALState == WALStateCommitted)
 }
 
 func (s *MySQLStore) notifyFlush() {

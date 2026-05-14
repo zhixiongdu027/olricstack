@@ -16,7 +16,7 @@ func TestDurableHookBeforeSetWritesFlushableRecord(t *testing.T) {
 	hook := newTestDurableHook(t, backing)
 	entry := newTestEntry("alice", "A", time.Now().Add(time.Minute).UnixMilli(), 42)
 
-	err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+	_, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
 		DMap:  "users",
 		Key:   "alice",
 		HKey:  HKey("users", "alice"),
@@ -38,7 +38,7 @@ func TestDurableHookBeforeDeleteWritesTombstone(t *testing.T) {
 	backing := newRecordingStore()
 	hook := newTestDurableHook(t, backing)
 
-	err := hook.BeforeDelete(context.Background(), olricconfig.DurableOperation{
+	_, err := hook.BeforeDelete(context.Background(), olricconfig.DurableOperation{
 		DMap: "users",
 		Key:  "alice",
 		HKey: HKey("users", "alice"),
@@ -57,7 +57,7 @@ func TestDurableHookBeforeExpireWritesUpdatedEntry(t *testing.T) {
 	hook := newTestDurableHook(t, backing)
 	entry := newTestEntry("alice", "A", time.Now().Add(time.Hour).UnixMilli(), 43)
 
-	err := hook.BeforeExpire(context.Background(), olricconfig.DurableOperation{
+	_, err := hook.BeforeExpire(context.Background(), olricconfig.DurableOperation{
 		DMap:  "users",
 		Key:   "alice",
 		HKey:  HKey("users", "alice"),
@@ -69,6 +69,36 @@ func TestDurableHookBeforeExpireWritesUpdatedEntry(t *testing.T) {
 	record := backing.records[HKey("users", "alice")]
 	if record.TTL != entry.TTL() || record.Timestamp != entry.Timestamp() || record.Origin != "client_expire" || !record.FlushMySQL {
 		t.Fatalf("unexpected expire record: %#v", record)
+	}
+}
+
+func TestDurableHookPrepareCommitWithCommitStore(t *testing.T) {
+	backing := newRecordingCommitStore()
+	hook := newTestDurableHook(t, backing)
+	entry := newTestEntry("alice", "A", time.Now().Add(time.Minute).UnixMilli(), 45)
+
+	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+		DMap:  "users",
+		Key:   "alice",
+		HKey:  HKey("users", "alice"),
+		Entry: entry,
+	})
+	if err != nil {
+		t.Fatalf("before set: %v", err)
+	}
+	if op.Version == 0 {
+		t.Fatal("expected prepared version")
+	}
+	record := backing.records[HKey("users", "alice")]
+	if record.WALState != store.WALStatePrepared || record.FlushMySQL {
+		t.Fatalf("expected prepared unflushable record, got %#v", record)
+	}
+	if err := hook.AfterSet(context.Background(), op); err != nil {
+		t.Fatalf("after set: %v", err)
+	}
+	record = backing.records[HKey("users", "alice")]
+	if record.WALState != store.WALStateCommitted || !record.FlushMySQL {
+		t.Fatalf("expected committed flushable record, got %#v", record)
 	}
 }
 

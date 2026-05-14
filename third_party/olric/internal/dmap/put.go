@@ -338,16 +338,29 @@ func (dm *DMap) putOnCluster(e *env) error {
 			op.Entry = current
 			op.Origin = "client_expire"
 			op.TTL = e.timeout
-			if err := dm.s.config.DurableHook.BeforeExpire(e.ctx, op); err != nil {
+			op, err = dm.s.config.DurableHook.BeforeExpire(e.ctx, op)
+			if err != nil {
 				return err
 			}
 		} else {
 			op.Origin = "client_set"
-			if err := dm.s.config.DurableHook.BeforeSet(e.ctx, op); err != nil {
+			op, err = dm.s.config.DurableHook.BeforeSet(e.ctx, op)
+			if err != nil {
 				return err
 			}
 		}
+		if err = dm.putOnClusterAfterDurable(e, nt); err != nil {
+			return err
+		}
+		if e.putConfig.OnlyUpdateTTL {
+			return dm.s.config.DurableHook.AfterExpire(e.ctx, op)
+		}
+		return dm.s.config.DurableHook.AfterSet(e.ctx, op)
 	}
+	return dm.putOnClusterAfterDurable(e, nt)
+}
+
+func (dm *DMap) putOnClusterAfterDurable(e *env, nt storage.Entry) error {
 	if dm.s.config.ReplicaCount > config.MinimumReplicaCount {
 		switch dm.s.config.ReplicationMode {
 		case config.AsyncReplicationMode:
