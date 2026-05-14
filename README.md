@@ -44,8 +44,8 @@ OlricStack is a stack-based distributed KV platform prototype. Each stack is int
 - `WATCHDOG_ROLE`: static role, `primary` or `standby`; default `primary`.
 - `WATCHDOG_GENERATION`: monotonic generation for this Watchdog process, default process start timestamp.
 - `WATCHDOG_LEASE_DURATION`: Kubernetes Lease duration for primary election, default `15s`.
-- `WATCHDOG_LEASE_RENEW_INTERVAL`: primary Lease renewal interval, default `5s`.
-- `WATCHDOG_LEASE_ACQUIRE_INTERVAL`: standby acquisition retry interval, default `5s`.
+- `WATCHDOG_LEASE_RENEW_DEADLINE`: official leader-election renew deadline, default `10s`.
+- `WATCHDOG_LEASE_RETRY_PERIOD`: official leader-election retry period, default `2s`.
 - `WATCHDOG_RECONCILE_INTERVAL`: interval for reconciling this stack's Olric StatefulSet/headless Service, default `10s`.
 
 ## Topology Model
@@ -56,9 +56,9 @@ This keeps the control plane decoupled from node network reachability and gives 
 
 The Watchdog also runs a bookworm loop: it periodically pushes the complete structured member topology with the current epoch even when membership has not changed. Nodes can use the epoch and `valid_until` to distinguish unchanged anti-entropy refreshes from real topology transitions and stale leases.
 
-Watchdog is designed for primary/standby operation. Only the primary accepts node membership and pushes topology. Standby instances expose their role and generation but do not own topology. When `STACK_ID` is set, Watchdog starts as standby and must win the per-stack Kubernetes Lease before becoming primary; `WATCHDOG_ROLE` is only a local fallback when election is not enabled. The bootstrap Operator creates two Watchdog replicas by default so they can compete for the Lease.
+Watchdog is designed for primary/standby operation using Kubernetes client-go leader election. When `STACK_ID` is set, a Watchdog process does not start topology gRPC, topology reaping/bookworm loops, or stack reconciliation until the official leader-election callback grants leadership. When leadership is lost, the business context is canceled and the gRPC server is stopped. The bootstrap Operator creates two Watchdog replicas by default so they can compete for the Lease.
 
-The Watchdog Deployment exposes gRPC health as readiness and reports `SERVING` only while primary. Kubernetes Services therefore route node topology streams to the current primary instead of load-balancing equally across primary and standby replicas.
+The Watchdog Deployment exposes gRPC health as readiness and reports `SERVING` only while primary. Kubernetes Services therefore route node topology streams to the current primary instead of load-balancing equally across primary and standby replicas. The Deployment rolling update allows one unavailable replica because standby Pods are intentionally not ready.
 
 ## Watchdog State Model
 

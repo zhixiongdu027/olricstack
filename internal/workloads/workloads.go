@@ -77,6 +77,13 @@ func WatchdogDeployment(stack *olricv1alpha1.OlricStack) *appsv1.Deployment {
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
+			Strategy: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
+					MaxUnavailable: intstrPtr(1),
+					MaxSurge:       intstrPtr(1),
+				},
+			},
 			Selector: &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
@@ -196,6 +203,11 @@ func OlricStatefulSet(stack *olricv1alpha1.OlricStack) *appsv1.StatefulSet {
 
 func resourceQuantity(value string) resource.Quantity {
 	return resource.MustParse(value)
+}
+
+func intstrPtr(value int) *intstr.IntOrString {
+	out := intstr.FromInt(value)
+	return &out
 }
 
 func valueOrDefault(value, fallback string) string {

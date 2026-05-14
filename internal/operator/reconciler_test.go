@@ -73,6 +73,10 @@ func TestReconcileCreatesStackResources(t *testing.T) {
 	if readiness == nil || readiness.GRPC == nil || readiness.GRPC.Port != int32(8081) {
 		t.Fatalf("expected watchdog gRPC readiness probe, got %#v", readiness)
 	}
+	rolling := watchdog.Spec.Strategy.RollingUpdate
+	if rolling == nil || rolling.MaxUnavailable == nil || rolling.MaxUnavailable.IntValue() != 1 {
+		t.Fatalf("expected watchdog rolling update to allow one unavailable standby, got %#v", rolling)
+	}
 
 	var statefulSet appsv1.StatefulSet
 	if err := client.Get(context.Background(), types.NamespacedName{Name: "demo-olric", Namespace: "default"}, &statefulSet); err == nil {
