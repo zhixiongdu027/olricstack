@@ -19,7 +19,7 @@
 
 ## 3. 技术栈建议
 *   **语言**: Go 1.22+
-*   **分布式 KV**: `github.com/buraksezer/olric` (底层路由与分片)
+*   **分布式 KV**: `github.com/olric-data/olric` (底层路由与分片)
 *   **Operator**: `controller-runtime` (K8s 调谐逻辑)
 *   **MySQL**: `GORM` (高性能异步落盘)
 *   **RPC**: `gRPC` (Watchdog -> Olric 的拓扑指令分发)
