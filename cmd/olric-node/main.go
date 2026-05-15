@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"strconv"
@@ -52,12 +53,11 @@ func main() {
 		}
 	}()
 
-	go runTopologySubscription(ctx, topologyLease)
-
 	olricDB, err := startOlric(ctx, leaseGatedStore)
 	if err != nil {
 		log.Fatalf("start olric: %v", err)
 	}
+	go runTopologySubscription(ctx, topologyLease, olricDB)
 	if leaseGatedStore != nil {
 		provider, err := stringkv.NewOlricProvider(olricDB.NewEmbeddedClient())
 		if err != nil {
@@ -87,9 +87,14 @@ func main() {
 	<-ctx.Done()
 }
 
-type logJoiner struct{}
+type olricJoiner struct {
+	db              *olric.Olric
+	nodeID          string
+	memberlistPort  int
+	topologyTimeout time.Duration
+}
 
-func (logJoiner) Join(ctx context.Context, envelope *topologypb.TopologyEnvelope) error {
+func (j olricJoiner) Join(ctx context.Context, envelope *topologypb.TopologyEnvelope) error {
 	log.Printf("received topology push epoch=%d reason=%s watchdog=%s/%d members=%v",
 		envelope.GetEpoch(),
 		envelope.GetReason().String(),
@@ -97,10 +102,22 @@ func (logJoiner) Join(ctx context.Context, envelope *topologypb.TopologyEnvelope
 		envelope.GetWatchdogGeneration(),
 		envelope.GetMembers(),
 	)
+
+	peers := topologyPeers(envelope, j.nodeID, j.memberlistPort)
+	if len(peers) == 0 || j.db == nil {
+		return nil
+	}
+	joinCtx, cancel := context.WithTimeout(ctx, j.topologyTimeout)
+	defer cancel()
+	joined, err := j.db.Join(joinCtx, peers)
+	if err != nil {
+		return fmt.Errorf("join topology peers %v: %w", peers, err)
+	}
+	log.Printf("joined topology peers count=%d peers=%v", joined, peers)
 	return nil
 }
 
-func runTopologySubscription(ctx context.Context, lease *node.LeaseTracker) {
+func runTopologySubscription(ctx context.Context, lease *node.LeaseTracker, olricDB *olric.Olric) {
 	stackID := os.Getenv("STACK_ID")
 	watchdogAddr := os.Getenv("WATCHDOG_SVC_NAME")
 	podIP := os.Getenv("POD_IP")
@@ -118,7 +135,12 @@ func runTopologySubscription(ctx context.Context, lease *node.LeaseTracker) {
 		ProtocolVersion:   "v2",
 		HeartbeatInterval: envDuration("HEARTBEAT_INTERVAL", 10*time.Second),
 		Lease:             lease,
-		Joiner:            logJoiner{},
+		Joiner: olricJoiner{
+			db:              olricDB,
+			nodeID:          envString("NODE_ID", os.Getenv("POD_NAME")),
+			memberlistPort:  envInt("OLRIC_MEMBERLIST_ADVERTISE_PORT", envInt("OLRIC_ADVERTISE_PORT", envInt("OLRIC_MEMBERLIST_BIND_PORT", 3322))),
+			topologyTimeout: envDuration("TOPOLOGY_JOIN_TIMEOUT", 5*time.Second),
+		},
 	})
 	if err != nil {
 		log.Printf("create topology subscriber: %v", err)
@@ -137,6 +159,27 @@ func runTopologySubscription(ctx context.Context, lease *node.LeaseTracker) {
 		case <-time.After(wait.Jitter(retryInterval, 0.2)):
 		}
 	}
+}
+
+func topologyPeers(envelope *topologypb.TopologyEnvelope, nodeID string, memberlistPort int) []string {
+	seen := make(map[string]struct{}, len(envelope.GetMembers()))
+	peers := make([]string, 0, len(envelope.GetMembers()))
+	for _, member := range envelope.GetMembers() {
+		if member.GetNodeId() == "" || member.GetNodeId() == nodeID {
+			continue
+		}
+		podIP := strings.TrimSpace(member.GetPodIp())
+		if podIP == "" {
+			continue
+		}
+		peer := net.JoinHostPort(podIP, strconv.Itoa(memberlistPort))
+		if _, ok := seen[peer]; ok {
+			continue
+		}
+		seen[peer] = struct{}{}
+		peers = append(peers, peer)
+	}
+	return peers
 }
 
 func subscribeOnce(ctx context.Context, watchdogAddr string, subscriber *node.Subscriber) error {

@@ -33,7 +33,7 @@ func TestRunTopologySubscriptionReconnectsAfterPromotion(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runTopologySubscription(ctx, lease)
+		runTopologySubscription(ctx, lease, nil)
 	}()
 
 	waitForLeaseState(t, lease, true, 2*time.Second)
@@ -53,6 +53,20 @@ func TestRunTopologySubscriptionReconnectsAfterPromotion(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("topology subscription loop did not stop on context cancel")
+	}
+}
+
+func TestTopologyPeersSkipsSelfAndDeduplicates(t *testing.T) {
+	envelope := &topologypb.TopologyEnvelope{Members: []*topologypb.Member{
+		{NodeId: "node-a", PodIp: "10.0.0.2"},
+		{NodeId: "node-b", PodIp: "10.0.0.3"},
+		{NodeId: "node-c", PodIp: "10.0.0.3"},
+		{NodeId: "node-d"},
+	}}
+
+	peers := topologyPeers(envelope, "node-a", 3322)
+	if len(peers) != 1 || peers[0] != "10.0.0.3:3322" {
+		t.Fatalf("unexpected peers: %v", peers)
 	}
 }
 

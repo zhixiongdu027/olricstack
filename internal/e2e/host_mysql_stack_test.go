@@ -114,10 +114,58 @@ func TestHostOnlyRestartReadsThroughMySQL(t *testing.T) {
 	}
 }
 
+func TestHostOnlyTwoNodeClusterCrossNodeReadWrite(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	watchdogAddr, _, cleanupWatchdog := startHostWatchdog(t, ctx)
+	defer cleanupWatchdog()
+
+	memberlistPort := mustFreeTCPPort(t)
+	first := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:    watchdogAddr,
+		nodeID:          "host-only-cluster-a",
+		podIP:           "127.0.0.2",
+		bindAddr:        "127.0.0.2",
+		memberlistPort:  memberlistPort,
+		memberlistPeers: net.JoinHostPort("127.0.0.3", strconv.Itoa(memberlistPort)),
+	})
+	defer first.stop(t)
+	second := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:    watchdogAddr,
+		nodeID:          "host-only-cluster-b",
+		podIP:           "127.0.0.3",
+		bindAddr:        "127.0.0.3",
+		memberlistPort:  memberlistPort,
+		memberlistPeers: net.JoinHostPort("127.0.0.2", strconv.Itoa(memberlistPort)),
+	})
+	defer second.stop(t)
+
+	waitForText(t, ctx, first.logs, `node_id:"host-only-cluster-b"`)
+	waitForText(t, ctx, second.logs, `node_id:"host-only-cluster-a"`)
+	waitForText(t, ctx, first.logs, "joined topology peers")
+	waitForText(t, ctx, second.logs, "joined topology peers")
+
+	key := "host-cluster:" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if out, err := first.put(ctx, "users", key, "value-from-node-a"); err != nil {
+		t.Fatalf("write through first node: %v (%s)\nfirst logs:\n%s\nsecond logs:\n%s",
+			err, strings.TrimSpace(out), strings.TrimSpace(first.logs.String()), strings.TrimSpace(second.logs.String()))
+	}
+	got, out, err := second.get(ctx, "users", key)
+	if err != nil {
+		t.Fatalf("read through second node: %v (%s)\nfirst logs:\n%s\nsecond logs:\n%s",
+			err, strings.TrimSpace(out), strings.TrimSpace(first.logs.String()), strings.TrimSpace(second.logs.String()))
+	}
+	if got != "value-from-node-a" {
+		t.Fatalf("expected cross-node value %q, got %q", "value-from-node-a", got)
+	}
+}
+
 type hostOlricNode struct {
 	nodeID       string
 	repoRoot     string
 	clientBinary string
+	bindAddr     string
 	olricPort    int
 	cmd          *exec.Cmd
 	errCh        chan error
@@ -126,6 +174,33 @@ type hostOlricNode struct {
 
 func startHostOlricNode(t *testing.T, parent context.Context, watchdogAddr, mysqlDSN, nodeID string) *hostOlricNode {
 	t.Helper()
+	return startHostOlricNodeWithConfig(t, parent, hostNodeConfig{
+		watchdogAddr: watchdogAddr,
+		mysqlDSN:     mysqlDSN,
+		nodeID:       nodeID,
+		podIP:        "127.0.0.1",
+		bindAddr:     "127.0.0.1",
+	})
+}
+
+type hostNodeConfig struct {
+	watchdogAddr    string
+	mysqlDSN        string
+	nodeID          string
+	podIP           string
+	bindAddr        string
+	memberlistPort  int
+	memberlistPeers string
+}
+
+func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg hostNodeConfig) *hostOlricNode {
+	t.Helper()
+	if cfg.podIP == "" {
+		cfg.podIP = "127.0.0.1"
+	}
+	if cfg.bindAddr == "" {
+		cfg.bindAddr = cfg.podIP
+	}
 
 	repoRoot := repoRoot(t)
 	binDir := t.TempDir()
@@ -133,6 +208,9 @@ func startHostOlricNode(t *testing.T, parent context.Context, watchdogAddr, mysq
 	clientBinary := buildBinary(t, parent, repoRoot, filepath.Join(binDir, "olric-e2e-client"), "./cmd/olric-e2e-client", nil)
 	olricPort := mustFreeTCPPort(t)
 	memberlistPort := mustFreeTCPPort(t)
+	if cfg.memberlistPort > 0 {
+		memberlistPort = cfg.memberlistPort
+	}
 	logs := &lockedBuffer{}
 
 	cmd := exec.Command(nodeBinary)
@@ -141,23 +219,24 @@ func startHostOlricNode(t *testing.T, parent context.Context, watchdogAddr, mysq
 	cmd.Stderr = logs
 	cmd.Env = append(os.Environ(),
 		"STACK_ID=host-only",
-		"WATCHDOG_SVC_NAME="+watchdogAddr,
-		"POD_NAME="+nodeID,
-		"NODE_ID="+nodeID,
-		"POD_IP=127.0.0.1",
-		"STORAGE_MODE=mysql",
-		"MYSQL_DSN="+mysqlDSN,
+		"WATCHDOG_SVC_NAME="+cfg.watchdogAddr,
+		"POD_NAME="+cfg.nodeID,
+		"NODE_ID="+cfg.nodeID,
+		"POD_IP="+cfg.podIP,
+		"STORAGE_MODE="+hostStorageMode(cfg.mysqlDSN),
+		"MYSQL_DSN="+cfg.mysqlDSN,
 		"WAL_PATH="+filepath.Join(t.TempDir(), "cache.wal"),
 		"FLUSH_INTERVAL=100ms",
 		"FLUSH_BACKOFF=100ms",
 		"HEARTBEAT_INTERVAL=100ms",
 		"WATCHDOG_RECONNECT_INTERVAL=100ms",
-		"OLRIC_BIND_ADDR=127.0.0.1",
+		"OLRIC_BIND_ADDR="+cfg.bindAddr,
 		"OLRIC_BIND_PORT="+strconv.Itoa(olricPort),
-		"OLRIC_MEMBERLIST_BIND_ADDR=127.0.0.1",
+		"OLRIC_MEMBERLIST_BIND_ADDR="+cfg.bindAddr,
 		"OLRIC_MEMBERLIST_BIND_PORT="+strconv.Itoa(memberlistPort),
-		"OLRIC_ADVERTISE_ADDR=127.0.0.1",
+		"OLRIC_ADVERTISE_ADDR="+cfg.bindAddr,
 		"OLRIC_ADVERTISE_PORT="+strconv.Itoa(memberlistPort),
+		"OLRIC_PEERS="+cfg.memberlistPeers,
 		"OLRIC_MEMBERLIST_ENV=local",
 		"OLRIC_LOG_LEVEL=WARN",
 	)
@@ -166,9 +245,10 @@ func startHostOlricNode(t *testing.T, parent context.Context, watchdogAddr, mysq
 	}
 
 	node := &hostOlricNode{
-		nodeID:       nodeID,
+		nodeID:       cfg.nodeID,
 		repoRoot:     repoRoot,
 		clientBinary: clientBinary,
+		bindAddr:     cfg.bindAddr,
 		olricPort:    olricPort,
 		cmd:          cmd,
 		errCh:        make(chan error, 1),
@@ -178,16 +258,30 @@ func startHostOlricNode(t *testing.T, parent context.Context, watchdogAddr, mysq
 		node.errCh <- cmd.Wait()
 	}()
 
-	waitForText(t, parent, logs, "storage mode: memory + local wal + mysql")
+	waitForText(t, parent, logs, hostStorageLog(cfg.mysqlDSN))
 	waitForText(t, parent, logs, "received topology push")
 	waitForText(t, parent, logs, "olric node bootstrap complete")
 	return node
 }
 
+func hostStorageMode(mysqlDSN string) string {
+	if mysqlDSN == "" {
+		return "wal"
+	}
+	return "mysql"
+}
+
+func hostStorageLog(mysqlDSN string) string {
+	if mysqlDSN == "" {
+		return "storage mode: memory + local wal"
+	}
+	return "storage mode: memory + local wal + mysql"
+}
+
 func (n *hostOlricNode) put(ctx context.Context, dmap, key, value string) (string, error) {
 	cmd := exec.CommandContext(ctx,
 		n.clientBinary,
-		"-addr", fmt.Sprintf("127.0.0.1:%d", n.olricPort),
+		"-addr", fmt.Sprintf("%s:%d", n.bindAddr, n.olricPort),
 		"-op", "put",
 		"-dmap", dmap,
 		"-key", key,
@@ -202,7 +296,7 @@ func (n *hostOlricNode) put(ctx context.Context, dmap, key, value string) (strin
 func (n *hostOlricNode) get(ctx context.Context, dmap, key string) (string, string, error) {
 	cmd := exec.CommandContext(ctx,
 		n.clientBinary,
-		"-addr", fmt.Sprintf("127.0.0.1:%d", n.olricPort),
+		"-addr", fmt.Sprintf("%s:%d", n.bindAddr, n.olricPort),
 		"-op", "get",
 		"-dmap", dmap,
 		"-key", key,

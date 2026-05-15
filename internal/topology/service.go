@@ -403,7 +403,11 @@ func closeSubscriber(sub *subscriber) {
 	if sub.done == nil {
 		return
 	}
-	close(sub.done)
+	select {
+	case <-sub.done:
+	default:
+		close(sub.done)
+	}
 }
 
 func validateHeartbeat(heartbeat *topologypb.Heartbeat) error {

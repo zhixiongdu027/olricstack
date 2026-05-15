@@ -30,6 +30,36 @@ type Route struct {
 
 type RoutingTable map[uint64]Route
 
+// Join attempts to join the Olric memberlist to the given peers and refreshes
+// the routing table. It is intended for external topology controllers that
+// discover peers after the embedded node has already started.
+func (db *Olric) Join(ctx context.Context, peers []string) (int, error) {
+	if len(peers) == 0 {
+		return 0, nil
+	}
+	done := make(chan struct {
+		n   int
+		err error
+	}, 1)
+	go func() {
+		n, err := db.rt.Discovery().Rejoin(peers)
+		if err == nil {
+			db.rt.UpdateEagerly()
+		}
+		done <- struct {
+			n   int
+			err error
+		}{n: n, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case res := <-done:
+		return res.n, res.err
+	}
+}
+
 func mapToRoutingTable(slice []interface{}) (RoutingTable, error) {
 	rt := make(RoutingTable)
 	for _, raw := range slice {
