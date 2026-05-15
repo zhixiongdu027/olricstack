@@ -10,8 +10,10 @@ import (
 )
 
 var (
-	ErrTopologyLeaseExpired = errors.New("topology lease is expired")
-	ErrTopologyNotPrimary   = errors.New("topology envelope is not from primary watchdog")
+	ErrTopologyLeaseExpired    = errors.New("topology lease is expired")
+	ErrTopologyNotPrimary      = errors.New("topology envelope is not from primary watchdog")
+	ErrStaleTopologyEpoch      = errors.New("stale topology epoch")
+	ErrStaleWatchdogGeneration = errors.New("stale watchdog generation")
 )
 
 type Joiner interface {
@@ -67,10 +69,16 @@ func NewSubscriber(cfg SubscriberConfig) (*Subscriber, error) {
 }
 
 func (s *Subscriber) Run(ctx context.Context, client topologypb.TopologyControlClient) error {
-	stream, err := client.Watch(ctx)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	stream, err := client.Watch(runCtx)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		_ = stream.CloseSend()
+	}()
 
 	sendHeartbeat := func(observedEpoch int64) error {
 		return stream.Send(&topologypb.Heartbeat{
@@ -97,8 +105,8 @@ func (s *Subscriber) Run(ctx context.Context, client topologypb.TopologyControlC
 
 		for {
 			select {
-			case <-ctx.Done():
-				errCh <- ctx.Err()
+			case <-runCtx.Done():
+				errCh <- runCtx.Err()
 				return
 			case <-ticker.C:
 				if err := sendHeartbeat(observedEpoch.Load()); err != nil {
@@ -115,11 +123,14 @@ func (s *Subscriber) Run(ctx context.Context, client topologypb.TopologyControlC
 			return err
 		}
 		if err := s.lease.Apply(envelope, time.Now()); err != nil {
+			if shouldRevokeLease(err) {
+				s.lease.Revoke()
+			}
 			return err
 		}
 		observedEpoch.Store(envelope.GetEpoch())
 		if s.cfg.Joiner != nil {
-			if err := s.cfg.Joiner.Join(ctx, envelope); err != nil {
+			if err := s.cfg.Joiner.Join(runCtx, envelope); err != nil {
 				return err
 			}
 		}
@@ -135,6 +146,7 @@ func (s *Subscriber) Run(ctx context.Context, client topologypb.TopologyControlC
 type LeaseTracker struct {
 	validUntilUnixMs atomic.Int64
 	generation       atomic.Int64
+	epoch            atomic.Int64
 }
 
 func NewLeaseTracker() *LeaseTracker {
@@ -149,11 +161,26 @@ func (l *LeaseTracker) Apply(envelope *topologypb.TopologyEnvelope, now time.Tim
 		return ErrTopologyLeaseExpired
 	}
 	if current := l.generation.Load(); envelope.GetWatchdogGeneration() < current {
-		return errors.New("stale watchdog generation")
+		return ErrStaleWatchdogGeneration
+	}
+	if current := l.epoch.Load(); envelope.GetEpoch() < current {
+		return ErrStaleTopologyEpoch
 	}
 	l.generation.Store(envelope.GetWatchdogGeneration())
+	l.epoch.Store(envelope.GetEpoch())
 	l.validUntilUnixMs.Store(envelope.GetValidUntilUnixMs())
 	return nil
+}
+
+func (l *LeaseTracker) Revoke() {
+	l.validUntilUnixMs.Store(0)
+}
+
+func shouldRevokeLease(err error) bool {
+	return errors.Is(err, ErrTopologyLeaseExpired) ||
+		errors.Is(err, ErrTopologyNotPrimary) ||
+		errors.Is(err, ErrStaleTopologyEpoch) ||
+		errors.Is(err, ErrStaleWatchdogGeneration)
 }
 
 func (l *LeaseTracker) ServingAllowed(now time.Time) bool {

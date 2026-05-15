@@ -85,6 +85,10 @@ type LeadershipObserver interface {
 	SetLeadership(role topologypb.WatchdogRole, generation int64)
 }
 
+type EpochErrorObserver interface {
+	SetDegraded(err error)
+}
+
 type subscriber struct {
 	nodeID string
 	ch     chan *topologypb.TopologyEnvelope
@@ -140,7 +144,9 @@ func (s *Service) ObservePods(stackID string, observations []stackwatchdog.PodOb
 		return
 	}
 	state := s.stateFor(stackID)
-	s.loadEpochLocked(context.Background(), stackID, state)
+	if err := s.loadEpochLocked(context.Background(), stackID, state); err != nil {
+		return
+	}
 	cfg := s.config()
 	if state.cluster.ApplyPodObservations(observations, cfg.ExpireAfter, time.Now()) {
 		s.broadcastLocked(stackID, state, topologypb.TopologyReason_TOPOLOGY_REASON_RECONCILE)
@@ -159,7 +165,9 @@ func (s *Service) GetTopology(ctx context.Context, req *topologypb.TopologyQuery
 	defer s.mu.Unlock()
 
 	state := s.stateFor(req.GetStackId())
-	s.loadEpochLocked(ctx, req.GetStackId(), state)
+	if err := s.loadEpochLocked(ctx, req.GetStackId(), state); err != nil {
+		return nil, err
+	}
 	s.pruneExpiredLocked(req.GetStackId(), state, time.Now())
 	return s.envelopeFor(req.GetStackId(), state, topologypb.TopologyReason_TOPOLOGY_REASON_BOOKWORM), nil
 }
@@ -181,7 +189,9 @@ func (s *Service) Watch(stream topologypb.TopologyControl_WatchServer) error {
 		ch:     make(chan *topologypb.TopologyEnvelope, 8),
 		done:   make(chan struct{}),
 	}
-	s.registerHeartbeat(first, sub)
+	if err := s.registerHeartbeat(first, sub); err != nil {
+		return err
+	}
 	defer s.unregister(first.GetStackId(), first.GetNodeId(), sub)
 
 	ctx, cancel := context.WithCancel(stream.Context())
@@ -221,7 +231,10 @@ func (s *Service) receiveHeartbeats(ctx context.Context, stackID, nodeID string,
 			errCh <- err
 			return
 		}
-		s.registerHeartbeat(heartbeat, sub)
+		if err := s.registerHeartbeat(heartbeat, sub); err != nil {
+			errCh <- err
+			return
+		}
 
 		select {
 		case <-ctx.Done():
@@ -231,13 +244,15 @@ func (s *Service) receiveHeartbeats(ctx context.Context, stackID, nodeID string,
 	}
 }
 
-func (s *Service) registerHeartbeat(heartbeat *topologypb.Heartbeat, sub *subscriber) {
+func (s *Service) registerHeartbeat(heartbeat *topologypb.Heartbeat, sub *subscriber) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now := time.Now()
 	state := s.stateFor(heartbeat.GetStackId())
-	s.loadEpochLocked(context.Background(), heartbeat.GetStackId(), state)
+	if err := s.loadEpochLocked(context.Background(), heartbeat.GetStackId(), state); err != nil {
+		return err
+	}
 	s.pruneExpiredLocked(heartbeat.GetStackId(), state, now)
 
 	result := state.cluster.ApplyHeartbeat(stackwatchdog.HeartbeatObservation{
@@ -250,7 +265,7 @@ func (s *Service) registerHeartbeat(heartbeat *topologypb.Heartbeat, sub *subscr
 		SeenAt:          now,
 	})
 	if result.Stale {
-		return
+		return nil
 	}
 	if current := state.subscribers[heartbeat.GetNodeId()]; current != nil && current != sub {
 		closeSubscriber(current)
@@ -259,11 +274,12 @@ func (s *Service) registerHeartbeat(heartbeat *topologypb.Heartbeat, sub *subscr
 
 	if result.Changed {
 		s.broadcastLocked(heartbeat.GetStackId(), state, topologypb.TopologyReason_TOPOLOGY_REASON_EVENT)
-		return
+		return nil
 	}
 	if heartbeat.GetObservedEpoch() < state.cluster.Epoch() {
 		s.sendLatestLocked(heartbeat.GetStackId(), state, sub, topologypb.TopologyReason_TOPOLOGY_REASON_BOOKWORM)
 	}
+	return nil
 }
 
 func (s *Service) unregister(stackID, nodeID string, sub *subscriber) {
@@ -442,14 +458,28 @@ func (s *Service) AddLeadershipObserver(observer LeadershipObserver) {
 	generation := s.cfg.Generation
 	s.cfgMu.Unlock()
 	observer.SetLeadership(role, generation)
+	if degraded, ok := any(observer).(EpochErrorObserver); ok {
+		if err := s.EpochError(); err != nil {
+			degraded.SetDegraded(err)
+		}
+	}
 }
 
 func (s *Service) closeSubscribersForLeadershipChange() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, state := range s.stacks {
+	for stackID, state := range s.stacks {
+		envelope := s.standbyEnvelope(stackID)
 		for nodeID, sub := range state.subscribers {
+			select {
+			case <-sub.ch:
+			default:
+			}
+			select {
+			case sub.ch <- cloneEnvelope(envelope):
+			default:
+			}
 			closeSubscriber(sub)
 			delete(state.subscribers, nodeID)
 		}
@@ -468,20 +498,26 @@ func (s *Service) config() Config {
 	return s.cfg
 }
 
-func (s *Service) loadEpochLocked(ctx context.Context, stackID string, state *stackState) {
+func (s *Service) loadEpochLocked(ctx context.Context, stackID string, state *stackState) error {
 	if state.loadedEpoch {
-		return
+		return nil
 	}
-	state.loadedEpoch = true
 	store := s.config().EpochStore
 	if store == nil {
-		return
+		state.loadedEpoch = true
+		return nil
 	}
 	epoch, err := store.LoadEpoch(ctx, stackID)
 	if err != nil {
-		return
+		wrapped := fmt.Errorf("load topology epoch: %w", err)
+		s.setEpochError(wrapped)
+		log.Printf("watchdog topology epoch load failed for stack %q: %v", stackID, err)
+		return wrapped
 	}
+	state.loadedEpoch = true
 	state.cluster.BumpEpochAtLeast(epoch)
+	s.setEpochError(nil)
+	return nil
 }
 
 func (s *Service) saveEpochLocked(ctx context.Context, stackID string, epoch int64) {
@@ -507,6 +543,19 @@ func (s *Service) EpochError() error {
 
 func (s *Service) setEpochError(err error) {
 	s.epochErrMu.Lock()
-	defer s.epochErrMu.Unlock()
 	s.epochErr = err
+	s.epochErrMu.Unlock()
+
+	observers := s.leadershipObserversSnapshot()
+	for _, observer := range observers {
+		if degraded, ok := any(observer).(EpochErrorObserver); ok {
+			degraded.SetDegraded(err)
+		}
+	}
+}
+
+func (s *Service) leadershipObserversSnapshot() []LeadershipObserver {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return append([]LeadershipObserver(nil), s.leadershipObservers...)
 }

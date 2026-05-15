@@ -2,6 +2,7 @@ package watchdog
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 
@@ -48,5 +49,23 @@ func TestLeadershipHealthFollowsRole(t *testing.T) {
 	}
 	if resp.GetStatus() != healthgrpc.HealthCheckResponse_SERVING {
 		t.Fatalf("expected primary serving, got %s", resp.GetStatus())
+	}
+
+	health.SetDegraded(errors.New("epoch persistence failed"))
+	resp, err = client.Check(context.Background(), &healthgrpc.HealthCheckRequest{})
+	if err != nil {
+		t.Fatalf("check degraded health: %v", err)
+	}
+	if resp.GetStatus() != healthgrpc.HealthCheckResponse_NOT_SERVING {
+		t.Fatalf("expected degraded not serving, got %s", resp.GetStatus())
+	}
+
+	health.SetDegraded(nil)
+	resp, err = client.Check(context.Background(), &healthgrpc.HealthCheckRequest{})
+	if err != nil {
+		t.Fatalf("check recovered health: %v", err)
+	}
+	if resp.GetStatus() != healthgrpc.HealthCheckResponse_SERVING {
+		t.Fatalf("expected recovered serving, got %s", resp.GetStatus())
 	}
 }

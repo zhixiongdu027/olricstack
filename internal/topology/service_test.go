@@ -3,11 +3,15 @@ package topology
 import (
 	"context"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
 	topologypb "github.com/zhixiongdu/olricstack/api/topology/v1"
 	stackwatchdog "github.com/zhixiongdu/olricstack/internal/watchdog"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 )
 
 func TestServiceRegistersHeartbeatAndReturnsTopology(t *testing.T) {
@@ -209,25 +213,105 @@ func TestServiceDoesNotReplaceWithStaleIncarnation(t *testing.T) {
 
 func TestServiceRecordsEpochPersistenceFailure(t *testing.T) {
 	service := NewServiceWithConfig(Config{EpochStore: failingEpochStore{err: errors.New("boom")}})
+	health := stackwatchdog.NewLeadershipHealth()
+	service.AddLeadershipObserver(health)
 	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1)})
 
 	if service.EpochError() == nil {
 		t.Fatal("expected epoch persistence error")
+	}
+	if got := healthStatus(t, health); got != "NOT_SERVING" {
+		t.Fatalf("expected degraded health, got %s", got)
 	}
 }
 
 func TestServiceClearsEpochPersistenceFailureAfterSuccess(t *testing.T) {
 	store := &flakyEpochStore{err: errors.New("boom")}
 	service := NewServiceWithConfig(Config{EpochStore: store})
+	health := stackwatchdog.NewLeadershipHealth()
+	service.AddLeadershipObserver(health)
 	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1), done: make(chan struct{})})
 	if service.EpochError() == nil {
 		t.Fatal("expected epoch persistence error")
+	}
+	if got := healthStatus(t, health); got != "NOT_SERVING" {
+		t.Fatalf("expected degraded health, got %s", got)
 	}
 
 	store.err = nil
 	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.3", 2), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1), done: make(chan struct{})})
 	if service.EpochError() != nil {
 		t.Fatalf("expected epoch persistence error to clear, got %v", service.EpochError())
+	}
+	if got := healthStatus(t, health); got != "SERVING" {
+		t.Fatalf("expected recovered health, got %s", got)
+	}
+}
+
+func TestServiceObserverAddedAfterEpochErrorSeesDegradedHealth(t *testing.T) {
+	service := NewService()
+	service.setEpochError(errors.New("boom"))
+
+	health := stackwatchdog.NewLeadershipHealth()
+	service.AddLeadershipObserver(health)
+
+	if got := healthStatus(t, health); got != "NOT_SERVING" {
+		t.Fatalf("expected degraded health for late observer, got %s", got)
+	}
+}
+
+func TestServiceRetriesEpochLoadAfterFailure(t *testing.T) {
+	store := &flakyEpochStore{loadErr: errors.New("boom"), epoch: 7}
+	service := NewServiceWithConfig(Config{EpochStore: store})
+	health := stackwatchdog.NewLeadershipHealth()
+	service.AddLeadershipObserver(health)
+
+	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1)})
+	if service.EpochError() == nil {
+		t.Fatal("expected epoch load failure")
+	}
+	if got := healthStatus(t, health); got != "NOT_SERVING" {
+		t.Fatalf("expected degraded health after load failure, got %s", got)
+	}
+	if _, err := service.GetTopology(context.Background(), &topologypb.TopologyQuery{StackId: "stack-a"}); err == nil {
+		t.Fatal("expected get topology to fail while epoch load is blocked")
+	}
+
+	store.loadErr = nil
+	service.registerHeartbeat(heartbeat("stack-a", "node-b", "pod-b", "10.0.0.3", 2), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1)})
+	if service.EpochError() != nil {
+		t.Fatalf("expected epoch load failure to clear, got %v", service.EpochError())
+	}
+	if got := healthStatus(t, health); got != "SERVING" {
+		t.Fatalf("expected recovered health, got %s", got)
+	}
+
+	resp, err := service.GetTopology(context.Background(), &topologypb.TopologyQuery{StackId: "stack-a"})
+	if err != nil {
+		t.Fatalf("get topology: %v", err)
+	}
+	if resp.GetEpoch() < 7 {
+		t.Fatalf("expected loaded epoch to be applied, got %d", resp.GetEpoch())
+	}
+	if len(resp.GetMembers()) != 1 || resp.GetMembers()[0].GetNodeId() != "node-b" {
+		t.Fatalf("expected only recovered heartbeat member, got %v", resp.GetMembers())
+	}
+}
+
+func TestServiceRegisterHeartbeatFailsClosedWhenEpochLoadFails(t *testing.T) {
+	store := &flakyEpochStore{loadErr: errors.New("boom")}
+	service := NewServiceWithConfig(Config{EpochStore: store})
+	sub := &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1), done: make(chan struct{})}
+
+	err := service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), sub)
+	if err == nil {
+		t.Fatal("expected register heartbeat to fail on epoch load error")
+	}
+
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	if got := len(service.stateFor("stack-a").subscribers); got != 0 {
+		t.Fatalf("expected no subscriber registration after epoch load failure, got %d", got)
 	}
 }
 
@@ -238,6 +322,22 @@ func TestServiceDemotionClosesSubscribers(t *testing.T) {
 
 	service.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, 1)
 
+	foundStandby := false
+	for {
+		select {
+		case envelope := <-sub.ch:
+			if envelope.GetWatchdogRole() == topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY {
+				foundStandby = true
+			}
+		default:
+			if !foundStandby {
+				t.Fatal("expected standby envelope before subscriber close")
+			}
+			goto closed
+		}
+	}
+
+closed:
 	select {
 	case <-sub.done:
 	default:
@@ -263,6 +363,35 @@ func heartbeat(stackID, nodeID, podName, podIP string, incarnation int64) *topol
 	}
 }
 
+func healthStatus(t *testing.T, health *stackwatchdog.LeadershipHealth) string {
+	t.Helper()
+
+	server := grpc.NewServer()
+	health.Register(server)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	defer server.Stop()
+
+	conn, err := grpc.Dial(listener.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	client := healthgrpc.NewHealthClient(conn)
+
+	resp, err := client.Check(context.Background(), &healthgrpc.HealthCheckRequest{})
+	if err != nil {
+		t.Fatalf("health check: %v", err)
+	}
+	return resp.GetStatus().String()
+}
+
 type failingEpochStore struct {
 	err error
 }
@@ -276,11 +405,16 @@ func (s failingEpochStore) SaveEpoch(context.Context, string, int64) error {
 }
 
 type flakyEpochStore struct {
-	err error
+	err     error
+	loadErr error
+	epoch   int64
 }
 
 func (s *flakyEpochStore) LoadEpoch(context.Context, string) (int64, error) {
-	return 0, nil
+	if s.loadErr != nil {
+		return 0, s.loadErr
+	}
+	return s.epoch, nil
 }
 
 func (s *flakyEpochStore) SaveEpoch(context.Context, string, int64) error {

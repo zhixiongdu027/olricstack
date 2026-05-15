@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -38,6 +37,7 @@ type appConfig struct {
 	k8sClient client.Client
 	clientset kubernetes.Interface
 	health    *stackwatchdog.LeadershipHealth
+	terminate func(int)
 }
 
 func main() {
@@ -85,6 +85,7 @@ func loadAppConfig() (*appConfig, error) {
 		identity:  identity,
 		scheme:    scheme,
 		health:    stackwatchdog.NewLeadershipHealth(),
+		terminate: os.Exit,
 	}
 
 	if stackID == "" {
@@ -135,7 +136,8 @@ func runWithLeaderElection(ctx context.Context, cfg *appConfig) {
 			},
 			OnStoppedLeading: func() {
 				cfg.health.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, 0)
-				log.Printf("watchdog lost leadership")
+				log.Printf("watchdog lost leadership, exiting for pod restart")
+				cfg.terminate(1)
 			},
 			OnNewLeader: func(identity string) {
 				if identity != cfg.identity {
@@ -151,7 +153,10 @@ func runStandalone(ctx context.Context, cfg *appConfig) error {
 }
 
 func runPrimary(ctx context.Context, cfg *appConfig) error {
-	generation := time.Now().UnixNano()
+	generation, epochStore, err := allocateWatchdogGeneration(ctx, cfg)
+	if err != nil {
+		return err
+	}
 	cfg.health.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY, generation)
 	defer cfg.health.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, 0)
 
@@ -170,7 +175,7 @@ func runPrimary(ctx context.Context, cfg *appConfig) error {
 	go topologyService.RunBookworm(ctx)
 
 	if cfg.k8sClient != nil {
-		topologyService.SetEpochStore(stackwatchdog.NewConfigMapEpochStore(cfg.k8sClient, cfg.namespace, cfg.stackID+"-topology"))
+		topologyService.SetEpochStore(epochStore)
 		controller, err := stackwatchdog.NewController(cfg.k8sClient, cfg.scheme, stackwatchdog.ControllerConfig{
 			StackID:           cfg.stackID,
 			Namespace:         cfg.namespace,
@@ -188,6 +193,18 @@ func runPrimary(ctx context.Context, cfg *appConfig) error {
 	}
 
 	return serveTopology(ctx, cfg, topologyService)
+}
+
+func allocateWatchdogGeneration(ctx context.Context, cfg *appConfig) (int64, topology.EpochStore, error) {
+	if cfg.k8sClient == nil {
+		return time.Now().UnixNano(), nil, nil
+	}
+	store := stackwatchdog.NewConfigMapEpochStore(cfg.k8sClient, cfg.namespace, cfg.stackID+"-topology")
+	generation, err := store.NextGeneration(ctx, cfg.stackID)
+	if err != nil {
+		return 0, nil, err
+	}
+	return generation, store, nil
 }
 
 func serveTopology(ctx context.Context, cfg *appConfig, topologyService *topology.Service) error {
@@ -211,7 +228,7 @@ func serveTopology(ctx context.Context, cfg *appConfig, topologyService *topolog
 
 	select {
 	case <-ctx.Done():
-		server.GracefulStop()
+		server.Stop()
 		return ctx.Err()
 	case err := <-errCh:
 		if errors.Is(err, grpc.ErrServerStopped) {
@@ -237,19 +254,6 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 	parsed, err := time.ParseDuration(value)
 	if err != nil || parsed <= 0 {
 		log.Printf("invalid %s=%q, using %s", name, value, fallback)
-		return fallback
-	}
-	return parsed
-}
-
-func envInt64(name string, fallback int64) int64 {
-	value := os.Getenv(name)
-	if value == "" {
-		return fallback
-	}
-	parsed, err := strconv.ParseInt(value, 10, 64)
-	if err != nil || parsed <= 0 {
-		log.Printf("invalid %s=%q, using %d", name, value, fallback)
 		return fallback
 	}
 	return parsed

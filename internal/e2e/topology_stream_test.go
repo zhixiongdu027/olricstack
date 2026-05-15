@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"net"
 	"reflect"
 	"sort"
@@ -13,14 +14,16 @@ import (
 	"github.com/zhixiongdu/olricstack/internal/node"
 	"github.com/zhixiongdu/olricstack/internal/topology"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 func TestTopologySubscriptionE2E(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	addr, cleanup := startWatchdog(t, ctx)
+	addr, _, cleanup := startWatchdog(t, ctx)
 	defer cleanup()
 
 	client, closeClient := newTopologyClient(t, addr)
@@ -49,7 +52,137 @@ func TestTopologySubscriptionE2E(t *testing.T) {
 	joinerA.waitFor(t, []string{"node-a"}, startIndex)
 }
 
-func startWatchdog(t *testing.T, ctx context.Context) (string, func()) {
+func TestTopologySubscriptionRevokesLeaseOnDemotion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr, service, cleanup := startWatchdog(t, ctx)
+	defer cleanup()
+
+	client, closeClient := newTopologyClient(t, addr)
+	defer closeClient()
+
+	joiner := &historyJoiner{}
+	lease := node.NewLeaseTracker()
+	sub, err := node.NewSubscriber(node.SubscriberConfig{
+		StackID:           "demo",
+		NodeID:            "node-a",
+		PodName:           "demo-a",
+		PodIP:             "10.0.0.2",
+		Incarnation:       1,
+		ProtocolVersion:   "v2",
+		HeartbeatInterval: 10 * time.Millisecond,
+		Lease:             lease,
+		Joiner:            joiner,
+	})
+	if err != nil {
+		t.Fatalf("new subscriber: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- sub.Run(ctx, client)
+	}()
+
+	joiner.waitFor(t, []string{"node-a"}, 0)
+	if !lease.ServingAllowed(time.Now()) {
+		t.Fatal("expected lease to become valid before demotion")
+	}
+
+	service.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, 1)
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, node.ErrTopologyNotPrimary) {
+			t.Fatalf("expected standby demotion error, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber did not stop after demotion")
+	}
+
+	if lease.ServingAllowed(time.Now()) {
+		t.Fatal("expected lease to be revoked immediately on demotion")
+	}
+}
+
+func TestTopologySubscriptionReconnectsAfterPromotion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr, service, cleanup := startWatchdog(t, ctx)
+	defer cleanup()
+
+	client, closeClient := newTopologyClient(t, addr)
+	defer closeClient()
+
+	joiner := &historyJoiner{}
+	lease := node.NewLeaseTracker()
+	sub, err := node.NewSubscriber(node.SubscriberConfig{
+		StackID:           "demo",
+		NodeID:            "node-a",
+		PodName:           "demo-a",
+		PodIP:             "10.0.0.2",
+		Incarnation:       1,
+		ProtocolVersion:   "v2",
+		HeartbeatInterval: 10 * time.Millisecond,
+		Lease:             lease,
+		Joiner:            joiner,
+	})
+	if err != nil {
+		t.Fatalf("new subscriber: %v", err)
+	}
+
+	firstErrCh := make(chan error, 1)
+	go func() {
+		firstErrCh <- sub.Run(ctx, client)
+	}()
+
+	joiner.waitFor(t, []string{"node-a"}, 0)
+	if !lease.ServingAllowed(time.Now()) {
+		t.Fatal("expected lease to become valid before demotion")
+	}
+
+	service.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, 1)
+
+	select {
+	case err := <-firstErrCh:
+		if !errors.Is(err, node.ErrTopologyNotPrimary) {
+			t.Fatalf("expected standby demotion error, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscriber did not stop after demotion")
+	}
+	if lease.ServingAllowed(time.Now()) {
+		t.Fatal("expected lease to be revoked on demotion")
+	}
+
+	service.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY, 2)
+	reconnectClient, closeReconnectClient := newTopologyClient(t, addr)
+	defer closeReconnectClient()
+
+	startIndex := joiner.len()
+	secondErrCh := make(chan error, 1)
+	go func() {
+		secondErrCh <- sub.Run(ctx, reconnectClient)
+	}()
+
+	joiner.waitFor(t, []string{"node-a"}, startIndex)
+	if !lease.ServingAllowed(time.Now()) {
+		t.Fatal("expected lease to become valid again after promotion")
+	}
+
+	cancel()
+	select {
+	case err := <-secondErrCh:
+		if !errors.Is(err, context.Canceled) && status.Code(err) != codes.Canceled {
+			t.Fatalf("expected canceled reconnect shutdown, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnected subscriber did not stop on context cancel")
+	}
+}
+
+func startWatchdog(t *testing.T, ctx context.Context) (string, *topology.Service, func()) {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -76,7 +209,7 @@ func startWatchdog(t *testing.T, ctx context.Context) (string, func()) {
 		_ = server.Serve(listener)
 	}()
 
-	return listener.Addr().String(), func() {
+	return listener.Addr().String(), service, func() {
 		server.GracefulStop()
 		_ = listener.Close()
 	}

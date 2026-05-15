@@ -2,6 +2,7 @@ package watchdog
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
@@ -12,6 +13,7 @@ import (
 )
 
 const epochKey = "topologyEpoch"
+const generationKey = "watchdogGeneration"
 
 type ConfigMapEpochStore struct {
 	client    client.Client
@@ -42,25 +44,98 @@ func (s *ConfigMapEpochStore) LoadEpoch(ctx context.Context, stackID string) (in
 }
 
 func (s *ConfigMapEpochStore) SaveEpoch(ctx context.Context, stackID string, epoch int64) error {
-	var cm corev1.ConfigMap
 	key := types.NamespacedName{Name: s.name, Namespace: s.namespace}
-	if err := s.client.Get(ctx, key, &cm); err != nil {
-		if !apierrors.IsNotFound(err) {
+	for {
+		var cm corev1.ConfigMap
+		if err := s.client.Get(ctx, key, &cm); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return err
+			}
+			cm = corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: s.name, Namespace: s.namespace},
+				Data:       map[string]string{epochKey: strconv.FormatInt(epoch, 10)},
+			}
+			if err := s.client.Create(ctx, &cm); err != nil {
+				if apierrors.IsAlreadyExists(err) {
+					continue
+				}
+				return err
+			}
+			return nil
+		}
+		if cm.Data == nil {
+			cm.Data = make(map[string]string)
+		}
+		current, err := parseStoredCounter(cm.Data, epochKey)
+		if err != nil {
 			return err
 		}
-		cm = corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: s.name, Namespace: s.namespace},
-			Data:       map[string]string{epochKey: strconv.FormatInt(epoch, 10)},
+		if current >= epoch {
+			return nil
 		}
-		return s.client.Create(ctx, &cm)
-	}
-	if cm.Data == nil {
-		cm.Data = make(map[string]string)
-	}
-	current, _ := strconv.ParseInt(cm.Data[epochKey], 10, 64)
-	if current >= epoch {
+		cm.Data[epochKey] = strconv.FormatInt(epoch, 10)
+		if err := s.client.Update(ctx, &cm); err != nil {
+			if apierrors.IsConflict(err) {
+				continue
+			}
+			return err
+		}
 		return nil
 	}
-	cm.Data[epochKey] = strconv.FormatInt(epoch, 10)
-	return s.client.Update(ctx, &cm)
+}
+
+func (s *ConfigMapEpochStore) NextGeneration(ctx context.Context, stackID string) (int64, error) {
+	for {
+		var cm corev1.ConfigMap
+		key := types.NamespacedName{Name: s.name, Namespace: s.namespace}
+		if err := s.client.Get(ctx, key, &cm); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return 0, err
+			}
+			cm = corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: s.name, Namespace: s.namespace},
+				Data: map[string]string{
+					generationKey: "1",
+				},
+			}
+			if err := s.client.Create(ctx, &cm); err != nil {
+				if apierrors.IsAlreadyExists(err) {
+					continue
+				}
+				return 0, err
+			}
+			return 1, nil
+		}
+		if cm.Data == nil {
+			cm.Data = make(map[string]string)
+		}
+		current, err := parseStoredCounter(cm.Data, generationKey)
+		if err != nil {
+			return 0, err
+		}
+		next := current + 1
+		if next <= 0 {
+			next = 1
+		}
+		cm.Data[generationKey] = strconv.FormatInt(next, 10)
+		if err := s.client.Update(ctx, &cm); err != nil {
+			if apierrors.IsConflict(err) {
+				continue
+			}
+			return 0, err
+		}
+		return next, nil
+	}
+}
+
+func parseStoredCounter(data map[string]string, key string) (int64, error) {
+	value := data[key]
+	if value == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s: %w", key, err)
+	}
+	return parsed, nil
 }
