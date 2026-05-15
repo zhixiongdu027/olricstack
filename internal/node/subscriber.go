@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -144,15 +145,28 @@ func (s *Subscriber) Run(ctx context.Context, client topologypb.TopologyControlC
 }
 
 type LeaseTracker struct {
-	validUntilUnixMs atomic.Int64
-	generation       atomic.Int64
-	epoch            atomic.Int64
+	mu               sync.RWMutex
+	generation       int64
+	epoch            int64
+	validUntilUnixMs int64
 }
 
 func NewLeaseTracker() *LeaseTracker {
 	return &LeaseTracker{}
 }
 
+// Apply validates and ingests a topology envelope. The state transition is:
+//
+//   - role != PRIMARY                   ⇒ ErrTopologyNotPrimary
+//   - validUntil <= now                 ⇒ ErrTopologyLeaseExpired
+//   - env.generation <  cur.generation  ⇒ ErrStaleWatchdogGeneration
+//   - env.generation >  cur.generation  ⇒ accept, reset epoch baseline (N1)
+//   - env.generation == cur.generation:
+//       env.epoch    <  cur.epoch       ⇒ ErrStaleTopologyEpoch
+//       env.epoch    >= cur.epoch       ⇒ accept
+//
+// On accept (generation, epoch, validUntilUnixMs) are persisted atomically
+// under l.mu so that ServingAllowed/SnapshotForWrite cannot read a torn state.
 func (l *LeaseTracker) Apply(envelope *topologypb.TopologyEnvelope, now time.Time) error {
 	if envelope.GetWatchdogRole() != topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY {
 		return ErrTopologyNotPrimary
@@ -160,32 +174,53 @@ func (l *LeaseTracker) Apply(envelope *topologypb.TopologyEnvelope, now time.Tim
 	if envelope.GetValidUntilUnixMs() <= now.UnixMilli() {
 		return ErrTopologyLeaseExpired
 	}
-	if current := l.generation.Load(); envelope.GetWatchdogGeneration() < current {
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	switch {
+	case envelope.GetWatchdogGeneration() < l.generation:
 		return ErrStaleWatchdogGeneration
+	case envelope.GetWatchdogGeneration() > l.generation:
+		// N1: a new primary resets the epoch baseline. The new generation's
+		// epoch sequence is independent of the previous one's, so we accept
+		// any epoch the new primary publishes (including 0 on a fresh stack).
+		l.generation = envelope.GetWatchdogGeneration()
+		l.epoch = envelope.GetEpoch()
+		l.validUntilUnixMs = envelope.GetValidUntilUnixMs()
+		return nil
+	default:
+		if envelope.GetEpoch() < l.epoch {
+			return ErrStaleTopologyEpoch
+		}
+		l.epoch = envelope.GetEpoch()
+		l.validUntilUnixMs = envelope.GetValidUntilUnixMs()
+		return nil
 	}
-	if current := l.epoch.Load(); envelope.GetEpoch() < current {
-		return ErrStaleTopologyEpoch
-	}
-	l.generation.Store(envelope.GetWatchdogGeneration())
-	l.epoch.Store(envelope.GetEpoch())
-	l.validUntilUnixMs.Store(envelope.GetValidUntilUnixMs())
-	return nil
 }
 
 func (l *LeaseTracker) Revoke() {
-	l.validUntilUnixMs.Store(0)
-}
-
-func shouldRevokeLease(err error) bool {
-	return errors.Is(err, ErrTopologyLeaseExpired) ||
-		errors.Is(err, ErrTopologyNotPrimary) ||
-		errors.Is(err, ErrStaleTopologyEpoch) ||
-		errors.Is(err, ErrStaleWatchdogGeneration)
+	l.mu.Lock()
+	l.validUntilUnixMs = 0
+	l.mu.Unlock()
 }
 
 func (l *LeaseTracker) ServingAllowed(now time.Time) bool {
-	validUntil := l.validUntilUnixMs.Load()
-	return validUntil > now.UnixMilli()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.validUntilUnixMs > now.UnixMilli()
+}
+
+// SnapshotForWrite returns the current (generation, epoch) atomically with the
+// lease validity check. ok is false if the lease has expired, in which case the
+// caller MUST abort the write before mutating any durable state.
+func (l *LeaseTracker) SnapshotForWrite(now time.Time) (generation, epoch int64, ok bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.validUntilUnixMs <= now.UnixMilli() {
+		return 0, 0, false
+	}
+	return l.generation, l.epoch, true
 }
 
 func (l *LeaseTracker) WaitExpired(ctx context.Context, pollInterval time.Duration) error {
@@ -205,4 +240,11 @@ func (l *LeaseTracker) WaitExpired(ctx context.Context, pollInterval time.Durati
 		case <-ticker.C:
 		}
 	}
+}
+
+func shouldRevokeLease(err error) bool {
+	return errors.Is(err, ErrTopologyLeaseExpired) ||
+		errors.Is(err, ErrTopologyNotPrimary) ||
+		errors.Is(err, ErrStaleTopologyEpoch) ||
+		errors.Is(err, ErrStaleWatchdogGeneration)
 }

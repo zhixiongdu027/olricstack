@@ -33,7 +33,7 @@ func TestRunTopologySubscriptionReconnectsAfterPromotion(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runTopologySubscription(ctx, lease, nil)
+		runTopologySubscription(ctx, lease, nil, nil)
 	}()
 
 	waitForLeaseState(t, lease, true, 2*time.Second)

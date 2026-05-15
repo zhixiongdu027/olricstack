@@ -31,8 +31,8 @@ type CacheStore interface {
 
 type CommitStore interface {
 	PrepareEntry(ctx context.Context, record EntryRecord) (EntryRecord, error)
-	PrepareDelete(ctx context.Context, ref EntryRef) (EntryRecord, error)
-	CommitEntry(ctx context.Context, ref EntryRef, version int64) error
+	CommitEntry(ctx context.Context, ref EntryRef, walSeq int64) error
+	AbortEntry(ctx context.Context, ref EntryRef, walSeq int64) error
 }
 
 type Starter interface {
@@ -57,12 +57,32 @@ type EntryRecord struct {
 	TTL          int64     `gorm:"column:ttl;not null" json:"ttl"`
 	Timestamp    int64     `gorm:"column:timestamp;not null" json:"timestamp"`
 	Tombstone    bool      `gorm:"column:tombstone;not null" json:"tombstone"`
-	Version      int64     `gorm:"column:version;not null;index:idx_cache_version_writer" json:"version"`
-	WriterID     string    `gorm:"column:writer_id;size:128;not null;index:idx_cache_version_writer" json:"writer_id"`
+	Generation   int64     `gorm:"column:generation;not null;index:idx_cache_fence" json:"generation"`
+	Epoch        int64     `gorm:"column:epoch;not null;index:idx_cache_fence" json:"epoch"`
+	OwnerSeq     int64     `gorm:"column:owner_seq;not null;index:idx_cache_fence" json:"owner_seq"`
 	UpdatedAt    time.Time `gorm:"column:updated_at" json:"updated_at"`
-	Origin       string    `gorm:"-" json:"origin,omitempty"`
-	FlushMySQL   bool      `gorm:"-" json:"flush_mysql,omitempty"`
-	WALState     string    `gorm:"-" json:"wal_state,omitempty"`
+	// WALSeq is a node-local monotonic identifier assigned at PrepareEntry. It
+	// is never persisted to MySQL — the durable contract is the fence triple
+	// (Generation, Epoch, OwnerSeq). WALSeq exists only to bind a Commit/Abort
+	// call back to the exact prepared record in bbolt.
+	WALSeq     int64  `gorm:"-" json:"wal_seq,omitempty"`
+	Origin     string `gorm:"-" json:"origin,omitempty"`
+	FlushMySQL bool   `gorm:"-" json:"flush_mysql,omitempty"`
+	WALState   string `gorm:"-" json:"wal_state,omitempty"`
+}
+
+func (r EntryRecord) Fence() (generation, epoch, ownerSeq int64) {
+	return r.Generation, r.Epoch, r.OwnerSeq
+}
+
+func fenceLess(a, b EntryRecord) bool {
+	if a.Generation != b.Generation {
+		return a.Generation < b.Generation
+	}
+	if a.Epoch != b.Epoch {
+		return a.Epoch < b.Epoch
+	}
+	return a.OwnerSeq < b.OwnerSeq
 }
 
 const (
@@ -89,7 +109,6 @@ type Config struct {
 	FlushInterval time.Duration
 	BatchSize     int
 	WALPath       string
-	NodeID        string
 	FlushBackoff  time.Duration
 }
 
@@ -109,9 +128,6 @@ func (c Config) withDefaults() Config {
 	if c.FlushBackoff <= 0 {
 		c.FlushBackoff = c.FlushInterval
 	}
-	if c.NodeID == "" {
-		c.NodeID = "unknown"
-	}
 	return c
 }
 
@@ -122,7 +138,7 @@ type dirtyEntry struct {
 var (
 	walDirtyBucket = []byte("dirty")
 	walMetaBucket  = []byte("meta")
-	walVersionKey  = []byte("version")
+	walSeqKey      = []byte("wal_seq")
 )
 
 type MySQLStore struct {
@@ -192,6 +208,63 @@ func (s *MySQLStore) Start(context.Context) error {
 		go s.flushLoop()
 	})
 	return nil
+}
+
+// PurgeBelowGeneration removes WAL records whose fence Generation is strictly
+// less than minGeneration. It exists for the case where a node restarts under
+// a higher Watchdog generation than the one its committed records were stamped
+// with: those records can no longer win the MySQL upsert (the fence triple
+// would lose) and would otherwise just produce noise as flushable IO. This is
+// the engineering counterpart to Formal Target #6 — old owners cannot
+// overwrite newer state — by deleting the IO before it ever reaches MySQL.
+//
+// Records currently in WALStatePrepared are left untouched: the active
+// Olric mutation may still call AfterSet/Commit. Tombstones (Generation>0)
+// follow the same purge rule as live records.
+func (s *MySQLStore) PurgeBelowGeneration(ctx context.Context, minGeneration int64) (int, error) {
+	if minGeneration <= 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return 0, errors.New("cache store is closed")
+	}
+	s.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	var purged int
+	err := s.wal.Update(func(tx *bolt.Tx) error {
+		dirty := tx.Bucket(walDirtyBucket)
+		cursor := dirty.Cursor()
+		var stale [][]byte
+		for key, encoded := cursor.First(); key != nil; key, encoded = cursor.Next() {
+			var entry dirtyEntry
+			if err := json.Unmarshal(encoded, &entry); err != nil {
+				return err
+			}
+			if entry.Record.WALState == WALStatePrepared {
+				continue
+			}
+			if entry.Record.Generation > 0 && entry.Record.Generation < minGeneration {
+				stale = append(stale, append([]byte(nil), key...))
+			}
+		}
+		for _, key := range stale {
+			if err := dirty.Delete(key); err != nil {
+				return err
+			}
+		}
+		purged = len(stale)
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("purge below generation %d: %w", minGeneration, err)
+	}
+	return purged, nil
 }
 
 func (s *MySQLStore) Replay(ctx context.Context, f func(EntryRecord) error) error {
@@ -282,7 +355,7 @@ func (s *MySQLStore) StoreEntry(ctx context.Context, record EntryRecord) error {
 			record.WALState = WALStateLocal
 		}
 	}
-	return s.store(ctx, record, 0)
+	return s.store(ctx, record)
 }
 
 func (s *MySQLStore) DeleteEntry(ctx context.Context, ref EntryRef) error {
@@ -295,30 +368,19 @@ func (s *MySQLStore) DeleteEntry(ctx context.Context, ref EntryRef) error {
 		Origin:     "client_delete",
 		FlushMySQL: true,
 		WALState:   WALStateCommitted,
-	}, 0)
+	})
 }
 
+// PrepareEntry stages a record in the WAL with WALStatePrepared. The caller
+// controls record.Tombstone (true for delete intent). The record only becomes
+// flushable to MySQL after a successful CommitEntry; an AbortEntry removes it.
 func (s *MySQLStore) PrepareEntry(ctx context.Context, record EntryRecord) (EntryRecord, error) {
-	record.Tombstone = false
 	record.FlushMySQL = false
 	record.WALState = WALStatePrepared
-	return s.storeAndReturn(ctx, record, 0)
+	return s.storeAndReturn(ctx, record)
 }
 
-func (s *MySQLStore) PrepareDelete(ctx context.Context, ref EntryRef) (EntryRecord, error) {
-	return s.storeAndReturn(ctx, EntryRecord{
-		DMap:       ref.DMap,
-		Key:        ref.Key,
-		HKey:       ref.HKey,
-		Tombstone:  true,
-		UpdatedAt:  time.Now().UTC(),
-		Origin:     "client_delete",
-		FlushMySQL: false,
-		WALState:   WALStatePrepared,
-	}, 0)
-}
-
-func (s *MySQLStore) CommitEntry(ctx context.Context, ref EntryRef, version int64) error {
+func (s *MySQLStore) CommitEntry(ctx context.Context, ref EntryRef, walSeq int64) error {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
@@ -328,7 +390,7 @@ func (s *MySQLStore) CommitEntry(ctx context.Context, ref EntryRef, version int6
 		s.mu.Unlock()
 		return err
 	}
-	depth, err := s.commitDirty(ref, version)
+	depth, err := s.commitDirty(ref, walSeq)
 	if err != nil {
 		s.mu.Unlock()
 		return err
@@ -341,12 +403,37 @@ func (s *MySQLStore) CommitEntry(ctx context.Context, ref EntryRef, version int6
 	return nil
 }
 
-func (s *MySQLStore) store(ctx context.Context, record EntryRecord, version int64) error {
-	_, err := s.storeAndReturn(ctx, record, version)
+// AbortEntry deletes a prepared WAL record after the corresponding Olric
+// mutation failed. It is intentionally narrow:
+//
+//   - If no record exists for ref, it is a no-op (idempotent).
+//   - If the record's WALSeq does not match, it was superseded by a newer
+//     prepare/commit and must not be touched.
+//   - If the record was already committed, abort is rejected — committed state
+//     is the durable contract and only flush+deleteFlushed may remove it.
+//
+// This makes AbortEntry safe to call from a DurableHook error path even if the
+// hook does not know whether the prepare itself reached the WAL.
+func (s *MySQLStore) AbortEntry(ctx context.Context, ref EntryRef, walSeq int64) error {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return errors.New("cache store is closed")
+	}
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	defer s.mu.Unlock()
+	return s.abortDirty(ref, walSeq)
+}
+
+func (s *MySQLStore) store(ctx context.Context, record EntryRecord) error {
+	_, err := s.storeAndReturn(ctx, record)
 	return err
 }
 
-func (s *MySQLStore) storeAndReturn(ctx context.Context, record EntryRecord, version int64) (EntryRecord, error) {
+func (s *MySQLStore) storeAndReturn(ctx context.Context, record EntryRecord) (EntryRecord, error) {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
@@ -356,7 +443,7 @@ func (s *MySQLStore) storeAndReturn(ctx context.Context, record EntryRecord, ver
 		s.mu.Unlock()
 		return EntryRecord{}, err
 	}
-	entry, depth, err := s.appendDirty(record, version)
+	entry, depth, err := s.appendDirty(record)
 	if err != nil {
 		s.mu.Unlock()
 		return EntryRecord{}, err
@@ -416,25 +503,6 @@ func (s *MySQLStore) flushLoop() {
 			return
 		}
 	}
-}
-
-func (s *MySQLStore) flushPending(pending map[string][]byte) bool {
-	entries := make([]dirtyEntry, 0, len(pending))
-	now := time.Now().UTC()
-	for key, value := range pending {
-		entries = append(entries, dirtyEntry{Record: EntryRecord{
-			Key:          key,
-			HKey:         uint64(len(key)),
-			EncodedEntry: value,
-			Version:      now.UnixNano(),
-			WriterID:     s.cfg.NodeID,
-			UpdatedAt:    now,
-			Origin:       "legacy_pending",
-			FlushMySQL:   true,
-			WALState:     WALStateCommitted,
-		}})
-	}
-	return s.flushEntries(entries)
 }
 
 func (s *MySQLStore) flushWAL(force bool) bool {
@@ -529,14 +597,11 @@ func openWAL(path string) (*bolt.DB, error) {
 	return db, nil
 }
 
-func (s *MySQLStore) appendDirty(record EntryRecord, version int64) (dirtyEntry, int, error) {
+func (s *MySQLStore) appendDirty(record EntryRecord) (dirtyEntry, int, error) {
 	now := time.Now().UTC()
 	record = record.Clone()
 	if record.UpdatedAt.IsZero() {
 		record.UpdatedAt = now
-	}
-	if record.WriterID == "" {
-		record.WriterID = s.cfg.NodeID
 	}
 	entry := dirtyEntry{Record: record}
 	var depth int
@@ -557,7 +622,7 @@ func (s *MySQLStore) appendDirty(record EntryRecord, version int64) (dirtyEntry,
 			return ErrQueueFull
 		}
 		meta := tx.Bucket(walMetaBucket)
-		entry.Record.Version = nextVersion(meta, entry.Record.UpdatedAt, version)
+		entry.Record.WALSeq = nextWALSeq(meta)
 		encoded, err := json.Marshal(entry)
 		if err != nil {
 			return err
@@ -571,7 +636,7 @@ func (s *MySQLStore) appendDirty(record EntryRecord, version int64) (dirtyEntry,
 	return entry, depth, err
 }
 
-func (s *MySQLStore) commitDirty(ref EntryRef, version int64) (int, error) {
+func (s *MySQLStore) commitDirty(ref EntryRef, walSeq int64) (int, error) {
 	var depth int
 	err := s.wal.Update(func(tx *bolt.Tx) error {
 		dirty := tx.Bucket(walDirtyBucket)
@@ -584,7 +649,7 @@ func (s *MySQLStore) commitDirty(ref EntryRef, version int64) (int, error) {
 		if err := json.Unmarshal(encoded, &entry); err != nil {
 			return err
 		}
-		if entry.Record.Version != version {
+		if entry.Record.WALSeq != walSeq {
 			return ErrNotFound
 		}
 		entry.Record.WALState = WALStateCommitted
@@ -600,6 +665,30 @@ func (s *MySQLStore) commitDirty(ref EntryRef, version int64) (int, error) {
 		return nil
 	})
 	return depth, err
+}
+
+func (s *MySQLStore) abortDirty(ref EntryRef, walSeq int64) error {
+	return s.wal.Update(func(tx *bolt.Tx) error {
+		dirty := tx.Bucket(walDirtyBucket)
+		key := []byte(walKey(ref))
+		encoded := dirty.Get(key)
+		if encoded == nil {
+			// Already gone — abort is idempotent.
+			return nil
+		}
+		var entry dirtyEntry
+		if err := json.Unmarshal(encoded, &entry); err != nil {
+			return err
+		}
+		if entry.Record.WALSeq != walSeq {
+			// Superseded by a newer prepare; do not touch the live record.
+			return nil
+		}
+		if entry.Record.WALState == WALStateCommitted {
+			return errors.New("cannot abort committed wal record")
+		}
+		return dirty.Delete(key)
+	})
 }
 
 func (s *MySQLStore) loadDirty(ref EntryRef) (EntryRecord, bool, error) {
@@ -672,7 +761,7 @@ func (s *MySQLStore) deleteFlushed(entries []dirtyEntry) error {
 			if err := json.Unmarshal(encoded, &current); err != nil {
 				return err
 			}
-			if current.Record.Version == flushed.Record.Version {
+			if current.Record.WALSeq == flushed.Record.WALSeq {
 				if err := dirty.Delete(key); err != nil {
 					return err
 				}
@@ -682,27 +771,36 @@ func (s *MySQLStore) deleteFlushed(entries []dirtyEntry) error {
 	})
 }
 
-func nextVersion(bucket *bolt.Bucket, now time.Time, requested int64) int64 {
+// nextWALSeq returns a strictly-monotonic per-WAL identifier used to bind a
+// prepared dirty record to its later Commit/Abort call. It is *not* persisted
+// to MySQL — fence (Generation, Epoch, OwnerSeq) is the only durable ordering.
+func nextWALSeq(bucket *bolt.Bucket) int64 {
 	var current uint64
-	if encoded := bucket.Get(walVersionKey); len(encoded) == 8 {
+	if encoded := bucket.Get(walSeqKey); len(encoded) == 8 {
 		current = binary.BigEndian.Uint64(encoded)
 	}
-	next := uint64(now.UnixNano())
-	if requested > 0 {
-		next = uint64(requested)
-	}
-	if next <= current {
-		next = current + 1
-	}
+	next := current + 1
 	var encoded [8]byte
 	binary.BigEndian.PutUint64(encoded[:], next)
-	_ = bucket.Put(walVersionKey, encoded[:])
+	_ = bucket.Put(walSeqKey, encoded[:])
 	return int64(next)
 }
 
+// versionedUpsertClause encodes the durable conflict-resolution rule used by
+// the asynchronous flusher. Conflict resolution is a strict lexicographic
+// comparison of the fence triple (Generation, Epoch, OwnerSeq):
+//
+//	v1 < v2 ⟺ G1<G2  ∨  (G1=G2 ∧ E1<E2)  ∨  (G1=G2 ∧ E1=E2 ∧ S1<S2)
+//
+// This is what makes a delayed flush from an old owner provably lose to a
+// newer-owner write — local wall-clock time cannot defeat a higher fence.
+// isFlushable() rejects records without G>0 ∧ S>0, so by construction every
+// row reaching this clause carries a fence.
 func (s *MySQLStore) versionedUpsertClause() clause.OnConflict {
 	if s.db.Dialector.Name() == "mysql" {
-		newer := "VALUES(version) > version OR (VALUES(version) = version AND VALUES(writer_id) > writer_id)"
+		newer := "VALUES(generation) > generation OR " +
+			"(VALUES(generation) = generation AND VALUES(epoch) > epoch) OR " +
+			"(VALUES(generation) = generation AND VALUES(epoch) = epoch AND VALUES(owner_seq) > owner_seq)"
 		return clause.OnConflict{
 			Columns: []clause.Column{{Name: "dmap"}, {Name: "hkey"}},
 			DoUpdates: clause.Assignments(map[string]interface{}{
@@ -711,14 +809,17 @@ func (s *MySQLStore) versionedUpsertClause() clause.OnConflict {
 				"ttl":           gorm.Expr("CASE WHEN " + newer + " THEN VALUES(ttl) ELSE ttl END"),
 				"timestamp":     gorm.Expr("CASE WHEN " + newer + " THEN VALUES(timestamp) ELSE timestamp END"),
 				"tombstone":     gorm.Expr("CASE WHEN " + newer + " THEN VALUES(tombstone) ELSE tombstone END"),
-				"version":       gorm.Expr("GREATEST(version, VALUES(version))"),
-				"writer_id":     gorm.Expr("CASE WHEN " + newer + " THEN VALUES(writer_id) ELSE writer_id END"),
+				"generation":    gorm.Expr("CASE WHEN " + newer + " THEN VALUES(generation) ELSE generation END"),
+				"epoch":         gorm.Expr("CASE WHEN " + newer + " THEN VALUES(epoch) ELSE epoch END"),
+				"owner_seq":     gorm.Expr("CASE WHEN " + newer + " THEN VALUES(owner_seq) ELSE owner_seq END"),
 				"updated_at":    gorm.Expr("CASE WHEN " + newer + " THEN VALUES(updated_at) ELSE updated_at END"),
 			}),
 		}
 	}
 
-	newer := "excluded.version > version OR (excluded.version = version AND excluded.writer_id > writer_id)"
+	newer := "excluded.generation > generation OR " +
+		"(excluded.generation = generation AND excluded.epoch > epoch) OR " +
+		"(excluded.generation = generation AND excluded.epoch = epoch AND excluded.owner_seq > owner_seq)"
 	return clause.OnConflict{
 		Columns: []clause.Column{{Name: "dmap"}, {Name: "hkey"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
@@ -727,8 +828,9 @@ func (s *MySQLStore) versionedUpsertClause() clause.OnConflict {
 			"ttl":           gorm.Expr("CASE WHEN " + newer + " THEN excluded.ttl ELSE ttl END"),
 			"timestamp":     gorm.Expr("CASE WHEN " + newer + " THEN excluded.timestamp ELSE timestamp END"),
 			"tombstone":     gorm.Expr("CASE WHEN " + newer + " THEN excluded.tombstone ELSE tombstone END"),
-			"version":       gorm.Expr("MAX(version, excluded.version)"),
-			"writer_id":     gorm.Expr("CASE WHEN " + newer + " THEN excluded.writer_id ELSE writer_id END"),
+			"generation":    gorm.Expr("CASE WHEN " + newer + " THEN excluded.generation ELSE generation END"),
+			"epoch":         gorm.Expr("CASE WHEN " + newer + " THEN excluded.epoch ELSE epoch END"),
+			"owner_seq":     gorm.Expr("CASE WHEN " + newer + " THEN excluded.owner_seq ELSE owner_seq END"),
 			"updated_at":    gorm.Expr("CASE WHEN " + newer + " THEN excluded.updated_at ELSE updated_at END"),
 		}),
 	}
@@ -743,7 +845,17 @@ func isExpired(ttl int64, now time.Time) bool {
 }
 
 func isFlushable(record EntryRecord) bool {
-	return record.FlushMySQL && (record.WALState == "" || record.WALState == WALStateCommitted)
+	if !record.FlushMySQL {
+		return false
+	}
+	if record.WALState != "" && record.WALState != WALStateCommitted {
+		return false
+	}
+	// Fence (Generation, Epoch, OwnerSeq) is the durable contract for any
+	// MySQL upsert. Records without a fence cannot win the upsert race
+	// against fenced records, so we drop them at the flusher boundary
+	// instead of letting them produce non-comparable rows.
+	return record.Generation > 0 && record.OwnerSeq > 0
 }
 
 func shouldPreserveDirtyRecord(current, incoming EntryRecord) bool {

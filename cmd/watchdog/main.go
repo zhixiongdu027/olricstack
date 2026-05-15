@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -173,6 +174,10 @@ func runPrimary(ctx context.Context, cfg *appConfig) error {
 	topologyService.AddLeadershipObserver(cfg.health)
 	go topologyService.RunReaper(ctx)
 	go topologyService.RunBookworm(ctx)
+	go watchEpochHealth(ctx, topologyService, cfg.terminate,
+		envDuration("WATCHDOG_EPOCH_HEALTH_INTERVAL", 5*time.Second),
+		envInt("WATCHDOG_EPOCH_FAILURE_THRESHOLD", 3),
+	)
 
 	if cfg.k8sClient != nil {
 		topologyService.SetEpochStore(epochStore)
@@ -193,6 +198,53 @@ func runPrimary(ctx context.Context, cfg *appConfig) error {
 	}
 
 	return serveTopology(ctx, cfg, topologyService)
+}
+
+// watchEpochHealth terminates the process when topology epoch persistence has
+// been broken for consecutive polls. Holding a degraded primary alive would
+// only freeze the cluster — every membership change would invisibly bump
+// state.epoch without persistence, and a future primary that recovers the
+// stale ConfigMap epoch could no longer push envelopes that nodes accept.
+// Forcing a process restart hands leadership to a standby that can either
+// succeed at the same write or surface a clearer failure to operators.
+func watchEpochHealth(ctx context.Context, service *topology.Service, terminate func(int), interval time.Duration, threshold int) {
+	if interval <= 0 || threshold <= 0 || terminate == nil {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var consecutive int
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if service.EpochError() != nil {
+				consecutive++
+				if consecutive >= threshold {
+					log.Printf("watchdog topology epoch persistence has failed %d consecutive checks; terminating to release leadership", consecutive)
+					terminate(1)
+					return
+				}
+			} else {
+				consecutive = 0
+			}
+		}
+	}
+}
+
+func envInt(name string, fallback int) int {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed <= 0 {
+		log.Printf("invalid %s=%q, using %d", name, value, fallback)
+		return fallback
+	}
+	return parsed
 }
 
 func allocateWatchdogGeneration(ctx context.Context, cfg *appConfig) (int64, topology.EpochStore, error) {

@@ -116,6 +116,9 @@ func (s *Service) RunReaper(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
+			if s.EpochError() != nil {
+				continue
+			}
 			s.pruneExpired(now)
 		}
 	}
@@ -131,6 +134,9 @@ func (s *Service) RunBookworm(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if s.EpochError() != nil {
+				continue
+			}
 			s.broadcastSnapshots(topologypb.TopologyReason_TOPOLOGY_REASON_BOOKWORM)
 		}
 	}
@@ -349,7 +355,13 @@ func (s *Service) pruneExpiredLocked(stackID string, state *stackState, now time
 
 func (s *Service) broadcastLocked(stackID string, state *stackState, reason topologypb.TopologyReason) {
 	envelope := s.envelopeFor(stackID, state, reason)
-	s.saveEpochLocked(context.Background(), stackID, envelope.GetEpoch())
+	if err := s.saveEpochLocked(context.Background(), stackID, envelope.GetEpoch()); err != nil {
+		// W2: an envelope must never reach a subscriber unless its epoch is
+		// already durable. A new primary that recovers from ConfigMap with a
+		// lower epoch would otherwise reject this node's heartbeat under N1
+		// in the LeaseTracker, deadlocking the cluster until restart.
+		return
+	}
 	for _, sub := range state.subscribers {
 		select {
 		case sub.ch <- cloneEnvelope(envelope):
@@ -359,6 +371,10 @@ func (s *Service) broadcastLocked(stackID string, state *stackState, reason topo
 }
 
 func (s *Service) sendLatestLocked(stackID string, state *stackState, sub *subscriber, reason topologypb.TopologyReason) {
+	if s.EpochError() != nil {
+		// Degraded: don't push an envelope whose epoch may not be durable.
+		return
+	}
 	envelope := s.envelopeFor(stackID, state, reason)
 	select {
 	case sub.ch <- envelope:
@@ -469,10 +485,28 @@ func (s *Service) AddLeadershipObserver(observer LeadershipObserver) {
 	}
 }
 
+// closeSubscribersForLeadershipChange demotes every active stream to a
+// standby state in two phases:
+//
+//   Phase 1 (under s.mu): drain any pending envelope from each subscriber
+//   channel, post a fresh PRIMARY_CHANGE envelope, and remove the subscriber
+//   from the per-stack map so no later broadcast can target it.
+//
+//   Phase 2 (outside s.mu, after a short drain window): close sub.done so the
+//   Watch goroutine returns. The drain window lets Watch's select pick the
+//   standby envelope from sub.ch first; closing sub.done immediately would
+//   leave the Go runtime free to pick the done branch instead, dropping the
+//   demotion signal on the wire and forcing nodes to wait for the lease TTL.
 func (s *Service) closeSubscribersForLeadershipChange() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	type pendingSub struct {
+		stackID  string
+		nodeID   string
+		sub      *subscriber
+		envelope *topologypb.TopologyEnvelope
+	}
 
+	s.mu.Lock()
+	var pending []pendingSub
 	for stackID, state := range s.stacks {
 		envelope := s.standbyEnvelope(stackID)
 		for nodeID, sub := range state.subscribers {
@@ -484,9 +518,18 @@ func (s *Service) closeSubscribersForLeadershipChange() {
 			case sub.ch <- cloneEnvelope(envelope):
 			default:
 			}
-			closeSubscriber(sub)
 			delete(state.subscribers, nodeID)
+			pending = append(pending, pendingSub{stackID: stackID, nodeID: nodeID, sub: sub, envelope: envelope})
 		}
+	}
+	s.mu.Unlock()
+
+	// Drain window — bounded so demotion cannot stall leader election.
+	if len(pending) > 0 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	for _, p := range pending {
+		closeSubscriber(p.sub)
 	}
 }
 
@@ -524,19 +567,20 @@ func (s *Service) loadEpochLocked(ctx context.Context, stackID string, state *st
 	return nil
 }
 
-func (s *Service) saveEpochLocked(ctx context.Context, stackID string, epoch int64) {
+func (s *Service) saveEpochLocked(ctx context.Context, stackID string, epoch int64) error {
 	store := s.config().EpochStore
 	if store == nil {
 		s.setEpochError(nil)
-		return
+		return nil
 	}
 	if err := store.SaveEpoch(ctx, stackID, epoch); err != nil {
 		wrapped := fmt.Errorf("save topology epoch: %w", err)
 		s.setEpochError(wrapped)
 		log.Printf("watchdog topology epoch persistence failed for stack %q epoch %d: %v", stackID, epoch, err)
-		return
+		return wrapped
 	}
 	s.setEpochError(nil)
+	return nil
 }
 
 func (s *Service) EpochError() error {

@@ -324,13 +324,14 @@ func (dm *DMap) putOnCluster(e *env) error {
 			PartitionID: dm.s.primary.PartitionIDByHKey(e.hkey),
 			Entry:       nt,
 		}
-		if e.putConfig.OnlyUpdateTTL {
-			current, err := f.storage.Get(e.hkey)
-			if err != nil {
-				if errors.Is(err, storage.ErrKeyNotFound) {
-					err = ErrKeyNotFound
+		isExpire := e.putConfig.OnlyUpdateTTL
+		if isExpire {
+			current, gerr := f.storage.Get(e.hkey)
+			if gerr != nil {
+				if errors.Is(gerr, storage.ErrKeyNotFound) {
+					gerr = ErrKeyNotFound
 				}
-				return err
+				return gerr
 			}
 			current.SetTTL(nt.TTL())
 			current.SetTimestamp(nt.Timestamp())
@@ -349,13 +350,21 @@ func (dm *DMap) putOnCluster(e *env) error {
 				return err
 			}
 		}
-		if err = dm.putOnClusterAfterDurable(e, nt); err != nil {
-			return err
+		// putOnClusterAfterDurable performs the in-memory mutation and any
+		// quorum/replication step. AfterX MUST run regardless of mutErr so the
+		// hook can commit on success or abort the prepared durable record on
+		// failure. Returning early here would leak prepared WAL state.
+		mutErr := dm.putOnClusterAfterDurable(e, nt)
+		var hookErr error
+		if isExpire {
+			hookErr = dm.s.config.DurableHook.AfterExpire(e.ctx, op, mutErr)
+		} else {
+			hookErr = dm.s.config.DurableHook.AfterSet(e.ctx, op, mutErr)
 		}
-		if e.putConfig.OnlyUpdateTTL {
-			return dm.s.config.DurableHook.AfterExpire(e.ctx, op)
+		if mutErr != nil {
+			return mutErr
 		}
-		return dm.s.config.DurableHook.AfterSet(e.ctx, op)
+		return hookErr
 	}
 	return dm.putOnClusterAfterDurable(e, nt)
 }

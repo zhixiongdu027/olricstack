@@ -36,11 +36,23 @@ func main() {
 		log.Fatalf("create backing store: %v", err)
 	}
 	topologyLease := node.NewLeaseTracker()
-	var leaseGatedStore store.CacheStore
+	var (
+		leaseGatedStore *node.LeaseGatedStore
+		ownerSequence   *node.OwnerSequence
+		durableHook     *stringkv.DurableHook
+	)
 	if cacheStore != nil {
 		leaseGatedStore, err = node.NewLeaseGatedStore(cacheStore, topologyLease)
 		if err != nil {
 			log.Fatalf("create lease-gated store: %v", err)
+		}
+		ownerSequence, err = node.NewOwnerSequence(ownerSequencePath())
+		if err != nil {
+			log.Fatalf("open owner sequence: %v", err)
+		}
+		durableHook, err = stringkv.NewDurableHook(leaseGatedStore, topologyLease, ownerSequence)
+		if err != nil {
+			log.Fatalf("create durable hook: %v", err)
 		}
 	}
 	defer func() {
@@ -51,13 +63,22 @@ func main() {
 				log.Printf("close cache store: %v", err)
 			}
 		}
+		if ownerSequence != nil {
+			if err := ownerSequence.Close(); err != nil {
+				log.Printf("close owner sequence: %v", err)
+			}
+		}
 	}()
 
-	olricDB, err := startOlric(ctx, leaseGatedStore)
+	var olricBackingStore store.CacheStore
+	if leaseGatedStore != nil {
+		olricBackingStore = leaseGatedStore
+	}
+	olricDB, err := startOlric(ctx, olricBackingStore, durableHook)
 	if err != nil {
 		log.Fatalf("start olric: %v", err)
 	}
-	go runTopologySubscription(ctx, topologyLease, olricDB)
+	go runTopologySubscription(ctx, topologyLease, olricDB, leaseGatedStore)
 	if leaseGatedStore != nil {
 		provider, err := stringkv.NewOlricProvider(olricDB.NewEmbeddedClient())
 		if err != nil {
@@ -87,14 +108,31 @@ func main() {
 	<-ctx.Done()
 }
 
+// ownerSequencePath derives the persistent owner-sequence path from WAL_PATH
+// so a single mounted volume holds both bbolt files. Operators can override it
+// explicitly with OWNER_SEQ_PATH.
+func ownerSequencePath() string {
+	if explicit := os.Getenv("OWNER_SEQ_PATH"); explicit != "" {
+		return explicit
+	}
+	walPath := envString("WAL_PATH", "/var/lib/olricstack/cache.wal")
+	return walPath + ".seq"
+}
+
+type generationPurger interface {
+	PurgeBelowGeneration(ctx context.Context, minGeneration int64) (int, error)
+}
+
 type olricJoiner struct {
 	db              *olric.Olric
 	nodeID          string
 	memberlistPort  int
 	topologyTimeout time.Duration
+	purger          generationPurger
+	lastPurgedGen   int64
 }
 
-func (j olricJoiner) Join(ctx context.Context, envelope *topologypb.TopologyEnvelope) error {
+func (j *olricJoiner) Join(ctx context.Context, envelope *topologypb.TopologyEnvelope) error {
 	log.Printf("received topology push epoch=%d reason=%s watchdog=%s/%d members=%v",
 		envelope.GetEpoch(),
 		envelope.GetReason().String(),
@@ -102,6 +140,27 @@ func (j olricJoiner) Join(ctx context.Context, envelope *topologypb.TopologyEnve
 		envelope.GetWatchdogGeneration(),
 		envelope.GetMembers(),
 	)
+
+	// Drop WAL records stamped with strictly older Watchdog generations.
+	// These were written when this node served under a previous fence and
+	// can no longer win the MySQL upsert. The dedup on lastPurgedGen keeps
+	// bookworm refreshes (every BOOKWORM_INTERVAL) from re-scanning bbolt.
+	if j.purger != nil {
+		envGen := envelope.GetWatchdogGeneration()
+		if envGen > j.lastPurgedGen {
+			purgeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			purged, err := j.purger.PurgeBelowGeneration(purgeCtx, envGen)
+			cancel()
+			if err != nil {
+				log.Printf("purge stale wal records below generation %d: %v", envGen, err)
+			} else {
+				if purged > 0 {
+					log.Printf("purged %d stale wal records below generation %d", purged, envGen)
+				}
+				j.lastPurgedGen = envGen
+			}
+		}
+	}
 
 	peers := topologyPeers(envelope, j.nodeID, j.memberlistPort)
 	if len(peers) == 0 || j.db == nil {
@@ -117,7 +176,7 @@ func (j olricJoiner) Join(ctx context.Context, envelope *topologypb.TopologyEnve
 	return nil
 }
 
-func runTopologySubscription(ctx context.Context, lease *node.LeaseTracker, olricDB *olric.Olric) {
+func runTopologySubscription(ctx context.Context, lease *node.LeaseTracker, olricDB *olric.Olric, purger generationPurger) {
 	stackID := os.Getenv("STACK_ID")
 	watchdogAddr := os.Getenv("WATCHDOG_SVC_NAME")
 	podIP := os.Getenv("POD_IP")
@@ -135,11 +194,12 @@ func runTopologySubscription(ctx context.Context, lease *node.LeaseTracker, olri
 		ProtocolVersion:   "v2",
 		HeartbeatInterval: envDuration("HEARTBEAT_INTERVAL", 10*time.Second),
 		Lease:             lease,
-		Joiner: olricJoiner{
+		Joiner: &olricJoiner{
 			db:              olricDB,
 			nodeID:          envString("NODE_ID", os.Getenv("POD_NAME")),
 			memberlistPort:  envInt("OLRIC_MEMBERLIST_ADVERTISE_PORT", envInt("OLRIC_ADVERTISE_PORT", envInt("OLRIC_MEMBERLIST_BIND_PORT", 3322))),
 			topologyTimeout: envDuration("TOPOLOGY_JOIN_TIMEOUT", 5*time.Second),
+			purger:          purger,
 		},
 	})
 	if err != nil {
@@ -217,7 +277,6 @@ func buildCacheStore() (store.CacheStore, error) {
 		FlushInterval: envDuration("FLUSH_INTERVAL", time.Second),
 		BatchSize:     envInt("FLUSH_BATCH_SIZE", 256),
 		WALPath:       envString("WAL_PATH", "/var/lib/olricstack/cache.wal"),
-		NodeID:        envString("NODE_ID", os.Getenv("POD_NAME")),
 		FlushBackoff:  envDuration("FLUSH_BACKOFF", time.Second),
 	}
 	if mode == "wal" {
@@ -238,7 +297,7 @@ func buildCacheStore() (store.CacheStore, error) {
 	return store.NewMySQLStore(db, cfg)
 }
 
-func startOlric(ctx context.Context, cacheStore store.CacheStore) (*olric.Olric, error) {
+func startOlric(ctx context.Context, cacheStore store.CacheStore, durableHook *stringkv.DurableHook) (*olric.Olric, error) {
 	cfg := olricconfig.New(envString("OLRIC_MEMBERLIST_ENV", "lan"))
 	cfg.BindAddr = envString("OLRIC_BIND_ADDR", "0.0.0.0")
 	cfg.BindPort = envInt("OLRIC_BIND_PORT", 3320)
@@ -255,12 +314,8 @@ func startOlric(ctx context.Context, cacheStore store.CacheStore) (*olric.Olric,
 	cfg.LogVerbosity = int32(envInt("OLRIC_LOG_VERBOSITY", 3))
 	cfg.DMaps.Engine = olricconfig.NewEngine()
 	cfg.DMaps.Engine.Implementation = olricstore.New(cacheStore)
-	if cacheStore != nil {
-		hook, err := stringkv.NewDurableHook(cacheStore)
-		if err != nil {
-			return nil, err
-		}
-		cfg.DurableHook = hook
+	if durableHook != nil {
+		cfg.DurableHook = durableHook
 	}
 
 	started := make(chan struct{})

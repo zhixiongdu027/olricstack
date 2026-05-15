@@ -225,6 +225,65 @@ func TestServiceRecordsEpochPersistenceFailure(t *testing.T) {
 	}
 }
 
+func TestServiceDoesNotBroadcastWhenEpochSaveFails(t *testing.T) {
+	store := &flakyEpochStore{err: errors.New("boom")}
+	service := NewServiceWithConfig(Config{EpochStore: store})
+
+	sub := &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1), done: make(chan struct{})}
+	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), sub)
+
+	if service.EpochError() == nil {
+		t.Fatal("expected epoch persistence error")
+	}
+	// W2: when SaveEpoch fails, no envelope must be enqueued. Otherwise a
+	// subsequent primary that recovers the older persisted epoch would be
+	// unable to push any envelope the lease tracker accepts (P0-2 deadlock).
+	select {
+	case env := <-sub.ch:
+		t.Fatalf("envelope must not be broadcast while epoch save is failing: %#v", env)
+	default:
+	}
+}
+
+func TestServiceBookwormPausedWhenDegraded(t *testing.T) {
+	store := &flakyEpochStore{err: errors.New("boom")}
+	service := NewServiceWithConfig(Config{
+		EpochStore:       store,
+		BookwormInterval: 5 * time.Millisecond,
+		ReapInterval:     5 * time.Millisecond,
+	})
+
+	sub := &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 4), done: make(chan struct{})}
+	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), sub)
+	if service.EpochError() == nil {
+		t.Fatal("expected epoch persistence error")
+	}
+	// drain anything from the heartbeat path; broadcastLocked already filtered
+	// it because save failed, but the subscriber may still hold standby data.
+	for {
+		select {
+		case <-sub.ch:
+			continue
+		default:
+		}
+		break
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go service.RunBookworm(ctx)
+	go service.RunReaper(ctx)
+
+	// Give bookworm/reaper several tick windows. Neither must enqueue a
+	// degraded envelope.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case env := <-sub.ch:
+		t.Fatalf("bookworm/reaper must not broadcast while degraded, got %#v", env)
+	default:
+	}
+}
+
 func TestServiceClearsEpochPersistenceFailureAfterSuccess(t *testing.T) {
 	store := &flakyEpochStore{err: errors.New("boom")}
 	service := NewServiceWithConfig(Config{EpochStore: store})

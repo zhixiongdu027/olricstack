@@ -139,6 +139,67 @@ func TestLeaseTrackerRevokeClearsServing(t *testing.T) {
 	}
 }
 
+func TestLeaseTrackerNewGenerationResetsEpochBaseline(t *testing.T) {
+	tracker := NewLeaseTracker()
+	now := time.Now()
+
+	// Establish a high epoch under generation 1.
+	if err := tracker.Apply(&topologypb.TopologyEnvelope{
+		WatchdogRole:       topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY,
+		WatchdogGeneration: 1,
+		Epoch:              42,
+		ValidUntilUnixMs:   now.Add(time.Minute).UnixMilli(),
+	}, now); err != nil {
+		t.Fatalf("seed gen=1 epoch=42: %v", err)
+	}
+
+	// New primary publishes a smaller epoch under a higher generation. This
+	// must be accepted (N1) — otherwise live nodes deadlock on stale-epoch.
+	if err := tracker.Apply(&topologypb.TopologyEnvelope{
+		WatchdogRole:       topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY,
+		WatchdogGeneration: 2,
+		Epoch:              5,
+		ValidUntilUnixMs:   now.Add(time.Minute).UnixMilli(),
+	}, now); err != nil {
+		t.Fatalf("expected gen=2 epoch=5 accept after generation bump, got %v", err)
+	}
+
+	g, e, ok := tracker.SnapshotForWrite(now)
+	if !ok || g != 2 || e != 5 {
+		t.Fatalf("expected snapshot (g=2,e=5,ok=true), got (%d,%d,%v)", g, e, ok)
+	}
+
+	// Within the new generation, epoch must remain monotonic.
+	if err := tracker.Apply(&topologypb.TopologyEnvelope{
+		WatchdogRole:       topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY,
+		WatchdogGeneration: 2,
+		Epoch:              4,
+		ValidUntilUnixMs:   now.Add(time.Minute).UnixMilli(),
+	}, now); !errors.Is(err, ErrStaleTopologyEpoch) {
+		t.Fatalf("expected stale epoch within same generation, got %v", err)
+	}
+}
+
+func TestLeaseTrackerSnapshotForWriteHonorsExpiry(t *testing.T) {
+	tracker := NewLeaseTracker()
+	now := time.Now()
+	if err := tracker.Apply(&topologypb.TopologyEnvelope{
+		WatchdogRole:       topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY,
+		WatchdogGeneration: 3,
+		Epoch:              7,
+		ValidUntilUnixMs:   now.Add(50 * time.Millisecond).UnixMilli(),
+	}, now); err != nil {
+		t.Fatalf("apply lease: %v", err)
+	}
+
+	if g, e, ok := tracker.SnapshotForWrite(now); !ok || g != 3 || e != 7 {
+		t.Fatalf("expected live snapshot, got (%d,%d,%v)", g, e, ok)
+	}
+	if _, _, ok := tracker.SnapshotForWrite(now.Add(time.Second)); ok {
+		t.Fatal("expected snapshot to deny once lease has expired")
+	}
+}
+
 func TestSubscriberRunRevokesLeaseOnStandbyEnvelope(t *testing.T) {
 	now := time.Now()
 	lease := NewLeaseTracker()

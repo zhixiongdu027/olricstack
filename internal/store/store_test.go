@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -92,23 +93,6 @@ func TestMySQLStoreRejectsWhenDirtyQueueFull(t *testing.T) {
 	closeStore(t, cacheStore)
 }
 
-func TestMySQLStoreFlushPendingReportsSuccess(t *testing.T) {
-	cacheStore := newTestStore(t, Config{})
-	pending := map[string][]byte{"a": []byte("1")}
-
-	if !cacheStore.flushPending(pending) {
-		t.Fatalf("expected flush success: %v", cacheStore.workerError())
-	}
-	record, err := cacheStore.LoadEntry(context.Background(), EntryRef{Key: "a", HKey: 1})
-	if err != nil {
-		t.Fatalf("load flushed value: %v", err)
-	}
-	if string(record.EncodedEntry) != "1" {
-		t.Fatalf("expected value 1, got %q", record.EncodedEntry)
-	}
-	closeStore(t, cacheStore)
-}
-
 func TestMySQLStoreCloseReportsFinalFlushFailure(t *testing.T) {
 	cacheStore := newTestStore(t, Config{
 		FlushInterval: time.Hour,
@@ -138,7 +122,6 @@ func TestMySQLStoreFlushBackoffAfterFailure(t *testing.T) {
 		FlushBackoff:  time.Hour,
 		FlushInterval: time.Hour,
 	})
-	pending := map[string][]byte{"a": []byte("1")}
 
 	sqlDB, err := cacheStore.db.DB()
 	if err != nil {
@@ -148,8 +131,9 @@ func TestMySQLStoreFlushBackoffAfterFailure(t *testing.T) {
 		t.Fatalf("close sql db: %v", err)
 	}
 
-	if cacheStore.flushPending(pending) {
-		t.Fatal("expected flush failure")
+	entries := []dirtyEntry{{Record: testFencedRecord("a", 1, []byte("1"), 1, 1, 1)}}
+	if cacheStore.flushEntries(entries) {
+		t.Fatal("expected flush failure when underlying DB is closed")
 	}
 	cacheStore.deferFlush()
 	if cacheStore.flushWAL(false) {
@@ -201,7 +185,6 @@ func TestMySQLStoreWALSurvivesProcessRestart(t *testing.T) {
 
 	first, err := NewMySQLStore(db, Config{
 		WALPath:       walPath,
-		NodeID:        "node-a",
 		FlushInterval: time.Hour,
 		BatchSize:     128,
 	})
@@ -223,7 +206,6 @@ func TestMySQLStoreWALSurvivesProcessRestart(t *testing.T) {
 
 	second, err := NewMySQLStore(db, Config{
 		WALPath:       walPath,
-		NodeID:        "node-a",
 		FlushInterval: time.Hour,
 		BatchSize:     128,
 	})
@@ -248,7 +230,7 @@ func TestMySQLStoreWALSurvivesProcessRestart(t *testing.T) {
 
 func TestMySQLStoreLoadPrefersLocalWALBeforeMySQL(t *testing.T) {
 	cacheStore := newTestStore(t, Config{FlushInterval: time.Hour})
-	if err := cacheStore.flushEntries([]dirtyEntry{{Record: testVersionedRecord("split", 7, []byte("mysql"), time.Now().Add(-time.Second).UnixNano(), "node-a")}}); !err {
+	if err := cacheStore.flushEntries([]dirtyEntry{{Record: testFencedRecord("split", 7, []byte("mysql"), 1, 1, 1)}}); !err {
 		t.Fatalf("seed mysql: %v", cacheStore.workerError())
 	}
 	if err := cacheStore.StoreEntry(context.Background(), testRecord("split", 7, []byte("wal"))); err != nil {
@@ -353,7 +335,7 @@ func TestMySQLStoreDoesNotFlushPreparedEntriesBeforeCommit(t *testing.T) {
 		closeStore(t, reader)
 	}
 
-	if err := cacheStore.CommitEntry(context.Background(), prepared.Ref(), prepared.Version); err != nil {
+	if err := cacheStore.CommitEntry(context.Background(), prepared.Ref(), prepared.WALSeq); err != nil {
 		t.Fatalf("commit entry: %v", err)
 	}
 	closeStore(t, cacheStore)
@@ -369,15 +351,63 @@ func TestMySQLStoreDoesNotFlushPreparedEntriesBeforeCommit(t *testing.T) {
 	}
 }
 
-func TestMySQLStoreVersionedFlushDoesNotOverwriteNewerValue(t *testing.T) {
-	cacheStore := newTestStore(t, Config{NodeID: "node-a"})
-	now := time.Now()
+// TestMySQLStoreLateFlushFromPreviousOwnerLosesToCurrentOwner is the FT-3/FT-6
+// regression. It mimics the production race that motivated owner-fenced
+// versioning: an old owner with generation=N writes and commits a record
+// locally but its flusher stalls (e.g. MySQL outage, bbolt stuck behind a
+// fsync). Meanwhile a new primary elects a new owner under generation=N+1
+// which writes and successfully flushes its own value. When the old owner's
+// flusher eventually drains, the fence triple comparison must reject the
+// stale row, leaving MySQL holding the new owner's value.
+func TestMySQLStoreLateFlushFromPreviousOwnerLosesToCurrentOwner(t *testing.T) {
+	cacheStore := newTestStore(t, Config{})
+	defer closeStore(t, cacheStore)
 
-	if !cacheStore.flushEntries([]dirtyEntry{{Record: testVersionedRecord("conflict", 8, []byte("new"), now.UnixNano(), "node-b")}}) {
+	// New owner under generation=2 writes and reaches MySQL first.
+	newOwner := testFencedRecord("user:1", 7, []byte("from-new-owner"), 2, 1, 1)
+	if !cacheStore.flushEntries([]dirtyEntry{{Record: newOwner}}) {
+		t.Fatalf("flush new owner record: %v", cacheStore.workerError())
+	}
+
+	// Old owner under generation=1 had committed locally before failover and
+	// only now drains its flusher. The fence triple lexicographic comparison
+	// (G,E,S) must keep the new owner's value.
+	oldOwner := testFencedRecord("user:1", 7, []byte("stale-from-old-owner"), 1, 999, 999)
+	if !cacheStore.flushEntries([]dirtyEntry{{Record: oldOwner}}) {
+		t.Fatalf("flush old owner record: %v", cacheStore.workerError())
+	}
+
+	rec, err := cacheStore.LoadEntry(context.Background(), testRef("user:1", 7))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if string(rec.EncodedEntry) != "from-new-owner" {
+		t.Fatalf("late flush from previous owner won the upsert: got %q", rec.EncodedEntry)
+	}
+	if rec.Generation != 2 || rec.Epoch != 1 || rec.OwnerSeq != 1 {
+		t.Fatalf("expected fence (2,1,1) to remain, got (%d,%d,%d)", rec.Generation, rec.Epoch, rec.OwnerSeq)
+	}
+}
+
+func TestMySQLStoreSameGenerationLowerEpochFlushIsRejected(t *testing.T) {
+	cacheStore := newTestStore(t, Config{})
+
+	// Seed with a fence (G=2, E=3, S=5) record.
+	if !cacheStore.flushEntries([]dirtyEntry{{Record: testFencedRecord("conflict", 8, []byte("new"), 2, 3, 5)}}) {
 		t.Fatalf("seed newer value: %v", cacheStore.workerError())
 	}
-	if !cacheStore.flushEntries([]dirtyEntry{{Record: testVersionedRecord("conflict", 8, []byte("old"), now.Add(-time.Second).UnixNano(), "node-a")}}) {
-		t.Fatalf("flush older value: %v", cacheStore.workerError())
+	// Attempt to overwrite with an older fence — must be rejected by the
+	// (G, E, S) lexicographic conflict resolution. The variations cover all
+	// three positions of the fence triple.
+	older := []EntryRecord{
+		testFencedRecord("conflict", 8, []byte("older-G"), 1, 999, 999),
+		testFencedRecord("conflict", 8, []byte("older-E"), 2, 2, 999),
+		testFencedRecord("conflict", 8, []byte("older-S"), 2, 3, 4),
+	}
+	for i, rec := range older {
+		if !cacheStore.flushEntries([]dirtyEntry{{Record: rec}}) {
+			t.Fatalf("flush older[%d]: %v", i, cacheStore.workerError())
+		}
 	}
 
 	record, err := cacheStore.LoadEntry(context.Background(), testRef("conflict", 8))
@@ -386,6 +416,9 @@ func TestMySQLStoreVersionedFlushDoesNotOverwriteNewerValue(t *testing.T) {
 	}
 	if string(record.EncodedEntry) != "new" {
 		t.Fatalf("older flush overwrote newer value: %q", record.EncodedEntry)
+	}
+	if record.Generation != 2 || record.Epoch != 3 || record.OwnerSeq != 5 {
+		t.Fatalf("expected fence (2,3,5), got (%d,%d,%d)", record.Generation, record.Epoch, record.OwnerSeq)
 	}
 	closeStore(t, cacheStore)
 }
@@ -533,7 +566,7 @@ func TestWALStoreReplaysCommittedPreparedRecords(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare entry: %v", err)
 	}
-	if err := first.CommitEntry(context.Background(), prepared.Ref(), prepared.Version); err != nil {
+	if err := first.CommitEntry(context.Background(), prepared.Ref(), prepared.WALSeq); err != nil {
 		t.Fatalf("commit entry: %v", err)
 	}
 	if err := first.wal.Close(); err != nil {
@@ -557,6 +590,168 @@ func TestWALStoreReplaysCommittedPreparedRecords(t *testing.T) {
 	closeStore(t, second)
 }
 
+func TestMySQLStoreAbortRemovesPreparedRecord(t *testing.T) {
+	cacheStore := newTestStore(t, Config{FlushInterval: time.Hour})
+	defer closeStore(t, cacheStore)
+
+	prepared, err := cacheStore.PrepareEntry(context.Background(), testFlushableRecord("aborted", 90, []byte("ghost")))
+	if err != nil {
+		t.Fatalf("prepare entry: %v", err)
+	}
+	if err := cacheStore.AbortEntry(context.Background(), prepared.Ref(), prepared.WALSeq); err != nil {
+		t.Fatalf("abort prepared: %v", err)
+	}
+	if _, err := cacheStore.LoadEntry(context.Background(), prepared.Ref()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected aborted record to be gone, got %v", err)
+	}
+	if cacheStore.flushWAL(true) {
+		// flushWAL returns true on empty/no-op too, so explicitly check MySQL.
+	}
+	reader := newTestStoreWithDB(t, cacheStore.db, Config{WALPath: filepath.Join(t.TempDir(), "reader.wal")})
+	defer closeStore(t, reader)
+	if _, err := reader.LoadEntry(context.Background(), prepared.Ref()); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("aborted record leaked into MySQL: %v", err)
+	}
+}
+
+func TestMySQLStoreAbortIdempotentAndCommitProtected(t *testing.T) {
+	cacheStore := newTestStore(t, Config{FlushInterval: time.Hour})
+	defer closeStore(t, cacheStore)
+
+	// Abort with no prepared record is a no-op.
+	if err := cacheStore.AbortEntry(context.Background(), testRef("missing", 1), 12345); err != nil {
+		t.Fatalf("abort missing should be idempotent, got %v", err)
+	}
+
+	// Once committed, abort must refuse.
+	prepared, err := cacheStore.PrepareEntry(context.Background(), testFlushableRecord("locked", 91, []byte("v")))
+	if err != nil {
+		t.Fatalf("prepare entry: %v", err)
+	}
+	if err := cacheStore.CommitEntry(context.Background(), prepared.Ref(), prepared.WALSeq); err != nil {
+		t.Fatalf("commit entry: %v", err)
+	}
+	if err := cacheStore.AbortEntry(context.Background(), prepared.Ref(), prepared.WALSeq); err == nil {
+		t.Fatal("expected abort of committed record to fail")
+	}
+
+	// Stale version is ignored (newer prepare wins).
+	prepared2, err := cacheStore.PrepareEntry(context.Background(), testFlushableRecord("super", 92, []byte("v1")))
+	if err != nil {
+		t.Fatalf("prepare v1: %v", err)
+	}
+	prepared3, err := cacheStore.PrepareEntry(context.Background(), testFlushableRecord("super", 92, []byte("v2")))
+	if err != nil {
+		t.Fatalf("prepare v2: %v", err)
+	}
+	if prepared3.WALSeq <= prepared2.WALSeq {
+		t.Fatalf("expected prepare v2 to advance version, got v1=%d v2=%d", prepared2.WALSeq, prepared3.WALSeq)
+	}
+	if err := cacheStore.AbortEntry(context.Background(), prepared2.Ref(), prepared2.WALSeq); err != nil {
+		t.Fatalf("abort with stale version should be no-op, got %v", err)
+	}
+	if err := cacheStore.CommitEntry(context.Background(), prepared3.Ref(), prepared3.WALSeq); err != nil {
+		t.Fatalf("commit current prepare must still succeed, got %v", err)
+	}
+}
+
+func TestMySQLStorePurgeBelowGenerationDropsStaleRecords(t *testing.T) {
+	// Use NewMySQLStore directly without Start() so the flush loop does not
+	// drain WAL into MySQL before we observe the purge.
+	walPath := filepath.Join(t.TempDir(), "cache.wal")
+	cacheStore, err := NewMySQLStore(newTestDB(t), Config{
+		WALPath:       walPath,
+		FlushInterval: time.Hour,
+		BatchSize:     1024,
+	})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := cacheStore.Close(ctx); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	}()
+
+	if err := cacheStore.StoreEntry(context.Background(), testFencedRecord("a", 1, []byte("g1"), 1, 5, 1)); err != nil {
+		t.Fatalf("store g1: %v", err)
+	}
+	if err := cacheStore.StoreEntry(context.Background(), testFencedRecord("b", 2, []byte("g2"), 2, 5, 1)); err != nil {
+		t.Fatalf("store g2: %v", err)
+	}
+	if err := cacheStore.StoreEntry(context.Background(), testFencedRecord("c", 3, []byte("g3"), 3, 5, 1)); err != nil {
+		t.Fatalf("store g3: %v", err)
+	}
+
+	purged, err := cacheStore.PurgeBelowGeneration(context.Background(), 2)
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if purged != 1 {
+		t.Fatalf("expected 1 purged record, got %d", purged)
+	}
+	if _, err := cacheStore.LoadEntry(context.Background(), testRef("a", 1)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("stale g1 record should be gone, got %v", err)
+	}
+	if _, err := cacheStore.LoadEntry(context.Background(), testRef("b", 2)); err != nil {
+		t.Fatalf("g2 record must remain: %v", err)
+	}
+	if _, err := cacheStore.LoadEntry(context.Background(), testRef("c", 3)); err != nil {
+		t.Fatalf("g3 record must remain: %v", err)
+	}
+}
+
+func TestMySQLStorePurgeBelowGenerationSparesPreparedRecords(t *testing.T) {
+	walPath := filepath.Join(t.TempDir(), "cache.wal")
+	cacheStore, err := NewMySQLStore(newTestDB(t), Config{
+		WALPath:       walPath,
+		FlushInterval: time.Hour,
+		BatchSize:     1024,
+	})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = cacheStore.Close(ctx)
+	}()
+
+	prepared, err := cacheStore.PrepareEntry(context.Background(), testFencedRecord("pending", 99, []byte("v"), 1, 1, 1))
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	purged, err := cacheStore.PurgeBelowGeneration(context.Background(), 100)
+	if err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	if purged != 0 {
+		t.Fatalf("prepared records must not be purged, purged=%d", purged)
+	}
+	if err := cacheStore.CommitEntry(context.Background(), prepared.Ref(), prepared.WALSeq); err != nil {
+		t.Fatalf("commit after purge: %v", err)
+	}
+}
+
+func TestMySQLStorePurgeBelowGenerationIsNoOpWhenMinIsZero(t *testing.T) {
+	cacheStore := newTestStore(t, Config{FlushInterval: time.Hour})
+	defer closeStore(t, cacheStore)
+
+	if err := cacheStore.StoreEntry(context.Background(), testFencedRecord("a", 1, []byte("v"), 1, 1, 1)); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	purged, err := cacheStore.PurgeBelowGeneration(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("purge zero: %v", err)
+	}
+	if purged != 0 {
+		t.Fatalf("purge with minGeneration=0 must be a no-op, got %d", purged)
+	}
+}
+
 func newTestStore(t *testing.T, cfg Config) *MySQLStore {
 	t.Helper()
 
@@ -569,9 +764,6 @@ func newTestStoreWithDB(t *testing.T, db *gorm.DB, cfg Config) *MySQLStore {
 
 	if cfg.WALPath == "" {
 		cfg.WALPath = filepath.Join(t.TempDir(), "cache.wal")
-	}
-	if cfg.NodeID == "" {
-		cfg.NodeID = "node-a"
 	}
 	cacheStore, err := NewMySQLStore(db, cfg)
 	if err != nil {
@@ -629,17 +821,27 @@ func testRecord(key string, hkey uint64, value []byte) EntryRecord {
 	}
 }
 
+// testFenceCounter advances per testFlushableRecord call so default flushable
+// records carry monotonically increasing OwnerSeq under fence (1, 1).
+var testFenceCounter atomic.Int64
+
 func testFlushableRecord(key string, hkey uint64, value []byte) EntryRecord {
 	record := testRecord(key, hkey, value)
 	record.Origin = "client_set"
 	record.FlushMySQL = true
+	record.Generation = 1
+	record.Epoch = 1
+	record.OwnerSeq = testFenceCounter.Add(1)
 	return record
 }
 
-func testVersionedRecord(key string, hkey uint64, value []byte, version int64, writer string) EntryRecord {
+// testFencedRecord lets a test pin the exact (G, E, S) used in the upsert
+// comparison. Required for tests that exercise the conflict-resolution rules.
+func testFencedRecord(key string, hkey uint64, value []byte, generation, epoch, ownerSeq int64) EntryRecord {
 	record := testFlushableRecord(key, hkey, value)
-	record.Version = version
-	record.WriterID = writer
+	record.Generation = generation
+	record.Epoch = epoch
+	record.OwnerSeq = ownerSeq
 	record.UpdatedAt = time.Now().UTC()
 	return record
 }

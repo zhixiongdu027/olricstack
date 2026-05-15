@@ -389,19 +389,31 @@ func (dm *DMap) Get(ctx context.Context, key string) (storage.Entry, error) {
 					err = ErrKeyNotFound
 				}
 				if err == nil {
+					// Re-acquire fragment lock and re-check storage. A
+					// concurrent Set on this owner may have written a fresh
+					// value while LoadOnMiss was running unlocked. Refilling
+					// would otherwise overwrite that newer value with a stale
+					// MySQL row. Refill is unconditionally rejected when a
+					// fragment entry now exists; the resident value is what
+					// we return.
 					part := dm.getPartitionByHKey(hkey, partitions.PRIMARY)
 					f, ferr := dm.loadOrCreateFragment(part)
 					if ferr != nil {
 						return nil, ferr
 					}
 					f.Lock()
-					e := newEnv(ctx)
-					e.hkey = hkey
-					e.dmap = dm.name
-					e.key = key
-					e.fragment = f
-					err = dm.putEntryOnFragment(e, entry)
-					f.Unlock()
+					if existing, gerr := f.storage.Get(hkey); gerr == nil {
+						entry = existing
+						f.Unlock()
+					} else {
+						e := newEnv(ctx)
+						e.hkey = hkey
+						e.dmap = dm.name
+						e.key = key
+						e.fragment = f
+						err = dm.putEntryOnFragment(e, entry)
+						f.Unlock()
+					}
 				}
 			}
 			GetMisses.Increase(1)

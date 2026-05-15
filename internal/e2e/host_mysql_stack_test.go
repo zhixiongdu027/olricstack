@@ -423,6 +423,11 @@ type hostOlricNode struct {
 	logs         *lockedBuffer
 }
 
+type hostNodeBinaries struct {
+	nodeBinary   string
+	clientBinary string
+}
+
 func (n *hostOlricNode) kill(t *testing.T) {
 	t.Helper()
 	if n.cmd.Process != nil {
@@ -432,6 +437,26 @@ func (n *hostOlricNode) kill(t *testing.T) {
 	case <-n.errCh:
 	case <-time.After(10 * time.Second):
 		t.Fatalf("host olric-node did not exit after SIGKILL\nlogs:\n%s", strings.TrimSpace(n.logs.String()))
+	}
+}
+
+func (n *hostOlricNode) suspend(t *testing.T) {
+	t.Helper()
+	if n.cmd.Process == nil {
+		t.Fatalf("host olric-node %s has no process", n.nodeID)
+	}
+	if err := n.cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatalf("SIGSTOP host olric-node %s: %v", n.nodeID, err)
+	}
+}
+
+func (n *hostOlricNode) resume(t *testing.T) {
+	t.Helper()
+	if n.cmd.Process == nil {
+		t.Fatalf("host olric-node %s has no process", n.nodeID)
+	}
+	if err := n.cmd.Process.Signal(syscall.SIGCONT); err != nil {
+		t.Fatalf("SIGCONT host olric-node %s: %v", n.nodeID, err)
 	}
 }
 
@@ -454,6 +479,12 @@ type hostNodeConfig struct {
 	bindAddr        string
 	memberlistPort  int
 	memberlistPeers string
+	binaries        hostNodeBinaries
+	extraEnv        []string
+	replicaCount    int
+	writeQuorum     int
+	readQuorum      int
+	memberQuorum    int
 }
 
 func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg hostNodeConfig) *hostOlricNode {
@@ -466,13 +497,33 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 	}
 
 	repoRoot := repoRoot(t)
-	binDir := t.TempDir()
-	nodeBinary := buildBinary(t, parent, repoRoot, filepath.Join(binDir, "olric-node"), "./cmd/olric-node", nil)
-	clientBinary := buildBinary(t, parent, repoRoot, filepath.Join(binDir, "olric-e2e-client"), "./cmd/olric-e2e-client", nil)
+	nodeBinary := cfg.binaries.nodeBinary
+	clientBinary := cfg.binaries.clientBinary
+	if nodeBinary == "" || clientBinary == "" {
+		binDir := t.TempDir()
+		nodeBinary = buildBinary(t, parent, repoRoot, filepath.Join(binDir, "olric-node"), "./cmd/olric-node", nil)
+		clientBinary = buildBinary(t, parent, repoRoot, filepath.Join(binDir, "olric-e2e-client"), "./cmd/olric-e2e-client", nil)
+	}
 	olricPort := mustFreeTCPPort(t)
 	memberlistPort := mustFreeTCPPort(t)
 	if cfg.memberlistPort > 0 {
 		memberlistPort = cfg.memberlistPort
+	}
+	replicaCount := cfg.replicaCount
+	if replicaCount <= 0 {
+		replicaCount = 1
+	}
+	writeQuorum := cfg.writeQuorum
+	if writeQuorum <= 0 {
+		writeQuorum = 1
+	}
+	readQuorum := cfg.readQuorum
+	if readQuorum <= 0 {
+		readQuorum = 1
+	}
+	memberQuorum := cfg.memberQuorum
+	if memberQuorum <= 0 {
+		memberQuorum = 1
 	}
 	logs := &lockedBuffer{}
 
@@ -500,9 +551,14 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 		"OLRIC_ADVERTISE_ADDR="+cfg.bindAddr,
 		"OLRIC_ADVERTISE_PORT="+strconv.Itoa(memberlistPort),
 		"OLRIC_PEERS="+cfg.memberlistPeers,
+		"OLRIC_REPLICA_COUNT="+strconv.Itoa(replicaCount),
+		"OLRIC_WRITE_QUORUM="+strconv.Itoa(writeQuorum),
+		"OLRIC_READ_QUORUM="+strconv.Itoa(readQuorum),
+		"OLRIC_MEMBER_COUNT_QUORUM="+strconv.Itoa(memberQuorum),
 		"OLRIC_MEMBERLIST_ENV=local",
 		"OLRIC_LOG_LEVEL=WARN",
 	)
+	cmd.Env = append(cmd.Env, cfg.extraEnv...)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start host olric-node: %v", err)
 	}

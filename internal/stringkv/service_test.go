@@ -226,7 +226,9 @@ var _ store.CacheStore = (*recordingStore)(nil)
 
 type recordingCommitStore struct {
 	*recordingStore
-	nextVersion int64
+	nextVersion     int64
+	committedCount  int
+	abortedCount    int
 }
 
 func newRecordingCommitStore() *recordingCommitStore {
@@ -242,24 +244,31 @@ func (s *recordingCommitStore) PrepareEntry(ctx context.Context, record store.En
 	return s.storePrepared(record)
 }
 
-func (s *recordingCommitStore) PrepareDelete(ctx context.Context, ref store.EntryRef) (store.EntryRecord, error) {
-	return s.storePrepared(store.EntryRecord{
-		DMap:      ref.DMap,
-		Key:       ref.Key,
-		HKey:      ref.HKey,
-		Tombstone: true,
-		WALState:  store.WALStatePrepared,
-	})
-}
-
 func (s *recordingCommitStore) CommitEntry(ctx context.Context, ref store.EntryRef, version int64) error {
 	record, ok := s.records[ref.HKey]
-	if !ok || record.Version != version {
+	if !ok || record.WALSeq != version {
 		return store.ErrNotFound
 	}
 	record.WALState = store.WALStateCommitted
 	record.FlushMySQL = true
 	s.records[ref.HKey] = record.Clone()
+	s.committedCount++
+	return nil
+}
+
+func (s *recordingCommitStore) AbortEntry(ctx context.Context, ref store.EntryRef, version int64) error {
+	record, ok := s.records[ref.HKey]
+	if !ok {
+		return nil
+	}
+	if record.WALSeq != version {
+		return nil
+	}
+	if record.WALState == store.WALStateCommitted {
+		return errors.New("cannot abort committed record")
+	}
+	delete(s.records, ref.HKey)
+	s.abortedCount++
 	return nil
 }
 
@@ -267,7 +276,7 @@ func (s *recordingCommitStore) storePrepared(record store.EntryRecord) (store.En
 	if s.storeErr != nil {
 		return store.EntryRecord{}, s.storeErr
 	}
-	record.Version = s.nextVersion
+	record.WALSeq = s.nextVersion
 	s.nextVersion++
 	s.records[record.HKey] = record.Clone()
 	return record.Clone(), nil
