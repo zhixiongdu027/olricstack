@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -208,6 +210,208 @@ func TestHostOnlyTwoNodeClusterJoinsFromWatchdogTopologyOnly(t *testing.T) {
 	}
 }
 
+func TestHostOnlyKilledNodePrunedAndReplacementRejoins(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	watchdogAddr, _, cleanupWatchdog := startHostWatchdogWithConfig(t, ctx, hostWatchdogConfig{
+		suspectAfter:     300 * time.Millisecond,
+		expireAfter:      600 * time.Millisecond,
+		reapInterval:     100 * time.Millisecond,
+		bookwormInterval: 100 * time.Millisecond,
+		leaseTTL:         time.Second,
+	})
+	defer cleanupWatchdog()
+
+	memberlistPort := mustFreeTCPPort(t)
+	first := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   watchdogAddr,
+		nodeID:         "host-only-kill-a",
+		podIP:          "127.0.0.2",
+		bindAddr:       "127.0.0.2",
+		memberlistPort: memberlistPort,
+	})
+	defer first.stop(t)
+	victim := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   watchdogAddr,
+		nodeID:         "host-only-kill-b",
+		podIP:          "127.0.0.3",
+		bindAddr:       "127.0.0.3",
+		memberlistPort: memberlistPort,
+	})
+
+	waitForText(t, ctx, first.logs, `node_id:"host-only-kill-b"`)
+	killOffset := first.logs.Len()
+	victim.kill(t)
+	waitForTopologyWithoutMemberAfter(t, ctx, first.logs, killOffset, "host-only-kill-b")
+
+	replacement := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   watchdogAddr,
+		nodeID:         "host-only-kill-c",
+		podIP:          "127.0.0.4",
+		bindAddr:       "127.0.0.4",
+		memberlistPort: memberlistPort,
+	})
+	defer replacement.stop(t)
+
+	waitForText(t, ctx, first.logs, `node_id:"host-only-kill-c"`)
+	waitForText(t, ctx, replacement.logs, `node_id:"host-only-kill-a"`)
+	waitForText(t, ctx, first.logs, "joined topology peers")
+	waitForText(t, ctx, replacement.logs, "joined topology peers")
+
+	key := "host-kill-rejoin:" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if out, err := first.put(ctx, "users", key, "value-after-rejoin"); err != nil {
+		t.Fatalf("write after replacement rejoin: %v (%s)\nfirst logs:\n%s\nreplacement logs:\n%s",
+			err, strings.TrimSpace(out), strings.TrimSpace(first.logs.String()), strings.TrimSpace(replacement.logs.String()))
+	}
+	waitForGetValue(t, ctx, replacement, "users", key, "value-after-rejoin", first, replacement)
+}
+
+func TestHostOnlyTwoNodeWriteStorm(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	watchdogAddr, _, cleanupWatchdog := startHostWatchdog(t, ctx)
+	defer cleanupWatchdog()
+
+	memberlistPort := mustFreeTCPPort(t)
+	first := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   watchdogAddr,
+		nodeID:         "host-only-storm-a",
+		podIP:          "127.0.0.2",
+		bindAddr:       "127.0.0.2",
+		memberlistPort: memberlistPort,
+	})
+	defer first.stop(t)
+	second := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   watchdogAddr,
+		nodeID:         "host-only-storm-b",
+		podIP:          "127.0.0.3",
+		bindAddr:       "127.0.0.3",
+		memberlistPort: memberlistPort,
+	})
+	defer second.stop(t)
+
+	waitForText(t, ctx, first.logs, `node_id:"host-only-storm-b"`)
+	waitForText(t, ctx, second.logs, `node_id:"host-only-storm-a"`)
+	waitForText(t, ctx, first.logs, "joined topology peers")
+	waitForText(t, ctx, second.logs, "joined topology peers")
+
+	const writers = 8
+	const writesPerWorker = 12
+	var failures atomic.Int64
+	var wg sync.WaitGroup
+	for worker := 0; worker < writers; worker++ {
+		worker := worker
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < writesPerWorker; i++ {
+				target := first
+				if (worker+i)%2 == 1 {
+					target = second
+				}
+				key := fmt.Sprintf("storm:%d:%d:%d", time.Now().UnixNano(), worker, i)
+				value := "value-" + key
+				if out, err := target.put(ctx, "users", key, value); err != nil {
+					t.Logf("storm put failed target=%s key=%s err=%v out=%s", target.nodeID, key, err, strings.TrimSpace(out))
+					failures.Add(1)
+					continue
+				}
+				reader := second
+				if target == second {
+					reader = first
+				}
+				got, out, err := reader.get(ctx, "users", key)
+				if err != nil || got != value {
+					t.Logf("storm get failed reader=%s key=%s got=%q err=%v out=%s", reader.nodeID, key, got, err, strings.TrimSpace(out))
+					failures.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if got := failures.Load(); got != 0 {
+		t.Fatalf("write storm had %d failures\nfirst logs:\n%s\nsecond logs:\n%s",
+			got, strings.TrimSpace(first.logs.String()), strings.TrimSpace(second.logs.String()))
+	}
+}
+
+func TestHostOnlyWatchdogNetworkJitterExpiresAndRecoversLease(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	watchdogAddr, _, cleanupWatchdog := startHostWatchdogWithConfig(t, ctx, hostWatchdogConfig{
+		suspectAfter:     600 * time.Millisecond,
+		expireAfter:      1200 * time.Millisecond,
+		reapInterval:     100 * time.Millisecond,
+		bookwormInterval: 100 * time.Millisecond,
+		leaseTTL:         500 * time.Millisecond,
+	})
+	defer cleanupWatchdog()
+
+	proxy := startTCPProxy(t, ctx, watchdogAddr)
+	defer proxy.close(t)
+
+	memberlistPort := mustFreeTCPPort(t)
+	first := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   proxy.addr(),
+		nodeID:         "host-only-jitter-a",
+		podIP:          "127.0.0.2",
+		bindAddr:       "127.0.0.2",
+		memberlistPort: memberlistPort,
+	})
+	defer first.stop(t)
+	second := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   proxy.addr(),
+		nodeID:         "host-only-jitter-b",
+		podIP:          "127.0.0.3",
+		bindAddr:       "127.0.0.3",
+		memberlistPort: memberlistPort,
+	})
+	defer second.stop(t)
+
+	waitForText(t, ctx, first.logs, `node_id:"host-only-jitter-b"`)
+	waitForText(t, ctx, second.logs, `node_id:"host-only-jitter-a"`)
+	waitForText(t, ctx, first.logs, "joined topology peers")
+	waitForText(t, ctx, second.logs, "joined topology peers")
+
+	beforeKey := "host-jitter-before:" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if out, err := first.put(ctx, "users", beforeKey, "before-jitter"); err != nil {
+		t.Fatalf("write before watchdog jitter: %v (%s)\nfirst logs:\n%s\nsecond logs:\n%s",
+			err, strings.TrimSpace(out), strings.TrimSpace(first.logs.String()), strings.TrimSpace(second.logs.String()))
+	}
+	if got, out, err := second.get(ctx, "users", beforeKey); err != nil || got != "before-jitter" {
+		t.Fatalf("cross-node read before watchdog jitter got=%q err=%v (%s)\nfirst logs:\n%s\nsecond logs:\n%s",
+			got, err, strings.TrimSpace(out), strings.TrimSpace(first.logs.String()), strings.TrimSpace(second.logs.String()))
+	}
+
+	proxy.pause()
+	waitForText(t, ctx, first.logs, "topology subscription ended")
+	waitForText(t, ctx, second.logs, "topology subscription ended")
+	waitForPutFailure(t, ctx, first, "users", "host-jitter-blocked:"+strconv.FormatInt(time.Now().UnixNano(), 10), "during-jitter")
+
+	firstRecoveryOffset := first.logs.Len()
+	secondRecoveryOffset := second.logs.Len()
+	proxy.resume()
+	waitForTextAfter(t, ctx, first.logs, firstRecoveryOffset, "TOPOLOGY_REASON_BOOKWORM")
+	waitForTextAfter(t, ctx, second.logs, secondRecoveryOffset, "TOPOLOGY_REASON_BOOKWORM")
+
+	afterKey := "host-jitter-after:" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if out, err := first.put(ctx, "users", afterKey, "after-jitter"); err != nil {
+		t.Fatalf("write after watchdog jitter recovery: %v (%s)\nfirst logs:\n%s\nsecond logs:\n%s",
+			err, strings.TrimSpace(out), strings.TrimSpace(first.logs.String()), strings.TrimSpace(second.logs.String()))
+	}
+	got, out, err := second.get(ctx, "users", afterKey)
+	if err != nil {
+		t.Fatalf("cross-node read after watchdog jitter recovery: %v (%s)\nfirst logs:\n%s\nsecond logs:\n%s",
+			err, strings.TrimSpace(out), strings.TrimSpace(first.logs.String()), strings.TrimSpace(second.logs.String()))
+	}
+	if got != "after-jitter" {
+		t.Fatalf("expected recovered cross-node value %q, got %q", "after-jitter", got)
+	}
+}
+
 type hostOlricNode struct {
 	nodeID       string
 	repoRoot     string
@@ -217,6 +421,18 @@ type hostOlricNode struct {
 	cmd          *exec.Cmd
 	errCh        chan error
 	logs         *lockedBuffer
+}
+
+func (n *hostOlricNode) kill(t *testing.T) {
+	t.Helper()
+	if n.cmd.Process != nil {
+		_ = n.cmd.Process.Kill()
+	}
+	select {
+	case <-n.errCh:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("host olric-node did not exit after SIGKILL\nlogs:\n%s", strings.TrimSpace(n.logs.String()))
+	}
 }
 
 func startHostOlricNode(t *testing.T, parent context.Context, watchdogAddr, mysqlDSN, nodeID string) *hostOlricNode {
@@ -391,7 +607,60 @@ func waitForPutFailure(t *testing.T, ctx context.Context, node *hostOlricNode, d
 	t.Fatalf("put unexpectedly kept succeeding after watchdog demotion\nlast output:\n%s\nnode logs:\n%s", strings.TrimSpace(lastOut), strings.TrimSpace(node.logs.String()))
 }
 
+func waitForGetValue(t *testing.T, ctx context.Context, reader *hostOlricNode, dmap, key, want string, logNodes ...*hostOlricNode) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	var lastGot, lastOut string
+	var lastErr error
+	for time.Now().Before(deadline) {
+		got, out, err := reader.get(ctx, dmap, key)
+		lastGot, lastOut, lastErr = got, out, err
+		if err == nil && got == want {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context ended waiting for %s/%s=%q through %s: %v\nlast got=%q err=%v out=%s\n%s",
+				dmap, key, want, reader.nodeID, ctx.Err(), lastGot, lastErr, strings.TrimSpace(lastOut), hostNodeLogs(logNodes...))
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	t.Fatalf("timed out waiting for %s/%s=%q through %s\nlast got=%q err=%v out=%s\n%s",
+		dmap, key, want, reader.nodeID, lastGot, lastErr, strings.TrimSpace(lastOut), hostNodeLogs(logNodes...))
+}
+
+func hostNodeLogs(nodes ...*hostOlricNode) string {
+	var b strings.Builder
+	for _, node := range nodes {
+		if node == nil {
+			continue
+		}
+		fmt.Fprintf(&b, "%s logs:\n%s\n", node.nodeID, strings.TrimSpace(node.logs.String()))
+	}
+	return strings.TrimSpace(b.String())
+}
+
 func startHostWatchdog(t *testing.T, ctx context.Context) (string, *topology.Service, func()) {
+	t.Helper()
+	return startHostWatchdogWithConfig(t, ctx, hostWatchdogConfig{
+		suspectAfter:     time.Second,
+		expireAfter:      2 * time.Second,
+		reapInterval:     200 * time.Millisecond,
+		bookwormInterval: 200 * time.Millisecond,
+		leaseTTL:         2 * time.Second,
+	})
+}
+
+type hostWatchdogConfig struct {
+	suspectAfter     time.Duration
+	expireAfter      time.Duration
+	reapInterval     time.Duration
+	bookwormInterval time.Duration
+	leaseTTL         time.Duration
+}
+
+func startHostWatchdogWithConfig(t *testing.T, ctx context.Context, cfg hostWatchdogConfig) (string, *topology.Service, func()) {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -400,11 +669,11 @@ func startHostWatchdog(t *testing.T, ctx context.Context) (string, *topology.Ser
 	}
 
 	service := topology.NewServiceWithConfig(topology.Config{
-		SuspectAfter:     time.Second,
-		ExpireAfter:      2 * time.Second,
-		ReapInterval:     200 * time.Millisecond,
-		BookwormInterval: 200 * time.Millisecond,
-		LeaseTTL:         2 * time.Second,
+		SuspectAfter:     cfg.suspectAfter,
+		ExpireAfter:      cfg.expireAfter,
+		ReapInterval:     cfg.reapInterval,
+		BookwormInterval: cfg.bookwormInterval,
+		LeaseTTL:         cfg.leaseTTL,
 		WatchdogID:       "wd-primary",
 		Generation:       1,
 		Role:             topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY,
@@ -467,6 +736,24 @@ func (b *lockedBuffer) String() string {
 	return b.buf.String()
 }
 
+func (b *lockedBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
+}
+
+func (b *lockedBuffer) StringFrom(offset int) string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > b.buf.Len() {
+		offset = b.buf.Len()
+	}
+	return b.buf.String()[offset:]
+}
+
 func waitForText(t *testing.T, ctx context.Context, buf *lockedBuffer, needle string) {
 	t.Helper()
 
@@ -482,4 +769,174 @@ func waitForText(t *testing.T, ctx context.Context, buf *lockedBuffer, needle st
 		}
 	}
 	t.Fatalf("logs did not contain %q; logs:\n%s", needle, strings.TrimSpace(buf.String()))
+}
+
+func waitForTextAfter(t *testing.T, ctx context.Context, buf *lockedBuffer, offset int, needle string) {
+	t.Helper()
+
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(buf.StringFrom(offset), needle) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context ended waiting for %q after offset %d: %v\nlogs:\n%s", needle, offset, ctx.Err(), strings.TrimSpace(buf.String()))
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatalf("logs after offset %d did not contain %q; logs:\n%s", offset, needle, strings.TrimSpace(buf.String()))
+}
+
+func waitForTopologyWithoutMemberAfter(t *testing.T, ctx context.Context, buf *lockedBuffer, offset int, nodeID string) {
+	t.Helper()
+
+	deadline := time.Now().Add(45 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, line := range strings.Split(buf.StringFrom(offset), "\n") {
+			if strings.Contains(line, "received topology push") &&
+				strings.Contains(line, "members=[") &&
+				!strings.Contains(line, `node_id:"`+nodeID+`"`) {
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context ended waiting for topology without %q after offset %d: %v\nlogs:\n%s", nodeID, offset, ctx.Err(), strings.TrimSpace(buf.String()))
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatalf("logs after offset %d did not contain topology without %q; logs:\n%s", offset, nodeID, strings.TrimSpace(buf.String()))
+}
+
+type tcpProxy struct {
+	listener net.Listener
+	target   string
+	mu       sync.Mutex
+	paused   bool
+	closed   bool
+	conns    map[net.Conn]struct{}
+}
+
+func startTCPProxy(t *testing.T, ctx context.Context, target string) *tcpProxy {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp proxy: %v", err)
+	}
+	p := &tcpProxy{
+		listener: listener,
+		target:   target,
+		conns:    make(map[net.Conn]struct{}),
+	}
+	go p.serve(ctx)
+	return p
+}
+
+func (p *tcpProxy) addr() string {
+	return p.listener.Addr().String()
+}
+
+func (p *tcpProxy) pause() {
+	p.mu.Lock()
+	p.paused = true
+	conns := p.snapshotConnsLocked()
+	p.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
+
+func (p *tcpProxy) resume() {
+	p.mu.Lock()
+	p.paused = false
+	p.mu.Unlock()
+}
+
+func (p *tcpProxy) close(t *testing.T) {
+	t.Helper()
+
+	p.mu.Lock()
+	p.closed = true
+	conns := p.snapshotConnsLocked()
+	p.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+	_ = p.listener.Close()
+}
+
+func (p *tcpProxy) serve(ctx context.Context) {
+	go func() {
+		<-ctx.Done()
+		_ = p.listener.Close()
+	}()
+	for {
+		client, err := p.listener.Accept()
+		if err != nil {
+			return
+		}
+		if p.isPausedOrClosed() {
+			_ = client.Close()
+			continue
+		}
+		go p.handle(client)
+	}
+}
+
+func (p *tcpProxy) handle(client net.Conn) {
+	server, err := net.Dial("tcp", p.target)
+	if err != nil {
+		_ = client.Close()
+		return
+	}
+	p.track(client)
+	p.track(server)
+	defer p.untrack(client)
+	defer p.untrack(server)
+	defer client.Close()
+	defer server.Close()
+
+	done := make(chan struct{}, 2)
+	go proxyCopy(server, client, done)
+	go proxyCopy(client, server, done)
+	<-done
+}
+
+func proxyCopy(dst, src net.Conn, done chan<- struct{}) {
+	_, _ = io.Copy(dst, src)
+	_ = dst.Close()
+	_ = src.Close()
+	done <- struct{}{}
+}
+
+func (p *tcpProxy) track(conn net.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed || p.paused {
+		_ = conn.Close()
+		return
+	}
+	p.conns[conn] = struct{}{}
+}
+
+func (p *tcpProxy) untrack(conn net.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.conns, conn)
+}
+
+func (p *tcpProxy) isPausedOrClosed() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.paused || p.closed
+}
+
+func (p *tcpProxy) snapshotConnsLocked() []net.Conn {
+	conns := make([]net.Conn, 0, len(p.conns))
+	for conn := range p.conns {
+		conns = append(conns, conn)
+	}
+	return conns
 }
