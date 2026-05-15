@@ -161,6 +161,53 @@ func TestHostOnlyTwoNodeClusterCrossNodeReadWrite(t *testing.T) {
 	}
 }
 
+func TestHostOnlyTwoNodeClusterJoinsFromWatchdogTopologyOnly(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	watchdogAddr, _, cleanupWatchdog := startHostWatchdog(t, ctx)
+	defer cleanupWatchdog()
+
+	memberlistPort := mustFreeTCPPort(t)
+	first := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   watchdogAddr,
+		nodeID:         "host-only-topology-a",
+		podIP:          "127.0.0.2",
+		bindAddr:       "127.0.0.2",
+		memberlistPort: memberlistPort,
+	})
+	defer first.stop(t)
+	second := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   watchdogAddr,
+		nodeID:         "host-only-topology-b",
+		podIP:          "127.0.0.3",
+		bindAddr:       "127.0.0.3",
+		memberlistPort: memberlistPort,
+	})
+	defer second.stop(t)
+
+	waitForText(t, ctx, first.logs, `node_id:"host-only-topology-b"`)
+	waitForText(t, ctx, second.logs, `node_id:"host-only-topology-a"`)
+	waitForText(t, ctx, first.logs, "joined topology peers")
+	waitForText(t, ctx, second.logs, "joined topology peers")
+	waitForText(t, ctx, first.logs, "Node joined:")
+	waitForText(t, ctx, second.logs, "Node joined:")
+
+	key := "host-topology-only:" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if out, err := first.put(ctx, "users", key, "value-from-topology-only"); err != nil {
+		t.Fatalf("write through first topology-only node: %v (%s)\nfirst logs:\n%s\nsecond logs:\n%s",
+			err, strings.TrimSpace(out), strings.TrimSpace(first.logs.String()), strings.TrimSpace(second.logs.String()))
+	}
+	got, out, err := second.get(ctx, "users", key)
+	if err != nil {
+		t.Fatalf("read through second topology-only node: %v (%s)\nfirst logs:\n%s\nsecond logs:\n%s",
+			err, strings.TrimSpace(out), strings.TrimSpace(first.logs.String()), strings.TrimSpace(second.logs.String()))
+	}
+	if got != "value-from-topology-only" {
+		t.Fatalf("expected topology-only cross-node value %q, got %q", "value-from-topology-only", got)
+	}
+}
+
 type hostOlricNode struct {
 	nodeID       string
 	repoRoot     string
