@@ -6,6 +6,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,20 +20,127 @@ func TestK3dStackReconcilesThroughWatchdog(t *testing.T) {
 	defer cancel()
 
 	stackName := envOrDefault("E2E_STACK_NAME", "demo")
+	defer env.cleanupStack(t, stackName)
+	deployTestStack(t, ctx, env, stackName, testStackOptions{})
+}
+
+func TestK3dWatchdogFailoverReconnectsOlricNode(t *testing.T) {
+	env := requireK3dEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	stackName := envOrDefault("E2E_STACK_NAME", "demo") + "-failover"
+	defer env.cleanupStack(t, stackName)
+	deployTestStack(t, ctx, env, stackName, testStackOptions{})
+
+	leaseName := stackName + "-watchdog"
+	configMapName := stackName + "-topology"
+	nodePodName := stackName + "-olric-0"
+
+	primaryPod, err := env.readLeaseHolder(ctx, env.namespace, leaseName)
+	if err != nil {
+		t.Fatalf("read primary watchdog lease holder: %v", err)
+	}
+	if primaryPod == "" {
+		t.Fatal("expected watchdog lease holder to be set")
+	}
+
+	initialGeneration, err := env.readConfigMapGeneration(ctx, env.namespace, configMapName)
+	if err != nil {
+		t.Fatalf("read initial watchdog generation: %v", err)
+	}
+	if initialGeneration <= 0 {
+		t.Fatalf("expected positive initial watchdog generation, got %d", initialGeneration)
+	}
+
+	initialToken := fmt.Sprintf("watchdog=%s/%d", primaryPod, initialGeneration)
+	env.waitForNodeLogContains(t, ctx, env.namespace, nodePodName, initialToken)
+
+	cmd := env.kubectlCmd(ctx, "-n", env.namespace, "delete", "pod", primaryPod, "--wait=true")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("delete primary watchdog pod %s: %v (%s)", primaryPod, err, strings.TrimSpace(string(out)))
+	}
+
+	nextPrimaryPod := env.waitForLeaseHolderChange(t, ctx, env.namespace, leaseName, primaryPod)
+	env.waitForPodReady(t, ctx, env.namespace, nextPrimaryPod)
+
+	nextGeneration := env.waitForConfigMapGenerationGreater(t, ctx, env.namespace, configMapName, initialGeneration)
+	env.assertServiceEndpoints(t, ctx, env.namespace, leaseName)
+
+	nextToken := fmt.Sprintf("watchdog=%s/%d", nextPrimaryPod, nextGeneration)
+	env.waitForNodeLogContains(t, ctx, env.namespace, nodePodName, nextToken)
+}
+
+func TestK3dMySQLDurableWritePath(t *testing.T) {
+	env := requireK3dEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+
+	stackName := envOrDefault("E2E_STACK_NAME", "demo") + "-mysql"
+	defer env.cleanupStack(t, stackName)
+	mysql := requireHostMySQL(t, env)
+
+	deployTestStack(t, ctx, env, stackName, testStackOptions{
+		mysqlDSN: mysql.clusterDSN(),
+	})
+
+	nodePodName := stackName + "-olric-0"
+	env.waitForNodeLogContains(t, ctx, env.namespace, nodePodName, "storage mode: memory + local wal + mysql")
+	env.waitForNodeLogContains(t, ctx, env.namespace, nodePodName, "olric node bootstrap complete")
+
+	writeCtx, writeCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer writeCancel()
+
+	key := "user:" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if err := env.writeDMapFromNode(t, writeCtx, env.namespace, nodePodName, "users", key, "value-"+stackName); err != nil {
+		t.Fatalf("write durable dmap entry: %v", err)
+	}
+
+	record := waitForMySQLRecord(t, ctx, mysql.hostDSN(), "users", key)
+	if record.WriterID != nodePodName {
+		t.Fatalf("expected mysql writer_id %q, got %q", nodePodName, record.WriterID)
+	}
+	if record.Tombstone {
+		t.Fatalf("expected mysql record for users/%s to be live, got tombstone", key)
+	}
+	if record.Version <= 0 {
+		t.Fatalf("expected mysql record version > 0, got %d", record.Version)
+	}
+}
+
+func requireHostMySQL(t *testing.T, env *k3dEnv) *hostMySQL {
+	t.Helper()
+	return provisionHostMySQL(t, env.hostGateway(t))
+}
+
+type testStackOptions struct {
+	mysqlSecretName string
+	mysqlDSN        string
+}
+
+func (o testStackOptions) withDefaults(stackName string) testStackOptions {
+	if o.mysqlSecretName == "" {
+		o.mysqlSecretName = stackName + "-mysql"
+	}
+	return o
+}
+
+func deployTestStack(t *testing.T, ctx context.Context, env *k3dEnv, stackName string, opts testStackOptions) {
+	t.Helper()
+
+	opts = opts.withDefaults(stackName)
 	nodeImage := envOrDefault("E2E_NODE_IMAGE", "olricstack/olric-node:e2e")
 	watchdogImage := envOrDefault("E2E_WATCHDOG_IMAGE", "olricstack/watchdog:e2e")
 
 	env.ensureNamespace(t, ctx)
-	defer env.cleanupStack(t, stackName)
-
 	env.ensureOperatorNamespace(t, ctx)
 	env.applyRepoManifest(t, ctx, env.repoPath(t, "config", "crd", "olric.io_olricstacks.yaml"), "")
 	env.applyRepoManifest(t, ctx, env.repoPath(t, "config", "rbac", "operator.yaml"), "")
 	env.deleteOperatorDeployment(t, ctx)
 	env.applyYAMLInNamespace(t, "olric-system", fmt.Sprintf(testOperatorDeploymentYAML, envOrDefault("E2E_OPERATOR_IMAGE", "olricstack/operator:e2e")))
 	env.waitForDeploymentReady(t, ctx, "olric-system", "olricstack-operator")
-	env.applyYAML(t, mysqlSecretYAML)
-	env.applyYAML(t, fmt.Sprintf(testStackYAML, stackName, env.namespace, nodeImage, watchdogImage))
+	env.applyYAML(t, renderMySQLSecret(opts.mysqlSecretName, opts.mysqlDSN))
+	env.applyYAML(t, fmt.Sprintf(testStackYAML, stackName, env.namespace, nodeImage, watchdogImage, opts.mysqlSecretName))
 
 	env.waitForStatefulSetReady(t, ctx, env.namespace, stackName+"-olric", 1)
 	env.assertLeaseExists(t, ctx, env.namespace, stackName+"-watchdog")
@@ -106,10 +216,12 @@ func (e *k3dEnv) cleanupStack(t *testing.T, stackName string) {
 		{"delete", "olricstack", stackName, "-n", e.namespace, "--ignore-not-found=true"},
 		{"delete", "statefulset", stackName + "-olric", "-n", e.namespace, "--ignore-not-found=true"},
 		{"delete", "deployment", stackName + "-watchdog", "-n", e.namespace, "--ignore-not-found=true"},
+		{"delete", "deployment", stackName + "-mysql", "-n", e.namespace, "--ignore-not-found=true"},
 		{"delete", "service", stackName + "-watchdog", stackName + "-olric", "-n", e.namespace, "--ignore-not-found=true"},
+		{"delete", "service", stackName + "-mysql", "-n", e.namespace, "--ignore-not-found=true"},
 		{"delete", "serviceaccount", stackName + "-watchdog", "-n", e.namespace, "--ignore-not-found=true"},
 		{"delete", "rolebinding", stackName + "-watchdog", "-n", e.namespace, "--ignore-not-found=true"},
-		{"delete", "secret", "demo-mysql", "-n", e.namespace, "--ignore-not-found=true"},
+		{"delete", "secret", stackName + "-mysql", "-n", e.namespace, "--ignore-not-found=true"},
 		{"delete", "configmap", stackName + "-topology", "-n", e.namespace, "--ignore-not-found=true"},
 	}
 	for _, args := range commands {
@@ -200,6 +312,199 @@ func (e *k3dEnv) assertServiceEndpoints(t *testing.T, ctx context.Context, names
 	t.Fatalf("service %s/%s has no endpoints", namespace, name)
 }
 
+func (e *k3dEnv) readLeaseHolder(ctx context.Context, namespace, name string) (string, error) {
+	cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "lease", name, "-o", "jsonpath={.spec.holderIdentity}")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("get lease holder for %s/%s: %w (%s)", namespace, name, err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func (e *k3dEnv) waitForLeaseHolderChange(t *testing.T, ctx context.Context, namespace, name, previous string) string {
+	t.Helper()
+
+	deadline := time.Now().Add(90 * time.Second)
+	var lastHolder string
+	for time.Now().Before(deadline) {
+		holder, err := e.readLeaseHolder(ctx, namespace, name)
+		if err == nil && holder != "" && holder != previous {
+			return holder
+		}
+		if err == nil {
+			lastHolder = holder
+		}
+		time.Sleep(2 * time.Second)
+	}
+	e.dumpDiagnostics(t, namespace)
+	t.Fatalf("lease holder for %s/%s did not change from %q (last observed %q)", namespace, name, previous, lastHolder)
+	return ""
+}
+
+func (e *k3dEnv) readConfigMapGeneration(ctx context.Context, namespace, name string) (int64, error) {
+	cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "configmap", name, "-o", "jsonpath={.data.watchdogGeneration}")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("get configmap generation for %s/%s: %w (%s)", namespace, name, err, strings.TrimSpace(string(out)))
+	}
+	value := strings.TrimSpace(string(out))
+	if value == "" {
+		return 0, fmt.Errorf("configmap %s/%s has empty watchdogGeneration", namespace, name)
+	}
+	generation, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse watchdogGeneration %q for %s/%s: %w", value, namespace, name, err)
+	}
+	return generation, nil
+}
+
+func (e *k3dEnv) waitForConfigMapGenerationGreater(t *testing.T, ctx context.Context, namespace, name string, previous int64) int64 {
+	t.Helper()
+
+	deadline := time.Now().Add(90 * time.Second)
+	var lastGeneration int64
+	for time.Now().Before(deadline) {
+		generation, err := e.readConfigMapGeneration(ctx, namespace, name)
+		if err == nil && generation > previous {
+			return generation
+		}
+		if err == nil {
+			lastGeneration = generation
+		}
+		time.Sleep(2 * time.Second)
+	}
+	e.dumpDiagnostics(t, namespace)
+	t.Fatalf("configmap %s/%s generation did not advance past %d (last observed %d)", namespace, name, previous, lastGeneration)
+	return 0
+}
+
+func (e *k3dEnv) waitForPodReady(t *testing.T, ctx context.Context, namespace, name string) {
+	t.Helper()
+
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		cmd := e.kubectlCmd(ctx, "-n", namespace, "wait", "--for=condition=ready", "pod/"+name, "--timeout=5s")
+		if out, err := cmd.CombinedOutput(); err == nil {
+			_ = out
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+	e.dumpDiagnostics(t, namespace)
+	t.Fatalf("pod %s/%s did not become ready within timeout", namespace, name)
+}
+
+func (e *k3dEnv) waitForNodeLogContains(t *testing.T, ctx context.Context, namespace, podName, needle string) {
+	t.Helper()
+
+	deadline := time.Now().Add(90 * time.Second)
+	var lastLogs string
+	for time.Now().Before(deadline) {
+		cmd := e.kubectlCmd(ctx, "-n", namespace, "logs", podName, "-c", "olric-node")
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			logs := string(out)
+			if strings.Contains(logs, needle) {
+				return
+			}
+			lastLogs = logs
+		}
+		time.Sleep(2 * time.Second)
+	}
+	e.dumpDiagnostics(t, namespace)
+	t.Fatalf("pod %s/%s logs did not contain %q; last logs:\n%s", namespace, podName, needle, strings.TrimSpace(lastLogs))
+}
+
+func (e *k3dEnv) writeDMapFromNode(t *testing.T, ctx context.Context, namespace, podName, dmap, key, value string) error {
+	t.Helper()
+
+	podIP, err := e.readPodField(ctx, namespace, podName, "{.status.podIP}")
+	if err != nil {
+		return err
+	}
+	nodeName, err := e.readPodField(ctx, namespace, podName, "{.spec.nodeName}")
+	if err != nil {
+		return err
+	}
+
+	localBinary := filepath.Join(t.TempDir(), "olric-e2e-client")
+	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", localBinary, "./cmd/olric-e2e-client")
+	buildCmd.Dir = e.repoRoot(t)
+	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("build olric e2e client: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+
+	nodeContainer := k3dNodeContainerName(nodeName)
+	remoteBinary := "/tmp/olric-e2e-client"
+	copyCmd := exec.CommandContext(ctx, "docker", "cp", localBinary, nodeContainer+":"+remoteBinary)
+	if out, err := copyCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("copy olric e2e client to %s: %w (%s)", nodeContainer, err, strings.TrimSpace(string(out)))
+	}
+
+	cmd := exec.CommandContext(ctx,
+		"docker", "exec", nodeContainer,
+		remoteBinary,
+		"-addr", podIP+":3320",
+		"-dmap", dmap,
+		"-key", key,
+		"-value", value,
+		"-timeout", "5s",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("write dmap from node %s to %s: %w (%s)", nodeName, podIP, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func (e *k3dEnv) readPodField(ctx context.Context, namespace, podName, jsonPath string) (string, error) {
+	cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "pod", podName, "-o", "jsonpath="+jsonPath)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("get pod field %s for %s/%s: %w (%s)", jsonPath, namespace, podName, err, strings.TrimSpace(string(out)))
+	}
+	value := strings.TrimSpace(string(out))
+	if value == "" {
+		return "", fmt.Errorf("pod field %s for %s/%s is empty", jsonPath, namespace, podName)
+	}
+	return value, nil
+}
+
+func (e *k3dEnv) hostGateway(t *testing.T) string {
+	t.Helper()
+
+	cmd := exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}", fmt.Sprintf("k3d-%s-server-0", e.clusterName))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read k3d host gateway: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	gateway := strings.TrimSpace(string(out))
+	if gateway == "" {
+		t.Fatal("k3d host gateway is empty")
+	}
+	return gateway
+}
+
+func k3dNodeContainerName(nodeName string) string {
+	if strings.HasPrefix(nodeName, "k3d-") {
+		return nodeName
+	}
+	return "k3d-" + nodeName
+}
+
+func renderMySQLSecret(name, dsn string) string {
+	return fmt.Sprintf(`
+apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+type: Opaque
+stringData:
+  dsn: %q
+`, name, dsn)
+}
+
 func (e *k3dEnv) dumpDiagnostics(t *testing.T, namespace string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -207,6 +512,8 @@ func (e *k3dEnv) dumpDiagnostics(t *testing.T, namespace string) {
 	for _, args := range [][]string{
 		{"-n", namespace, "get", "pods", "-o", "wide"},
 		{"-n", namespace, "get", "events", "--sort-by=.lastTimestamp"},
+		{"-n", namespace, "get", "svc"},
+		{"-n", namespace, "get", "deploy"},
 		{"-n", "olric-system", "get", "pods", "-o", "wide"},
 	} {
 		cmd := e.kubectlCmd(ctx, args...)
@@ -248,16 +555,6 @@ spec:
               port: 8082
 `
 
-const mysqlSecretYAML = `
-apiVersion: v1
-kind: Secret
-metadata:
-  name: demo-mysql
-type: Opaque
-stringData:
-  dsn: ""
-`
-
 const testStackYAML = `
 apiVersion: olric.io/v1alpha1
 kind: OlricStack
@@ -270,6 +567,6 @@ spec:
   image: %s
   watchdogImage: %s
   mysqlDsnSecret:
-    name: demo-mysql
+    name: %s
     key: dsn
 `
