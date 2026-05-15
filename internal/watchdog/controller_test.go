@@ -65,6 +65,14 @@ func TestControllerReconcilesOlricResourcesForOwnStack(t *testing.T) {
 	if len(mounts) != 1 || mounts[0].Name != workloads.OlricDataVolumeName || mounts[0].MountPath != workloads.OlricDataMountPath {
 		t.Fatalf("expected WAL volume mount, got %#v", mounts)
 	}
+	ports := statefulSet.Spec.Template.Spec.Containers[0].Ports
+	if len(ports) != 2 || ports[0].Name != "olric" || ports[0].ContainerPort != workloads.OlricPort || ports[1].Name != "memberlist" || ports[1].ContainerPort != workloads.MemberlistPort {
+		t.Fatalf("expected Olric and memberlist ports, got %#v", ports)
+	}
+	env := envMap(statefulSet.Spec.Template.Spec.Containers[0].Env)
+	if env["OLRIC_BIND_PORT"].Value != "3320" || env["OLRIC_MEMBERLIST_BIND_PORT"].Value != "3322" {
+		t.Fatalf("expected Olric port env vars, got %#v", env)
+	}
 
 	var service corev1.Service
 	if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "demo-olric", Namespace: "default"}, &service); err != nil {
@@ -72,6 +80,9 @@ func TestControllerReconcilesOlricResourcesForOwnStack(t *testing.T) {
 	}
 	if service.Spec.ClusterIP != "None" {
 		t.Fatalf("expected headless service, got clusterIP %q", service.Spec.ClusterIP)
+	}
+	if len(service.Spec.Ports) != 2 || service.Spec.Ports[0].Name != "olric" || service.Spec.Ports[0].Port != workloads.OlricPort || service.Spec.Ports[1].Name != "memberlist" || service.Spec.Ports[1].Port != workloads.MemberlistPort {
+		t.Fatalf("expected Olric and memberlist service ports, got %#v", service.Spec.Ports)
 	}
 }
 
@@ -173,6 +184,14 @@ type recordingObserver struct {
 func (o *recordingObserver) ObservePods(stackID string, observations []PodObservation) {
 	o.stackID = stackID
 	o.observations = append([]PodObservation(nil), observations...)
+}
+
+func envMap(envVars []corev1.EnvVar) map[string]corev1.EnvVar {
+	env := make(map[string]corev1.EnvVar, len(envVars))
+	for _, envVar := range envVars {
+		env[envVar.Name] = envVar
+	}
+	return env
 }
 
 func newTestScheme(t *testing.T) *runtime.Scheme {

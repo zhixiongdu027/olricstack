@@ -8,6 +8,7 @@ import (
 	"github.com/zhixiongdu/olricstack/internal/workloads"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -34,6 +35,8 @@ func (r *OlricStackReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	resources := []client.Object{
 		workloads.WatchdogService(&stack),
+		workloads.WatchdogServiceAccount(&stack),
+		workloads.WatchdogRoleBinding(&stack),
 		workloads.WatchdogDeployment(&stack),
 	}
 
@@ -56,6 +59,8 @@ func (r *OlricStackReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&olricv1alpha1.OlricStack{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&rbacv1.RoleBinding{}).
+		Owns(&corev1.ServiceAccount{}).
 		Owns(&corev1.Service{}).
 		Complete(r)
 }

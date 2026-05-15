@@ -1,4 +1,4 @@
-FROM golang:1.25 AS build
+FROM golang:1.26 AS build
 
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -9,14 +9,17 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /out/olric-node ./cmd/olric-node
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/watchdog ./cmd/watchdog
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/operator ./cmd/operator
 
-FROM gcr.io/distroless/static-debian12 AS olric-node
+FROM scratch AS olric-node
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /out/olric-node /olric-node
 ENTRYPOINT ["/olric-node"]
 
-FROM gcr.io/distroless/static-debian12 AS watchdog
+FROM scratch AS watchdog
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /out/watchdog /watchdog
 ENTRYPOINT ["/watchdog"]
 
-FROM gcr.io/distroless/static-debian12 AS operator
+FROM scratch AS operator
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /out/operator /operator
 ENTRYPOINT ["/operator"]

@@ -6,6 +6,7 @@ import (
 	olricv1alpha1 "github.com/zhixiongdu/olricstack/api/olric/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -21,10 +22,14 @@ const (
 	DefaultNodeImage     = "olricstack/olric-node:latest"
 	DefaultWatchdogImage = "olricstack/watchdog:latest"
 
-	WatchdogPort = int32(8081)
+	WatchdogPort   = int32(8081)
+	OlricPort      = int32(3320)
+	MemberlistPort = int32(3322)
 
 	OlricDataVolumeName = "olric-data"
 	OlricDataMountPath  = "/var/lib/olricstack"
+
+	WatchdogClusterRoleName = "olricstack-watchdog"
 )
 
 func StackLabels(stack *olricv1alpha1.OlricStack, component string) map[string]string {
@@ -42,6 +47,10 @@ func WatchdogName(stack *olricv1alpha1.OlricStack) string {
 
 func OlricName(stack *olricv1alpha1.OlricStack) string {
 	return stack.Name + "-olric"
+}
+
+func WatchdogServiceAccountName(stack *olricv1alpha1.OlricStack) string {
+	return WatchdogName(stack)
 }
 
 func WatchdogService(stack *olricv1alpha1.OlricStack) *corev1.Service {
@@ -88,7 +97,7 @@ func WatchdogDeployment(stack *olricv1alpha1.OlricStack) *appsv1.Deployment {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
-					ServiceAccountName: "olricstack-watchdog",
+					ServiceAccountName: WatchdogServiceAccountName(stack),
 					Containers: []corev1.Container{{
 						Name:  "watchdog",
 						Image: valueOrDefault(stack.Spec.WatchdogImage, DefaultWatchdogImage),
@@ -122,6 +131,37 @@ func WatchdogDeployment(stack *olricv1alpha1.OlricStack) *appsv1.Deployment {
 	}
 }
 
+func WatchdogServiceAccount(stack *olricv1alpha1.OlricStack) *corev1.ServiceAccount {
+	return &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      WatchdogServiceAccountName(stack),
+			Namespace: stack.Namespace,
+			Labels:    StackLabels(stack, ComponentWatchdog),
+		},
+	}
+}
+
+func WatchdogRoleBinding(stack *olricv1alpha1.OlricStack) *rbacv1.RoleBinding {
+	labels := StackLabels(stack, ComponentWatchdog)
+	return &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      WatchdogServiceAccountName(stack),
+			Namespace: stack.Namespace,
+			Labels:    labels,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "ClusterRole",
+			Name:     WatchdogClusterRoleName,
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind:      "ServiceAccount",
+			Name:      WatchdogServiceAccountName(stack),
+			Namespace: stack.Namespace,
+		}},
+	}
+}
+
 func OlricHeadlessService(stack *olricv1alpha1.OlricStack) *corev1.Service {
 	labels := StackLabels(stack, ComponentOlricNode)
 	return &corev1.Service{
@@ -134,8 +174,13 @@ func OlricHeadlessService(stack *olricv1alpha1.OlricStack) *corev1.Service {
 			ClusterIP: "None",
 			Selector:  labels,
 			Ports: []corev1.ServicePort{{
-				Name: "olric",
-				Port: 3320,
+				Name:       "olric",
+				Port:       OlricPort,
+				TargetPort: intstr.FromInt32(OlricPort),
+			}, {
+				Name:       "memberlist",
+				Port:       MemberlistPort,
+				TargetPort: intstr.FromInt32(MemberlistPort),
 			}},
 		},
 	}
@@ -165,6 +210,13 @@ func OlricStatefulSet(stack *olricv1alpha1.OlricStack) *appsv1.StatefulSet {
 						Name:      "olric-node",
 						Image:     valueOrDefault(stack.Spec.Image, DefaultNodeImage),
 						Resources: stack.Spec.Resources,
+						Ports: []corev1.ContainerPort{{
+							Name:          "olric",
+							ContainerPort: OlricPort,
+						}, {
+							Name:          "memberlist",
+							ContainerPort: MemberlistPort,
+						}},
 						VolumeMounts: []corev1.VolumeMount{{
 							Name:      OlricDataVolumeName,
 							MountPath: OlricDataMountPath,
@@ -179,6 +231,11 @@ func OlricStatefulSet(stack *olricv1alpha1.OlricStack) *appsv1.StatefulSet {
 							{Name: "FLUSH_BACKOFF", Value: "1s"},
 							{Name: "FLUSH_BATCH_SIZE", Value: "256"},
 							{Name: "WAL_PATH", Value: "/var/lib/olricstack/cache.wal"},
+							{Name: "OLRIC_BIND_ADDR", Value: "0.0.0.0"},
+							{Name: "OLRIC_BIND_PORT", Value: fmt.Sprintf("%d", OlricPort)},
+							{Name: "OLRIC_MEMBERLIST_BIND_ADDR", Value: "0.0.0.0"},
+							{Name: "OLRIC_MEMBERLIST_BIND_PORT", Value: fmt.Sprintf("%d", MemberlistPort)},
+							{Name: "OLRIC_MEMBERLIST_ENV", Value: "lan"},
 							{Name: "MYSQL_DSN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &stack.Spec.MySQLDSNSecret}},
 							{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
 							{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
