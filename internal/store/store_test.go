@@ -265,6 +265,33 @@ func TestMySQLStoreLoadPrefersLocalWALBeforeMySQL(t *testing.T) {
 	closeStore(t, cacheStore)
 }
 
+func TestMySQLStoreLocalRefillDoesNotOverwriteFlushableDirtyRecord(t *testing.T) {
+	cacheStore := newTestStore(t, Config{FlushInterval: time.Hour})
+	if err := cacheStore.StoreEntry(context.Background(), testFlushableRecord("refill", 16, []byte("dirty"))); err != nil {
+		t.Fatalf("store dirty value: %v", err)
+	}
+	if err := cacheStore.StoreEntry(context.Background(), EntryRecord{
+		DMap:         "users",
+		Key:          "refill",
+		HKey:         16,
+		EncodedEntry: []byte("mysql"),
+		Origin:       "mysql_refill",
+		FlushMySQL:   false,
+		WALState:     WALStateLocal,
+	}); err != nil {
+		t.Fatalf("store local refill: %v", err)
+	}
+
+	record, err := cacheStore.LoadEntry(context.Background(), testRef("refill", 16))
+	if err != nil {
+		t.Fatalf("load dirty value: %v", err)
+	}
+	if string(record.EncodedEntry) != "dirty" {
+		t.Fatalf("expected flushable dirty value to win, got %q", record.EncodedEntry)
+	}
+	closeStore(t, cacheStore)
+}
+
 func TestMySQLStoreDoesNotFlushLocalOnlyEntries(t *testing.T) {
 	db := newTestDB(t)
 	walPath := filepath.Join(t.TempDir(), "cache.wal")
@@ -314,6 +341,9 @@ func TestMySQLStoreDoesNotFlushPreparedEntriesBeforeCommit(t *testing.T) {
 	}
 	if prepared.WALState != WALStatePrepared || prepared.FlushMySQL {
 		t.Fatalf("expected unflushable prepared record, got %#v", prepared)
+	}
+	if _, err := cacheStore.LoadEntry(context.Background(), testRef("prepared", 32)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("prepared record must not be visible before commit, got %v", err)
 	}
 	if cacheStore.flushWAL(true) {
 		reader := newTestStoreWithDB(t, db, Config{WALPath: filepath.Join(t.TempDir(), "reader-before.wal")})
@@ -459,6 +489,70 @@ func TestWALStoreReplaysWithoutMySQL(t *testing.T) {
 	}
 	if len(replayed) != 1 || string(replayed[0].EncodedEntry) != "value" {
 		t.Fatalf("unexpected replayed records: %#v", replayed)
+	}
+	closeStore(t, second)
+}
+
+func TestWALStoreDoesNotReplayPreparedRecords(t *testing.T) {
+	walPath := filepath.Join(t.TempDir(), "cache.wal")
+	first, err := NewWALStore(Config{WALPath: walPath})
+	if err != nil {
+		t.Fatalf("new wal store: %v", err)
+	}
+	if _, err := first.PrepareEntry(context.Background(), testFlushableRecord("prepared", 14, []byte("ghost"))); err != nil {
+		t.Fatalf("prepare entry: %v", err)
+	}
+	if err := first.wal.Close(); err != nil {
+		t.Fatalf("close first wal: %v", err)
+	}
+
+	second, err := NewWALStore(Config{WALPath: walPath})
+	if err != nil {
+		t.Fatalf("reopen wal store: %v", err)
+	}
+	var replayed []EntryRecord
+	if err := second.Replay(context.Background(), func(record EntryRecord) error {
+		replayed = append(replayed, record)
+		return nil
+	}); err != nil {
+		t.Fatalf("replay wal: %v", err)
+	}
+	if len(replayed) != 0 {
+		t.Fatalf("prepared record must not be replayed into memory: %#v", replayed)
+	}
+	closeStore(t, second)
+}
+
+func TestWALStoreReplaysCommittedPreparedRecords(t *testing.T) {
+	walPath := filepath.Join(t.TempDir(), "cache.wal")
+	first, err := NewWALStore(Config{WALPath: walPath})
+	if err != nil {
+		t.Fatalf("new wal store: %v", err)
+	}
+	prepared, err := first.PrepareEntry(context.Background(), testFlushableRecord("committed", 15, []byte("value")))
+	if err != nil {
+		t.Fatalf("prepare entry: %v", err)
+	}
+	if err := first.CommitEntry(context.Background(), prepared.Ref(), prepared.Version); err != nil {
+		t.Fatalf("commit entry: %v", err)
+	}
+	if err := first.wal.Close(); err != nil {
+		t.Fatalf("close first wal: %v", err)
+	}
+
+	second, err := NewWALStore(Config{WALPath: walPath})
+	if err != nil {
+		t.Fatalf("reopen wal store: %v", err)
+	}
+	var replayed []EntryRecord
+	if err := second.Replay(context.Background(), func(record EntryRecord) error {
+		replayed = append(replayed, record)
+		return nil
+	}); err != nil {
+		t.Fatalf("replay wal: %v", err)
+	}
+	if len(replayed) != 1 || string(replayed[0].EncodedEntry) != "value" || replayed[0].WALState != WALStateCommitted {
+		t.Fatalf("unexpected replayed committed records: %#v", replayed)
 	}
 	closeStore(t, second)
 }

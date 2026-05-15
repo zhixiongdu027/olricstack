@@ -207,6 +207,9 @@ func (s *MySQLStore) Replay(ctx context.Context, f func(EntryRecord) error) erro
 				return err
 			}
 			record := entry.Record.Clone()
+			if record.WALState == WALStatePrepared {
+				continue
+			}
 			if record.Tombstone {
 				continue
 			}
@@ -235,6 +238,9 @@ func (s *MySQLStore) LoadEntry(ctx context.Context, ref EntryRef) (EntryRecord, 
 	if record, ok, err := s.loadDirty(ref); err != nil {
 		return EntryRecord{}, err
 	} else if ok {
+		if record.WALState == WALStatePrepared {
+			return EntryRecord{}, ErrNotFound
+		}
 		if record.Tombstone {
 			return EntryRecord{}, ErrNotFound
 		}
@@ -537,7 +543,17 @@ func (s *MySQLStore) appendDirty(record EntryRecord, version int64) (dirtyEntry,
 	err := s.wal.Update(func(tx *bolt.Tx) error {
 		dirty := tx.Bucket(walDirtyBucket)
 		key := []byte(walKey(record.Ref()))
-		if dirty.Get(key) == nil && dirty.Stats().KeyN >= s.cfg.QueueSize {
+		if existing := dirty.Get(key); existing != nil {
+			var current dirtyEntry
+			if err := json.Unmarshal(existing, &current); err != nil {
+				return err
+			}
+			if shouldPreserveDirtyRecord(current.Record, entry.Record) {
+				entry.Record = current.Record.Clone()
+				depth = dirty.Stats().KeyN
+				return nil
+			}
+		} else if dirty.Stats().KeyN >= s.cfg.QueueSize {
 			return ErrQueueFull
 		}
 		meta := tx.Bucket(walMetaBucket)
@@ -728,6 +744,14 @@ func isExpired(ttl int64, now time.Time) bool {
 
 func isFlushable(record EntryRecord) bool {
 	return record.FlushMySQL && (record.WALState == "" || record.WALState == WALStateCommitted)
+}
+
+func shouldPreserveDirtyRecord(current, incoming EntryRecord) bool {
+	return isLocalRefill(incoming) && (current.FlushMySQL || current.WALState == WALStatePrepared)
+}
+
+func isLocalRefill(record EntryRecord) bool {
+	return record.WALState == WALStateLocal || (!record.FlushMySQL && record.Origin == "mysql_refill")
 }
 
 func (s *MySQLStore) notifyFlush() {
