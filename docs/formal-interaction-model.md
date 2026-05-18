@@ -1,6 +1,6 @@
 # Formal Interaction Model — OlricStack Four-Way Timing Audit
 
-**Audited revision:** `9d440be` (2026-05-15)
+**Audited revision:** `2d55fec` (2026-05-18)
 **Components in scope:** Watchdog control plane · `stringkv` ingress proxy · Olric fork (`third_party/olric/internal/dmap`) · Durable store (`internal/store` WAL + MySQL).
 
 This document is a state-machine-level recipe-and-proof of the four-way timing contract. Every claim cites a code line. The structure is:
@@ -28,6 +28,18 @@ We do **not** write a TLA+ specification yet. The runtime is a mix of gRPC strea
 Every proof step is annotated with `path/to/file.go:Lline` so the proof can be re-validated against future commits.
 
 §9 lists the predicates that should be lifted to a real TLA+ model first when we cross that bridge.
+
+### Performance optimizations applied since the initial audit
+
+This document was first written at revision `aacaeee` against `9d440be`. The optimizations below were applied afterward and the proofs were re-walked to confirm invariants:
+
+| Commit | Optimization | Impact on invariants | Where proof changed |
+|---|---|---|---|
+| `7537a86` | #1 — `bbolt.Batch` for WAL writes (`appendDirty`, `commitDirty`, `abortDirty`) | None. Idempotency analyzed in store.go:600-617 comment. | §3 E9/E13/E14 atomicity unchanged in spec — bbolt.Batch is functionally identical to Update with shared fsync. |
+| `cf6aa45` | #2 — `OwnerSequence` reservation windows | None. Strict-lex MySQL upsert is gap-tolerant. | §3 E23 added; §8.9 new weakness entry. |
+| `2d55fec` | #4 — `BeforeSet` outside fragment lock + `VerifyAfterLock` barrier | S5 proof now requires the in-lock verify step. | §3 E8a/E8b/E_v; §4 S5 augmented; §6.1 rewritten; §8.10 new weakness entry. |
+
+Optimization #3 (merging owner_seq.bolt and cache.wal into one bbolt) is deferred until #1/#2/#4 prove stable in production.
 
 ---
 
@@ -157,23 +169,26 @@ Listed in causal order so subsequent sections can name them by ID.
 | E3 | `Subscriber.Apply(envelope)` | Stream Recv | `LeaseTracker.mu` (`subscriber.go:170`) |
 | E4 | `Subscriber.Revoke()` | Apply error | `LeaseTracker.mu` (`subscriber.go:202`) |
 | E5 | `stringkv.requireLease()` | Service entry | `LeaseTracker.RLock` |
-| E6 | Olric routing decision | `dm.put/get/delete` ingress | RoutingTable read (`put.go:421`) |
+| E6 | Olric routing decision | `dm.put/get/delete` ingress | RoutingTable read (`put.go:dm.put`) |
 | E7 | `frag.Lock()` | owner-side enter | per-fragment mutex |
-| E8 | `BeforeSet/Delete/Expire(op)` | inside E7 | calls E9 internally |
-| E9 | `PrepareEntry(record)` | hook | bbolt `Update` tx (`store.go:600`) |
+| E8a | `BeforeSet(op)` **outside** `frag.Lock` | client_set ingress | `LeaseTracker.RLock` + bbolt Batch (`put.go:putOnCluster step 5`) |
+| E8b | `BeforeDelete/Expire(op)` **inside** `frag.Lock` | client_delete / client_expire | E7 + bbolt Batch (`delete.go:deleteKey`, `put.go:isExpire branch`) |
+| E9 | `PrepareEntry(record)` | hook | bbolt `Batch` tx — coalesces fsyncs (`store.go:appendDirty`) |
+| E_v | `VerifyAfterLock(op)` | fork inside `frag.Lock` | `LeaseTracker.RLock` (`durable_hook.go:VerifyAfterLock`, `put.go:after f.Lock`) |
 | E10 | `putEntryOnFragment` / `f.storage.Delete` / `UpdateTTL` | fork mutation | inside E7 |
-| E11 | `syncPutOnCluster` quorum | replica writes | inside E7 (`put.go:174`) |
-| E12 | `AfterSet/Delete/Expire(op, mutErr)` | fork (unconditional) | inside E7 (`put.go:357`) |
-| E13 | `CommitEntry(ref, walSeq)` | hook with `mutErr=nil` | bbolt `Update` tx (`store.go:639`) |
-| E14 | `AbortEntry(ref, walSeq)` | hook with `mutErr≠nil` | bbolt `Update` tx (`store.go:670`) |
-| E15 | `flushLoop` tick | `notify` chan / interval | `s.mu` + GORM batch (`store.go:485`) |
-| E16 | `versionedUpsert` | flusher | MySQL row-level lock + `ON CONFLICT` (`store.go:799`) |
-| E17 | `deleteFlushed` | post-upsert | bbolt `Update` tx (`store.go:751`) |
-| E18 | `LoadOnMiss(op)` | fork get-miss | bbolt View + GORM `First` (`durable_hook.go:143`) |
-| E19 | Refill re-lock + check | fork after E18 | second `f.Lock()` (`get.go:404`) |
-| E20 | `closeSubscribersForLeadershipChange` | demote | two-phase: `Service.mu` then 50 ms drain (`service.go:500`) |
-| E21 | `PurgeBelowGeneration(minGen)` | new envelope arrival | bbolt `Update` tx (`store.go:224`) |
-| E22 | `WAL Replay` | `Engine.Start` | bbolt `View` (`store.go:270`) |
+| E11 | `syncPutOnCluster` quorum | replica writes | inside E7 (`put.go:syncPutOnCluster`) |
+| E12 | `AfterSet/Delete/Expire(op, mutErr)` | fork (unconditional) | inside E7 (`put.go:end of putOnCluster`) |
+| E13 | `CommitEntry(ref, walSeq)` | hook with `mutErr=nil` | bbolt `Batch` tx (`store.go:commitDirty`) |
+| E14 | `AbortEntry(ref, walSeq)` | hook with `mutErr≠nil` | bbolt `Batch` tx (`store.go:abortDirty`) |
+| E15 | `flushLoop` tick | `notify` chan / interval | `s.mu` + GORM batch (`store.go:flushLoop`) |
+| E16 | `versionedUpsert` | flusher | MySQL row-level lock + `ON CONFLICT` (`store.go:versionedUpsertClause`) |
+| E17 | `deleteFlushed` | post-upsert | bbolt `Update` tx (`store.go:deleteFlushed`) |
+| E18 | `LoadOnMiss(op)` | fork get-miss | bbolt View + GORM `First` (`durable_hook.go:LoadOnMiss`) |
+| E19 | Refill re-lock + check | fork after E18 | second `f.Lock()` (`get.go:after LoadOnMiss`) |
+| E20 | `closeSubscribersForLeadershipChange` | demote | two-phase: `Service.mu` then 50 ms drain (`service.go:closeSubscribersForLeadershipChange`) |
+| E21 | `PurgeBelowGeneration(minGen)` | new envelope arrival | bbolt `Update` tx (`store.go:PurgeBelowGeneration`) |
+| E22 | `WAL Replay` | `Engine.Start` | bbolt `View` (`store.go:Replay`) |
+| E23 | `OwnerSequence.Stamp` | inside hook fence stamp | `OwnerSequence.mu` + amortized fsync (`owner_seq.go:Stamp`) |
 
 ---
 
@@ -237,6 +252,17 @@ Stated as predicates over all reachable states. Each is proved (forward, golden 
 - `closeSubscribersForLeadershipChange` posts a `PRIMARY_CHANGE` envelope before tearing the stream, which Apply rejects → `Revoke()` (`subscriber.go:171,245`).
 - Generation source is `NextGeneration` in ConfigMap, which is monotonic by optimistic-locked increment (`epoch_store.go:87`).
 
+**Two-phase fence check (post-`2d55fec`)**: client_set prepares the durable record outside the fragment lock to coalesce fsyncs (Optimization #4 in commit `2d55fec`). This widens the time window between fence stamp (E8a) and the in-memory mutation (E10), so a second barrier is required:
+
+- `BeforeSet` snapshots `(L.gen, L.epoch)` inside `LeaseTracker.RLock` and writes it into the prepared record AND into the returned `op.FenceGeneration / op.FenceEpoch` (`durable_hook.go:74-91`).
+- The fork then acquires `frag.Lock()` and immediately calls `VerifyAfterLock(op)` (`put.go:339-345`).
+- `VerifyAfterLock` re-reads `(L.gen, L.epoch, L.validUntil)` and rejects if **any** of: lease has expired, `L.gen ≠ op.FenceGeneration`, or `L.epoch < op.FenceEpoch` (`subscriber.go:262-275`, `durable_hook.go:148-156`).
+- A non-nil verify result routes the fork to `AfterSet(op, vErr)` which calls `AbortEntry`. The prepared record is removed before any in-memory or replica mutation runs.
+
+This preserves S5 by reduction: even though the fence was stamped without the fragment lock, no acknowledged write exists without the fork holding `frag.Lock()` AND the lease still owning the same `(L.gen, L.epoch)` it had at stamp time. The post-stamp window is bounded by the verify check, not by hope.
+
+`client_delete` and `client_expire` keep the original in-lock `BeforeX` ordering (delete because tombstone fence depends on lock-protected `f.storage.Check`; expire because TTL fence depends on lock-protected `f.storage.Get`). They still call `VerifyAfterLock` defensively — a no-op when the fence was stamped under the same lock, but cheap insurance against future refactors.
+
 ### S6 — One owner-fenced write per acknowledged primary mutation
 
 This follows from S1 + S3 + uniqueness of `(G, E, S)` for a successful E13. The fence sequencer (`OwnerSequence.Stamp`, `owner_seq.go:75`) guarantees:
@@ -289,7 +315,9 @@ Notation: `[E1; loc] description // inv-checks` reads "event E1 at the cited loc
 
 ### 6.1 Happy SET on the partition owner
 
-Pre-state: `L_N` valid with `L_N.gen = G_p, L_N.epoch = E_p`. `seq.persisted = (G_p, E_p, S_p)`. No prior record for `(dmap, hkey)` in WAL.
+Pre-state: `L_N` valid with `L_N.gen = G_p, L_N.epoch = E_p`. `seq.persisted = (G_p, E_p, S_p)` with reserved ceiling `R_p ≥ S_p` (post-Optimization #2). No prior record for `(dmap, hkey)` in WAL.
+
+The event chain after Optimization #4 (`2d55fec`) splits into a lock-free preparation phase and an in-lock mutation phase. The two phases are reconciled by `VerifyAfterLock`.
 
 ```
 Step 1   [E5; service.go:108]
@@ -298,88 +326,100 @@ Step 1   [E5; service.go:108]
          // S5 holds (lease still valid)
 
 Step 2   [E6; put.go:421]
-         dm.put computes hkey, checks routing. If owner ≠ self → RPC to owner; we
-         assume owner = self for this sequence.
-         // No state change.
+         dm.put computes hkey, checks routing. If owner ≠ self → RPC to owner;
+         we assume owner = self for this sequence.
 
-Step 3   [E7; put.go:300]
-         frag.Lock() acquired.
-         // Mutex held throughout to Step 11.
+Step 3   [put.go:294]
+         dm.loadOrCreateFragment returns f. NO LOCK YET.
 
-Step 4   [E8 / BeforeSet; put.go:319-352]
-         hook called with op.Entry = prepareEntry(e). isExpire=false → BeforeSet.
+Step 4   [put.go:316-318]
+         e.timeout defaults seeded; nt = prepareEntry(e). prepareEntry only
+         allocates an Entry struct via storage.NewEntry — pure function on
+         the input, safe outside the lock.
 
-Step 5   [E9 inside Before; durable_hook.go:74-88]
-         5a. fencedRecord builds EntryRecord with origin=client_set, FlushMySQL=true.
-         5b. stampFence:
+Step 5   [E8a; put.go:329-348]
+         BeforeSet(op) called OUTSIDE f.Lock.
+
+Step 6   [E9 inside Before; durable_hook.go:74-91]
+         6a. fencedRecord builds EntryRecord with origin=client_set, FlushMySQL=true.
+         6b. stampFence:
              - LeaseTracker.SnapshotForWrite(now) atomically reads L.gen, L.epoch
                under L.mu while re-asserting validUntil>now (subscriber.go:217).
                OK → returns (G_p, E_p, true).
              - OwnerSequence.Stamp(G_p, E_p):
-               case (G_p, E_p) = persisted → S_p++ = S_p+1
-               persistLocked() flushes bbolt before return (owner_seq.go:98).
-               // seq.persisted now (G_p, E_p, S_p+1) DURABLY.
-         5c. PrepareEntry writes WAL with WALState=Prepared, FlushMySQL=false,
-             fence=(G_p, E_p, S_p+1), WALSeq=next (store.go:377-381, 600-636).
+               case (G_p, E_p) = persisted:
+                 if S_p+1 ≤ R_p: bump in-memory seq, no fsync (post-#2).
+                 else: extend reservation by N, fsync, then bump.
+               // returned (G_p, E_p, S_p+1) is guaranteed durable on disk.
+         6c. PrepareEntry writes WAL with WALState=Prepared, FlushMySQL=false,
+             fence=(G_p, E_p, S_p+1), WALSeq=next via bbolt.Batch (post-#1).
              // op.Version ← WALSeq.
+             // op.FenceGeneration/Epoch/OwnerSeq ← stamped values.
 
-         Invariants at Step 5 end:
+         Invariants at Step 6 end:
          // S2 holds: record is Prepared ⇒ isFlushable=false (store.go:851).
          // S6: fence triple unique by construction of Stamp.
-         // S5: SnapshotForWrite double-checked lease atomicity (durable_hook.go:38-44).
+         // S5: NOT YET fully proved — there is now a window before the lock.
 
-Step 6   [E10; put.go:357 → put.go:372-389]
-         putOnClusterAfterDurable. Replicas=1 (default) → putEntryOnFragment.
+Step 7   [E7; put.go:338]
+         f.Lock() acquired.
+
+Step 8   [E_v; put.go:339-345, durable_hook.go:148-156]
+         VerifyAfterLock(op) re-reads (L.gen, L.epoch, L.validUntil) under
+         L.mu. Passes iff:
+           validUntil > now          (lease still alive)
+           AND L.gen == op.FenceGeneration   (no leadership change)
+           AND L.epoch >= op.FenceEpoch      (only forward epoch progress)
+         If NOT passes → AfterSet(op, vErr) routes to AbortEntry, return error.
+         // S5 fully restored: any subsequent step happens under a fence that
+         // was just verified to match the active lease.
+
+Step 9   [put.go:347-356]
+         checkPutConditions (NX/XX) under lock — uses f.storage state.
+         setLRUEvictionStats under lock if configured.
+         Failures here also route through AfterSet(op, err) → AbortEntry.
+
+Step 10  [E10; put.go:395 → put.go:411-428]
+         putOnClusterAfterDurable. Replicas=1 → putEntryOnFragment.
          storage.Put writes in-memory entry under frag lock.
-         // frag.mem[hkey] updated.
 
-Step 7   [E11 (only if ReplicaCount>1); put.go:174-209]
-         syncPutOnCluster fans out PutEntry to backups, counts successes against
-         WriteQuorum. mutErr returned if quorum lost.
-         // For ReplicaCount=1 this step is skipped (put.go:387).
+Step 11  [E11 (only if ReplicaCount>1); put.go:174-209]
+         syncPutOnCluster fans out PutEntry to backups. Skipped at ReplicaCount=1.
 
-Step 8   [E12 / AfterSet; put.go:357-367]
+Step 12  [E12 / AfterSet; put.go:396-403]
          AfterSet(op, mutErr) called unconditionally.
 
-Step 9a  [E13; durable_hook.go:197-213, store.go:639-668]
+Step 13a [E13; durable_hook.go:213-229, store.go:651-680]
          (Case mutErr = nil)
-         CommitEntry(ref, WALSeq):
-         - Loads dirty[walKey], asserts WALSeq match (else ErrNotFound).
-         - Flips WALState=Committed, FlushMySQL=true.
-         - notifyFlush() if depth ≥ BatchSize.
+         CommitEntry(ref, WALSeq) via bbolt.Batch (post-#1).
+         Flips WALState=Committed, FlushMySQL=true.
+         notifyFlush() if depth ≥ BatchSize.
          // S1 satisfied: dirty[ref].WALState = Committed before return.
          // S2: record now Flushable.
 
-Step 9b  [E14; durable_hook.go:204-209, store.go:670-692]
-         (Case mutErr ≠ nil; not the happy path but listed for completeness)
-         AbortEntry(ref, WALSeq):
-         - WALSeq match required, Committed state rejected (store.go:687).
-         - Deletes dirty entry.
+Step 13b [E14; durable_hook.go:220-225, store.go:682-704]
+         (Case mutErr ≠ nil)
+         AbortEntry(ref, WALSeq) via bbolt.Batch.
+         WALSeq match required, Committed state rejected (store.go:699).
          // S1 still preserved: client receives mutErr, no ack was given.
 
-Step 10  [E12 returns]
+Step 14  [E12 returns]
          If mutErr ≠ nil, putOnCluster returns mutErr to client.
          Else returns hookErr (typically nil).
          // Client ack iff CommitEntry succeeded ⇒ S1 holds.
 
-Step 11  [E7 unlocked]
-         frag.Unlock at function exit.
+Step 15  [f.Unlock at function exit]
 
-Step 12  [E15 / flushLoop; store.go:485-533]
-         Sometime later (BatchSize threshold or FlushInterval), flushWAL runs.
-         loadFlushableBatch filters with isFlushable.
-
-Step 13  [E16; store.go:547-577]
-         flushEntries calls GORM CreateInBatches with versionedUpsertClause.
-         MySQL row written iff fence_new dominates fence_existing (store.go:799).
-         // S3 holds: lex monotonic.
-
-Step 14  [E17; store.go:751-772]
-         deleteFlushed removes only entries whose WALSeq still matches (handles the
-         case where a concurrent write since then re-Prepared the same ref).
+Step 16+ [E15..E17 flushLoop]
+         Identical to pre-#4: loadFlushableBatch + GORM upsert + deleteFlushed.
+         // S3 holds via versionedUpsertClause.
 ```
 
-**Conclusion for 6.1**: Client receives success ⟺ Step 9a executed ⟺ S1 holds for this write. S2 + S3 + S5 + S6 hold by construction at each step.
+**Concurrency improvement from #4**: between Step 5 and Step 7, no goroutine holds `f.Lock`. Concurrent SETs on different keys of the *same* fragment can therefore interleave their `PrepareEntry` fsyncs through bbolt.Batch (Optimization #1) instead of serializing on the fragment mutex. The window where the fragment lock is contended shrinks from "prepare + mutate + commit" to "verify + check + mutate", removing one fsync from the critical section.
+
+**Concurrency cost from #4**: the verify step (Step 8) adds a single `LeaseTracker.RLock` acquisition. It is uncontested 99% of the time; under a primary change the lease is being mutated under `LeaseTracker.mu.Lock` on the subscriber goroutine (`subscriber.go:178`), and verify must wait for that write lock to release. The added latency is bounded by the duration of one `Apply` call (~µs).
+
+**Conclusion for 6.1**: Client receives success ⟺ Steps 8 + 13a both executed ⟺ S1 + S5 hold for this write. S2 + S3 + S6 hold by construction at each step. The post-#4 ordering preserves every invariant from the pre-#4 proof while removing the WAL fsync from the fragment lock.
 
 ### 6.2 Durable GET miss → MySQL refill
 
@@ -890,6 +930,19 @@ Each weakness is graded **Severity** (impact on safety / liveness if exploited),
 - **Severity**: Low for correctness, High for ops.
 - **Trace**: WAL depth, prepared/committed ratios, flusher lag, last-flush time, queue full events — none are exposed. Operators cannot diagnose F5 outages until clients start failing.
 - **Hardening**: add Prometheus metrics. Phase 5 in the production plan.
+
+### 8.9 OwnerSequence post-restart seq gap (introduced by Optimization #2)
+
+- **Severity**: Low. Strict-lex MySQL upsert is gap-tolerant by design.
+- **Trace**: under reservation window N, a crash can lose up to N-1 unused seq values per `(G, E)`. The next Stamp resumes at `reservedHigh+1`.
+- **Impact on invariants**: zero — S3 requires only strict lex monotonicity, never contiguity. S6 requires only that no two records share a fence triple, which the new persistence model still guarantees because every issued seq is < reservedHigh and reservedHigh is durable before issue.
+- **Observable effect**: row `owner_seq` column in MySQL has holes. Audit tooling that assumes contiguous sequences (e.g., "count writes per primary") must be updated to use `MAX(owner_seq) - MIN(owner_seq)` instead of `COUNT(*)`.
+
+### 8.10 VerifyAfterLock widens the durable-hook interface (introduced by Optimization #4)
+
+- **Severity**: Low. The new method has a default no-op for hooks that don't perform out-of-lock prepare.
+- **Trace**: any third-party Olric fork user implementing `config.DurableHook` will fail to compile until they add `VerifyAfterLock`. This is a breaking interface change scoped to our internal fork; no external consumer exists.
+- **Recommendation**: when rebasing Olric onto a newer upstream, keep the interface addition in `config/durable.go` co-located with the rest of the durable-hook surface so the rebase diff stays minimal.
 
 ---
 
