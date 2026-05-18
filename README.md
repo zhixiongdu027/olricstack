@@ -28,10 +28,14 @@ OlricStack is a stack-based distributed KV platform prototype. Each stack is int
 - `FLUSH_BACKOFF`: optional retry backoff after a failed MySQL flush, default `1s`.
 - `FLUSH_BATCH_SIZE`: optional batch size, default `256`.
 - `WAL_PATH`: local durable dirty-write log path, default `/var/lib/olricstack/cache.wal` in `olric-node`.
+- `RESP_BIND_ADDR`: user-facing OlricStack RESP bind address, default `0.0.0.0`.
+- `RESP_BIND_PORT`: user-facing OlricStack RESP bind port, default `3321`.
+- `RESP_DEFAULT_DMAP`: hidden internal DMap used by the user RESP API, default `__default__`.
+- `RESP_COMMAND_TIMEOUT`: per-command user RESP timeout, default `5s`.
 - `HEARTBEAT_INTERVAL`: optional Watchdog heartbeat interval, default `10s`.
 - `WATCHDOG_RECONNECT_INTERVAL`: optional retry interval after subscription disconnect, default `3s`.
-- `OLRIC_BIND_ADDR`: Olric RESP/TCP bind address, default `0.0.0.0`.
-- `OLRIC_BIND_PORT`: Olric RESP/TCP bind port, default `3320`.
+- `OLRIC_BIND_ADDR`: internal Olric RESP/TCP bind address, default `0.0.0.0`.
+- `OLRIC_BIND_PORT`: internal Olric RESP/TCP bind port, default `3320`.
 - `OLRIC_MEMBERLIST_BIND_ADDR`: memberlist bind address, default `OLRIC_BIND_ADDR`.
 - `OLRIC_MEMBERLIST_BIND_PORT`: memberlist bind port, default `3322`.
 - `OLRIC_ADVERTISE_ADDR`: memberlist advertise address, default `POD_IP`.
@@ -63,7 +67,7 @@ OlricStack is a stack-based distributed KV platform prototype. Each stack is int
 
 Olric nodes do not expose a topology control port. Each node dials Watchdog and opens `Watch`, then keeps that stream alive with periodic `Heartbeat` messages. Watchdog pushes `TopologyEnvelope` updates only on the existing node-owned stream.
 
-The durable data-plane business API is the OlricStack string KV proxy layer running in the same process as Olric. It receives client `GET`, `SET`, `DEL`, and `EXPIRE` requests, writes the local WAL before applying Olric mutations, and lets the asynchronous flusher write MySQL. The native Olric RESP/TCP server on port `3320` remains available for cache/development use, but native DMap commands are not the durable MySQL contract. Memberlist gossip uses port `3322`.
+The durable data-plane business API is the OlricStack string KV proxy layer running in the same process as Olric. The user-facing RESP API listens on port `3321` and supports `GET`, `SET`, `DEL`, `EXPIRE`, `PING`, and `HELLO 3`. These commands are routed through `stringkv.Service` into a hidden default DMap, so clients do not use Olric native `DM.*` commands. The native Olric RESP/TCP server on port `3320` remains an internal node-to-node endpoint. Memberlist gossip uses port `3322`.
 
 This keeps the control plane decoupled from node network reachability and gives Watchdog a direct liveness signal. If heartbeats stop for the configured TTL, Watchdog prunes the node and advances the topology epoch.
 
@@ -107,10 +111,10 @@ Watchdog reconciles Pod observations by Pod name first and only falls back to Po
 
 The bootstrap Operator creates only the Watchdog Deployment/Service for each `OlricStack`. Each Watchdog then reads its own `OlricStack` and reconciles that stack's Olric StatefulSet and headless Service. This keeps high-frequency Olric control local to the stack and reduces pressure on the global Operator.
 
-The Olric headless Service is an internal cluster/memberlist endpoint, not the
-durable business API. Durable clients must enter through the string KV service
-boundary once an external transport is bound; calling the native Olric port
-directly bypasses the first serving-lease gate.
+The Olric headless Service is the StatefulSet governing Service and exposes
+only the user RESP port `3321`. Watchdog still distributes Pod IP topology for
+Olric internal communication; clients should use the RESP API and must not call
+Olric native `DM.*` commands directly.
 
 Install the CRD and RBAC:
 

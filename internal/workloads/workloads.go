@@ -24,6 +24,7 @@ const (
 
 	WatchdogPort   = int32(8081)
 	OlricPort      = int32(3320)
+	RESPPort       = int32(3321)
 	MemberlistPort = int32(3322)
 
 	OlricDataVolumeName = "olric-data"
@@ -178,13 +179,9 @@ func OlricHeadlessService(stack *olricv1alpha1.OlricStack) *corev1.Service {
 			ClusterIP: "None",
 			Selector:  labels,
 			Ports: []corev1.ServicePort{{
-				Name:       "olric",
-				Port:       OlricPort,
-				TargetPort: intstr.FromInt32(OlricPort),
-			}, {
-				Name:       "memberlist",
-				Port:       MemberlistPort,
-				TargetPort: intstr.FromInt32(MemberlistPort),
+				Name:       "resp",
+				Port:       RESPPort,
+				TargetPort: intstr.FromInt32(RESPPort),
 			}},
 		},
 	}
@@ -215,8 +212,11 @@ func OlricStatefulSet(stack *olricv1alpha1.OlricStack) *appsv1.StatefulSet {
 						Image:     valueOrDefault(stack.Spec.Image, DefaultNodeImage),
 						Resources: stack.Spec.Resources,
 						Ports: []corev1.ContainerPort{{
-							Name:          "olric",
+							Name:          "olric-internal",
 							ContainerPort: OlricPort,
+						}, {
+							Name:          "resp",
+							ContainerPort: RESPPort,
 						}, {
 							Name:          "memberlist",
 							ContainerPort: MemberlistPort,
@@ -237,6 +237,8 @@ func OlricStatefulSet(stack *olricv1alpha1.OlricStack) *appsv1.StatefulSet {
 							{Name: "WAL_PATH", Value: "/var/lib/olricstack/cache.wal"},
 							{Name: "OLRIC_BIND_ADDR", Value: "0.0.0.0"},
 							{Name: "OLRIC_BIND_PORT", Value: fmt.Sprintf("%d", OlricPort)},
+							{Name: "RESP_BIND_ADDR", Value: "0.0.0.0"},
+							{Name: "RESP_BIND_PORT", Value: fmt.Sprintf("%d", RESPPort)},
 							{Name: "OLRIC_MEMBERLIST_BIND_ADDR", Value: "0.0.0.0"},
 							{Name: "OLRIC_MEMBERLIST_BIND_PORT", Value: fmt.Sprintf("%d", MemberlistPort)},
 							{Name: "OLRIC_MEMBERLIST_ENV", Value: "lan"},

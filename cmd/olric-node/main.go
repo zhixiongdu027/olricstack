@@ -88,10 +88,20 @@ func main() {
 		if err != nil {
 			log.Fatalf("create string kv olric provider: %v", err)
 		}
-		if _, err := stringkv.NewService(provider, topologyLease); err != nil {
+		stringService, err := stringkv.NewService(provider, topologyLease)
+		if err != nil {
 			log.Fatalf("create string kv service: %v", err)
 		}
-		log.Printf("durable string kv service initialized; external API binding is pending")
+		respAddr := net.JoinHostPort(envString("RESP_BIND_ADDR", "0.0.0.0"), strconv.Itoa(envInt("RESP_BIND_PORT", 3321)))
+		go func() {
+			if err := stringkv.ServeRESP(ctx, stringService, stringkv.RESPServerConfig{
+				Addr:           respAddr,
+				DefaultDMap:    envString("RESP_DEFAULT_DMAP", stringkv.DefaultDMap),
+				CommandTimeout: envDuration("RESP_COMMAND_TIMEOUT", 5*time.Second),
+			}); err != nil {
+				log.Printf("string kv RESP service stopped: %v", err)
+			}
+		}()
 	}
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -101,11 +111,13 @@ func main() {
 		}
 	}()
 
-	log.Printf("olric node bootstrap complete stack_id=%q watchdog=%q olric_addr=%s:%d memberlist=%s:%d",
+	log.Printf("olric node bootstrap complete stack_id=%q watchdog=%q olric_internal=%s:%d resp=%s:%d memberlist=%s:%d",
 		os.Getenv("STACK_ID"),
 		os.Getenv("WATCHDOG_SVC_NAME"),
 		envString("OLRIC_BIND_ADDR", "0.0.0.0"),
 		envInt("OLRIC_BIND_PORT", 3320),
+		envString("RESP_BIND_ADDR", "0.0.0.0"),
+		envInt("RESP_BIND_PORT", 3321),
 		envString("OLRIC_MEMBERLIST_BIND_ADDR", envString("OLRIC_BIND_ADDR", "0.0.0.0")),
 		envInt("OLRIC_MEMBERLIST_BIND_PORT", 3322),
 	)

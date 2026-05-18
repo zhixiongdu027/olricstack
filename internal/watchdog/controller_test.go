@@ -66,12 +66,15 @@ func TestControllerReconcilesOlricResourcesForOwnStack(t *testing.T) {
 		t.Fatalf("expected WAL volume mount, got %#v", mounts)
 	}
 	ports := statefulSet.Spec.Template.Spec.Containers[0].Ports
-	if len(ports) != 2 || ports[0].Name != "olric" || ports[0].ContainerPort != workloads.OlricPort || ports[1].Name != "memberlist" || ports[1].ContainerPort != workloads.MemberlistPort {
-		t.Fatalf("expected Olric and memberlist ports, got %#v", ports)
+	if len(ports) != 3 ||
+		ports[0].Name != "olric-internal" || ports[0].ContainerPort != workloads.OlricPort ||
+		ports[1].Name != "resp" || ports[1].ContainerPort != workloads.RESPPort ||
+		ports[2].Name != "memberlist" || ports[2].ContainerPort != workloads.MemberlistPort {
+		t.Fatalf("expected Olric internal, RESP and memberlist ports, got %#v", ports)
 	}
 	env := envMap(statefulSet.Spec.Template.Spec.Containers[0].Env)
-	if env["OLRIC_BIND_PORT"].Value != "3320" || env["OLRIC_MEMBERLIST_BIND_PORT"].Value != "3322" {
-		t.Fatalf("expected Olric port env vars, got %#v", env)
+	if env["OLRIC_BIND_PORT"].Value != "3320" || env["RESP_BIND_PORT"].Value != "3321" || env["OLRIC_MEMBERLIST_BIND_PORT"].Value != "3322" {
+		t.Fatalf("expected Olric, RESP and memberlist port env vars, got %#v", env)
 	}
 
 	var service corev1.Service
@@ -82,10 +85,10 @@ func TestControllerReconcilesOlricResourcesForOwnStack(t *testing.T) {
 		t.Fatalf("expected headless service, got clusterIP %q", service.Spec.ClusterIP)
 	}
 	if service.Annotations[workloads.AnnotationServiceScope] != workloads.ServiceScopeInternal {
-		t.Fatalf("expected internal-only Olric service annotation, got %#v", service.Annotations)
+		t.Fatalf("expected internal governing service annotation, got %#v", service.Annotations)
 	}
-	if len(service.Spec.Ports) != 2 || service.Spec.Ports[0].Name != "olric" || service.Spec.Ports[0].Port != workloads.OlricPort || service.Spec.Ports[1].Name != "memberlist" || service.Spec.Ports[1].Port != workloads.MemberlistPort {
-		t.Fatalf("expected Olric and memberlist service ports, got %#v", service.Spec.Ports)
+	if len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Name != "resp" || service.Spec.Ports[0].Port != workloads.RESPPort {
+		t.Fatalf("expected RESP service port only, got %#v", service.Spec.Ports)
 	}
 }
 
