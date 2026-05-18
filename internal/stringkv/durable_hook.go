@@ -17,6 +17,11 @@ import (
 // without spinning up a full topology subscription.
 type FenceLease interface {
 	SnapshotForWrite(now time.Time) (generation, epoch int64, ok bool)
+	// VerifyFence re-validates a previously snapshotted fence under the
+	// current lease. It is the in-lock barrier used by the fork after it
+	// acquires the per-fragment write lock and before it performs the
+	// in-memory mutation. See LeaseTracker.VerifyFence.
+	VerifyFence(generation, epoch int64, now time.Time) bool
 }
 
 // FenceSequencer issues monotonic owner sequences within a fence
@@ -84,6 +89,9 @@ func (h *DurableHook) BeforeSet(ctx context.Context, op olricconfig.DurableOpera
 		return op, err
 	}
 	op.Version = prepared.WALSeq
+	op.FenceGeneration = record.Generation
+	op.FenceEpoch = record.Epoch
+	op.FenceOwnerSeq = record.OwnerSeq
 	return op, nil
 }
 
@@ -113,6 +121,9 @@ func (h *DurableHook) BeforeDelete(ctx context.Context, op olricconfig.DurableOp
 		return op, err
 	}
 	op.Version = prepared.WALSeq
+	op.FenceGeneration = g
+	op.FenceEpoch = e
+	op.FenceOwnerSeq = s
 	return op, nil
 }
 
@@ -133,11 +144,34 @@ func (h *DurableHook) BeforeExpire(ctx context.Context, op olricconfig.DurableOp
 		return op, err
 	}
 	op.Version = prepared.WALSeq
+	op.FenceGeneration = record.Generation
+	op.FenceEpoch = record.Epoch
+	op.FenceOwnerSeq = record.OwnerSeq
 	return op, nil
 }
 
 func (h *DurableHook) AfterExpire(ctx context.Context, op olricconfig.DurableOperation, mutationErr error) error {
 	return h.finalize(ctx, op, mutationErr)
+}
+
+// VerifyAfterLock re-validates the fence previously stamped by BeforeSet /
+// BeforeDelete / BeforeExpire. It is called by the fork inside the per-
+// fragment lock immediately before the in-memory mutation. The check is the
+// last barrier preserving S5: if leadership moved or the lease expired
+// between the prepared WAL append and the lock acquisition, the prepared
+// record must be aborted (the fork follows a non-nil return with an
+// AfterX(op, err) call which routes through finalize -> AbortEntry).
+//
+// Hooks that did not stamp a fence (op.FenceGeneration == 0) get a no-op:
+// VerifyAfterLock only matters when there is a prepared record to abort.
+func (h *DurableHook) VerifyAfterLock(ctx context.Context, op olricconfig.DurableOperation) error {
+	if op.FenceGeneration == 0 {
+		return nil
+	}
+	if !h.lease.VerifyFence(op.FenceGeneration, op.FenceEpoch, h.now()) {
+		return ErrLeaseExpired
+	}
+	return nil
 }
 
 func (h *DurableHook) LoadOnMiss(ctx context.Context, op olricconfig.DurableOperation) (olricstorage.Entry, error) {

@@ -295,78 +295,117 @@ func (dm *DMap) putOnCluster(e *env) error {
 	if err != nil {
 		return err
 	}
-
 	e.fragment = f
+
+	hook := dm.s.config.DurableHook
+	isExpire := e.putConfig.OnlyUpdateTTL
+
+	// For client_set we prepare the durable record OUTSIDE the fragment lock.
+	// PrepareEntry performs the WAL fsync; moving it out of the critical
+	// section lets sibling writes on the same fragment proceed concurrently
+	// with the fsync. Safety is preserved by the VerifyAfterLock barrier
+	// below: if the lease moved between prepare and lock acquisition the
+	// prepared record is aborted before any in-memory or replica mutation.
+	//
+	// client_expire is NOT moved: BeforeExpire reads the current resident
+	// entry from f.storage to seed its fence, which requires the lock. The
+	// expire path stays in its original in-lock order below.
+	if dm.config != nil && dm.config.ttlDuration.Seconds() != 0 && e.timeout.Seconds() == 0 {
+		e.timeout = dm.config.ttlDuration
+	}
+	nt := dm.prepareEntry(e)
+
+	var (
+		outOfLockOp       config.DurableOperation
+		outOfLockPrepared bool
+	)
+	if hook != nil && !isExpire {
+		outOfLockOp = config.DurableOperation{
+			DMap:        e.dmap,
+			Key:         e.key,
+			HKey:        e.hkey,
+			PartitionID: dm.s.primary.PartitionIDByHKey(e.hkey),
+			Origin:      "client_set",
+			Entry:       nt,
+		}
+		outOfLockOp, err = hook.BeforeSet(e.ctx, outOfLockOp)
+		if err != nil {
+			return err
+		}
+		outOfLockPrepared = true
+	}
+
 	f.Lock()
 	defer f.Unlock()
 
+	if hook != nil && outOfLockPrepared {
+		if vErr := hook.VerifyAfterLock(e.ctx, outOfLockOp); vErr != nil {
+			// Lease moved between prepare and lock. Abort the prepared
+			// record by routing through AfterSet with the verify error.
+			_ = hook.AfterSet(e.ctx, outOfLockOp, vErr)
+			return vErr
+		}
+	}
+
 	if err = dm.checkPutConditions(e); err != nil {
+		if hook != nil && outOfLockPrepared {
+			_ = hook.AfterSet(e.ctx, outOfLockOp, err)
+		}
 		return err
 	}
 
-	if dm.config != nil {
-		if dm.config.ttlDuration.Seconds() != 0 && e.timeout.Seconds() == 0 {
-			e.timeout = dm.config.ttlDuration
-		}
-		if dm.config.evictionPolicy == config.LRUEviction {
-			if err = dm.setLRUEvictionStats(e); err != nil {
-				return err
+	if dm.config != nil && dm.config.evictionPolicy == config.LRUEviction {
+		if err = dm.setLRUEvictionStats(e); err != nil {
+			if hook != nil && outOfLockPrepared {
+				_ = hook.AfterSet(e.ctx, outOfLockOp, err)
 			}
+			return err
 		}
 	}
 
-	nt := dm.prepareEntry(e)
-	if dm.s.config.DurableHook != nil {
+	if hook != nil && isExpire {
+		// Expire keeps the original in-lock prepare+commit ordering because
+		// the prepared TTL depends on the resident entry's value/timestamp.
+		current, gerr := f.storage.Get(e.hkey)
+		if gerr != nil {
+			if errors.Is(gerr, storage.ErrKeyNotFound) {
+				gerr = ErrKeyNotFound
+			}
+			return gerr
+		}
+		current.SetTTL(nt.TTL())
+		current.SetTimestamp(nt.Timestamp())
+		current.SetLastAccess(nt.LastAccess())
 		op := config.DurableOperation{
 			DMap:        e.dmap,
 			Key:         e.key,
 			HKey:        e.hkey,
 			PartitionID: dm.s.primary.PartitionIDByHKey(e.hkey),
-			Entry:       nt,
+			Origin:      "client_expire",
+			Entry:       current,
+			TTL:         e.timeout,
 		}
-		isExpire := e.putConfig.OnlyUpdateTTL
-		if isExpire {
-			current, gerr := f.storage.Get(e.hkey)
-			if gerr != nil {
-				if errors.Is(gerr, storage.ErrKeyNotFound) {
-					gerr = ErrKeyNotFound
-				}
-				return gerr
-			}
-			current.SetTTL(nt.TTL())
-			current.SetTimestamp(nt.Timestamp())
-			current.SetLastAccess(nt.LastAccess())
-			op.Entry = current
-			op.Origin = "client_expire"
-			op.TTL = e.timeout
-			op, err = dm.s.config.DurableHook.BeforeExpire(e.ctx, op)
-			if err != nil {
-				return err
-			}
-		} else {
-			op.Origin = "client_set"
-			op, err = dm.s.config.DurableHook.BeforeSet(e.ctx, op)
-			if err != nil {
-				return err
-			}
+		op, err = hook.BeforeExpire(e.ctx, op)
+		if err != nil {
+			return err
 		}
-		// putOnClusterAfterDurable performs the in-memory mutation and any
-		// quorum/replication step. AfterX MUST run regardless of mutErr so the
-		// hook can commit on success or abort the prepared durable record on
-		// failure. Returning early here would leak prepared WAL state.
 		mutErr := dm.putOnClusterAfterDurable(e, nt)
-		var hookErr error
-		if isExpire {
-			hookErr = dm.s.config.DurableHook.AfterExpire(e.ctx, op, mutErr)
-		} else {
-			hookErr = dm.s.config.DurableHook.AfterSet(e.ctx, op, mutErr)
-		}
+		hookErr := hook.AfterExpire(e.ctx, op, mutErr)
 		if mutErr != nil {
 			return mutErr
 		}
 		return hookErr
 	}
-	return dm.putOnClusterAfterDurable(e, nt)
+
+	mutErr := dm.putOnClusterAfterDurable(e, nt)
+	if hook != nil && outOfLockPrepared {
+		hookErr := hook.AfterSet(e.ctx, outOfLockOp, mutErr)
+		if mutErr != nil {
+			return mutErr
+		}
+		return hookErr
+	}
+	return mutErr
 }
 
 func (dm *DMap) putOnClusterAfterDurable(e *env, nt storage.Entry) error {

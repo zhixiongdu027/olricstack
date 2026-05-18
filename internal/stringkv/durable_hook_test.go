@@ -290,6 +290,23 @@ func (l *fakeFenceLease) SnapshotForWrite(time.Time) (int64, int64, bool) {
 	return l.g, l.e, l.ok
 }
 
+// VerifyFence mirrors LeaseTracker.VerifyFence for tests. It refuses when
+// the lease is not currently servable, the snapshotted generation does not
+// match (leadership change), or the current epoch has fallen behind the
+// snapshotted one (impossible in production but trivial to detect here).
+func (l *fakeFenceLease) VerifyFence(g, e int64, _ time.Time) bool {
+	if !l.ok {
+		return false
+	}
+	if l.g != g {
+		return false
+	}
+	if l.e < e {
+		return false
+	}
+	return true
+}
+
 type fakeFenceSequencer struct {
 	g, e, s int64
 	calls   int
@@ -314,4 +331,97 @@ func recordHasFlushIntent(r store.EntryRecord) bool {
 	// representation; the original "intent" is encoded by Origin so we just
 	// confirm the record was created with a client-origin tag.
 	return r.Origin == "client_set" || r.Origin == "client_expire" || r.Origin == "client_delete"
+}
+
+// TestDurableHookVerifyAfterLockPassesWhenFenceUnchanged covers the steady-
+// state case: BeforeSet stamps a fence, the fork acquires the fragment lock,
+// VerifyAfterLock confirms the fence is still current, and the prepared
+// record is committed normally by AfterSet.
+func TestDurableHookVerifyAfterLockPassesWhenFenceUnchanged(t *testing.T) {
+	backing := newRecordingCommitStore()
+	hook := newTestDurableHook(t, backing, fenceAt(7, 3))
+
+	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+		DMap:  "users",
+		Key:   "alice",
+		HKey:  HKey("users", "alice"),
+		Entry: newTestEntry("alice", "A", 0, 1),
+	})
+	if err != nil {
+		t.Fatalf("before set: %v", err)
+	}
+	if op.FenceGeneration != 7 || op.FenceEpoch != 3 {
+		t.Fatalf("expected fence (7,3) on op, got (%d,%d)", op.FenceGeneration, op.FenceEpoch)
+	}
+
+	if err := hook.VerifyAfterLock(context.Background(), op); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if err := hook.AfterSet(context.Background(), op, nil); err != nil {
+		t.Fatalf("after set: %v", err)
+	}
+}
+
+// TestDurableHookVerifyAfterLockRejectsLeaseRevocation covers the failover
+// race: BeforeSet stamps a fence, then the lease is revoked (or leadership
+// moves) before the fork acquires the fragment lock. VerifyAfterLock must
+// refuse so the fork can abort the prepared record without acknowledging
+// the write.
+func TestDurableHookVerifyAfterLockRejectsLeaseRevocation(t *testing.T) {
+	backing := newRecordingCommitStore()
+	lease := fenceAt(7, 3)
+	hook := newTestDurableHook(t, backing, lease)
+
+	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+		DMap:  "users",
+		Key:   "alice",
+		HKey:  HKey("users", "alice"),
+		Entry: newTestEntry("alice", "A", 0, 1),
+	})
+	if err != nil {
+		t.Fatalf("before set: %v", err)
+	}
+
+	// Simulate a demote between prepare and lock acquisition.
+	lease.ok = false
+
+	if err := hook.VerifyAfterLock(context.Background(), op); !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("expected ErrLeaseExpired from verify, got %v", err)
+	}
+
+	// The fork would now call AfterSet(op, vErr) which routes to AbortEntry.
+	if err := hook.AfterSet(context.Background(), op, ErrLeaseExpired); err != nil {
+		t.Fatalf("after set with verify error: %v", err)
+	}
+	for ref := range backing.records {
+		t.Fatalf("aborted prepare must not leave a WAL record, found %v", ref)
+	}
+}
+
+// TestDurableHookVerifyAfterLockRejectsGenerationChange catches the more
+// subtle failover: lease still says "valid", but the new envelope advanced
+// the generation (i.e. a new PRIMARY took over). The prepared record's fence
+// is from the OLD primary and must not be acknowledged.
+func TestDurableHookVerifyAfterLockRejectsGenerationChange(t *testing.T) {
+	backing := newRecordingCommitStore()
+	lease := fenceAt(7, 3)
+	hook := newTestDurableHook(t, backing, lease)
+
+	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+		DMap:  "users",
+		Key:   "alice",
+		HKey:  HKey("users", "alice"),
+		Entry: newTestEntry("alice", "A", 0, 1),
+	})
+	if err != nil {
+		t.Fatalf("before set: %v", err)
+	}
+
+	// New primary advanced the generation. lease.ok is still true.
+	lease.g = 8
+	lease.e = 0
+
+	if err := hook.VerifyAfterLock(context.Background(), op); !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("expected ErrLeaseExpired on generation change, got %v", err)
+	}
 }

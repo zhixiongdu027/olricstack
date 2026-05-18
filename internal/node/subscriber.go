@@ -242,6 +242,38 @@ func (l *LeaseTracker) WaitExpired(ctx context.Context, pollInterval time.Durati
 	}
 }
 
+// VerifyFence checks that a fence (generation, epoch) snapshotted earlier is
+// still compatible with the current lease at time `now`. It is the in-lock
+// re-validation barrier used by hooks that prepare a durable record outside
+// the fragment lock and want to commit it inside.
+//
+// Compatible means:
+//
+//   - The lease has not expired (validUntil > now).
+//   - The current generation has not changed since the snapshot. A generation
+//     bump means leadership moved to a different PRIMARY; a record stamped
+//     under the old PRIMARY must not be acknowledged.
+//   - The current epoch is >= snapshotted epoch. A monotonic epoch advance
+//     under the same PRIMARY is harmless because the fence triple at MySQL
+//     remains lex-comparable.
+//
+// VerifyFence does not return the new (G, E): callers should re-snapshot if
+// they need fresh values.
+func (l *LeaseTracker) VerifyFence(generation, epoch int64, now time.Time) bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.validUntilUnixMs <= now.UnixMilli() {
+		return false
+	}
+	if l.generation != generation {
+		return false
+	}
+	if l.epoch < epoch {
+		return false
+	}
+	return true
+}
+
 func shouldRevokeLease(err error) bool {
 	return errors.Is(err, ErrTopologyLeaseExpired) ||
 		errors.Is(err, ErrTopologyNotPrimary) ||

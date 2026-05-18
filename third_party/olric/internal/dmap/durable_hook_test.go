@@ -137,7 +137,7 @@ func (h *recordingDurableHook) BeforeSet(ctx context.Context, op config.DurableO
 	return op, nil
 }
 
-func (h *recordingDurableHook) AfterSet(ctx context.Context, op config.DurableOperation) error {
+func (h *recordingDurableHook) AfterSet(ctx context.Context, op config.DurableOperation, mutationErr error) error {
 	return nil
 }
 
@@ -146,7 +146,7 @@ func (h *recordingDurableHook) BeforeDelete(ctx context.Context, op config.Durab
 	return op, nil
 }
 
-func (h *recordingDurableHook) AfterDelete(ctx context.Context, op config.DurableOperation) error {
+func (h *recordingDurableHook) AfterDelete(ctx context.Context, op config.DurableOperation, mutationErr error) error {
 	return nil
 }
 
@@ -155,7 +155,11 @@ func (h *recordingDurableHook) BeforeExpire(ctx context.Context, op config.Durab
 	return op, nil
 }
 
-func (h *recordingDurableHook) AfterExpire(ctx context.Context, op config.DurableOperation) error {
+func (h *recordingDurableHook) AfterExpire(ctx context.Context, op config.DurableOperation, mutationErr error) error {
+	return nil
+}
+
+func (h *recordingDurableHook) VerifyAfterLock(ctx context.Context, op config.DurableOperation) error {
 	return nil
 }
 

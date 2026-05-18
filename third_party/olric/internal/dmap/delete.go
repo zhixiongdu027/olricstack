@@ -130,10 +130,12 @@ func (dm *DMap) deleteKey(ctx context.Context, key string) error {
 	f.Lock()
 	defer f.Unlock()
 
+	hook := dm.s.config.DurableHook
+
 	// Check the HKey before trying to delete it.
 	if !f.storage.Check(hkey) {
-		if dm.s.config.DurableHook != nil {
-			op, err := dm.s.config.DurableHook.BeforeDelete(ctx, config.DurableOperation{
+		if hook != nil {
+			op, err := hook.BeforeDelete(ctx, config.DurableOperation{
 				DMap:        dm.name,
 				Key:         key,
 				HKey:        hkey,
@@ -143,10 +145,14 @@ func (dm *DMap) deleteKey(ctx context.Context, key string) error {
 			if err != nil {
 				return err
 			}
+			if vErr := hook.VerifyAfterLock(ctx, op); vErr != nil {
+				_ = hook.AfterDelete(ctx, op, vErr)
+				return vErr
+			}
 			// Storage held no entry: the in-memory operation is a no-op, so
 			// from the cluster's perspective the mutation succeeded. We pass a
 			// nil mutErr so the hook can commit the tombstone it prepared.
-			if err := dm.s.config.DurableHook.AfterDelete(ctx, op, nil); err != nil {
+			if err := hook.AfterDelete(ctx, op, nil); err != nil {
 				return err
 			}
 		}
@@ -154,8 +160,8 @@ func (dm *DMap) deleteKey(ctx context.Context, key string) error {
 		DeleteMisses.Increase(1)
 		return nil
 	}
-	if dm.s.config.DurableHook != nil {
-		op, err := dm.s.config.DurableHook.BeforeDelete(ctx, config.DurableOperation{
+	if hook != nil {
+		op, err := hook.BeforeDelete(ctx, config.DurableOperation{
 			DMap:        dm.name,
 			Key:         key,
 			HKey:        hkey,
@@ -165,10 +171,14 @@ func (dm *DMap) deleteKey(ctx context.Context, key string) error {
 		if err != nil {
 			return err
 		}
+		if vErr := hook.VerifyAfterLock(ctx, op); vErr != nil {
+			_ = hook.AfterDelete(ctx, op, vErr)
+			return vErr
+		}
 		// AfterDelete MUST run regardless of the in-memory/quorum result so
 		// the hook can abort the prepared tombstone if deleteOnCluster failed.
 		mutErr := dm.deleteOnCluster(hkey, key, f)
-		hookErr := dm.s.config.DurableHook.AfterDelete(ctx, op, mutErr)
+		hookErr := hook.AfterDelete(ctx, op, mutErr)
 		if mutErr != nil {
 			return mutErr
 		}
