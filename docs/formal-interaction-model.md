@@ -41,6 +41,14 @@ This document was first written at revision `aacaeee` against `9d440be`. The opt
 
 Optimization #3 (merging owner_seq.bolt and cache.wal into one bbolt) is deferred until #1/#2/#4 prove stable in production.
 
+### Review audit 2026-05-18 (revision `de781c1`)
+
+A re-walk against the live tree confirmed every code anchor in §6/§7 still resolves and every invariant in §4/§5 still holds. Three documentation-precision deltas surfaced; they do not affect correctness but were folded into this revision to keep future re-walks accurate:
+
+- **§1 Ingress binding note** added. `stringkv.Service` is instantiated but the returned value is discarded — no external listener calls it yet. The proofs hold as a pre-condition for binding, not as a statement that clients can reach the system today.
+- **§S5 delete/expire `VerifyAfterLock`** description tightened. Earlier text called it a "no-op when the fence was stamped under the same lock"; in fact `LeaseTracker.mu` and `frag.lock` are independent mutexes, so the verify call closes a small but real interleaving window. Replaced with the precise statement.
+- **§8.1 Trace B** added. Verify-fail / pre-condition-fail paths route through `_ = hook.AfterX(...)` (`put.go:345,352,360`, `delete.go:149,175`) — if the abort's bbolt write fails, the error is swallowed and a Prepared orphan persists silently. Added hardening item #3 to surface these errors at the source.
+
 ---
 
 ## §1 Component Boundary
@@ -96,6 +104,15 @@ The four interaction edges audited here:
 | Ingress→Olric | `stringkv.Service` → Olric `DMap` | `internal/stringkv/service.go:51`, `olric_adapter.go:39` |
 | Olric→Hook | Fork `dmap.put/get/delete` → `DurableHook` | `third_party/olric/internal/dmap/put.go:319`, `delete.go:135`, `get.go:379` |
 | Hook→MySQL | `DurableHook` → WAL → `flushLoop` → MySQL | `internal/stringkv/durable_hook.go:74`, `internal/store/store.go:485,547` |
+
+**Ingress binding status (as of `2d55fec`)**: `stringkv.Service` is constructed in
+`cmd/olric-node/main.go:87-89` but the returned value is discarded with `_` — no
+external listener (gRPC, RESP, or HTTP) calls into it yet. The proofs below
+treat the Ingress→Olric edge as the contract that *will* serve clients once a
+listener is bound; everything they prove about lease gating, fence stamping
+and two-phase commit holds the moment a transport invokes `Service.Get/Set/
+Delete/Expire`. This document is a correctness pre-condition for binding the
+listener, not a claim that clients are reachable today.
 
 ---
 
@@ -261,7 +278,7 @@ Stated as predicates over all reachable states. Each is proved (forward, golden 
 
 This preserves S5 by reduction: even though the fence was stamped without the fragment lock, no acknowledged write exists without the fork holding `frag.Lock()` AND the lease still owning the same `(L.gen, L.epoch)` it had at stamp time. The post-stamp window is bounded by the verify check, not by hope.
 
-`client_delete` and `client_expire` keep the original in-lock `BeforeX` ordering (delete because tombstone fence depends on lock-protected `f.storage.Check`; expire because TTL fence depends on lock-protected `f.storage.Get`). They still call `VerifyAfterLock` defensively — a no-op when the fence was stamped under the same lock, but cheap insurance against future refactors.
+`client_delete` and `client_expire` keep the original in-lock `BeforeX` ordering (delete because tombstone fence depends on lock-protected `f.storage.Check`; expire because TTL fence depends on lock-protected `f.storage.Get`). They still call `VerifyAfterLock`, and the call is **not a no-op** even on these paths: `stampFence` acquires `LeaseTracker.mu.RLock` (`subscriber.go:218`), releases it on `BeforeDelete/BeforeExpire` return, and `VerifyAfterLock` re-acquires it (`subscriber.go:263`). Between those two read-lock windows a `Subscriber.Apply` goroutine can take `LeaseTracker.mu.Lock()` and rotate `(gen, epoch)`. The verify call closes that small but real interleaving window — fragment lock and lease-tracker lock are independent mutexes, so holding the former does not freeze the latter.
 
 ### S6 — One owner-fenced write per acknowledged primary mutation
 
@@ -860,13 +877,15 @@ Each weakness is graded **Severity** (impact on safety / liveness if exploited),
 
 - **Severity**: Low. Records cannot reach MySQL (`isFlushable`), cannot be reused by Replay, and are overwritten on the next write to the same key. No invariant violated.
 - **Detectability**: Low. There is no metric for `WALStatePrepared` count. Bbolt growth is the only indirect signal.
-- **Trace**: §6.4 Cβ. Process dies after `PrepareEntry` (`store.go:600`) but before `CommitEntry` or `AbortEntry` (`store.go:639`/`670`).
+- **Trace A — crash mid-mutation**: §6.4 Cβ. Process dies after `PrepareEntry` (`store.go:600`) but before `CommitEntry` or `AbortEntry` (`store.go:639`/`670`).
+- **Trace B — verify-fail with abort I/O failure (added in this audit)**: `BeforeSet` succeeds; the fork acquires `frag.Lock()`; `VerifyAfterLock` returns non-nil (lease moved). The fork routes through `_ = hook.AfterSet(e.ctx, op, vErr)` (`put.go:345`, mirrored at `delete.go:149,175`). `AfterSet → finalize → AbortEntry` runs in `bbolt.Batch`; if the bbolt write fails (disk full, fsync error, db closing), the error is silently swallowed by the leading `_ =`. The prepared record stays in the WAL with no caller aware of the leak. Same story for `checkPutConditions` / `setLRUEvictionStats` failure branches at `put.go:352, 360`.
 - **Defenses already in place**: `Replay` skips Prepared (`store.go:283`), `PurgeBelowGeneration` skips Prepared (`store.go:249`), `isFlushable` rejects Prepared (`store.go:851`).
 - **Hardening**:
-  1. **Boot-time sweep**: at `MySQLStore.Start`, walk dirty bucket once and Abort all `Prepared` records older than some retention (their fragment was never reached by `AfterSet` for this process; safe to drop).
+  1. **Boot-time sweep**: at `MySQLStore.Start`, walk dirty bucket once and Abort all `Prepared` records older than some retention (their fragment was never reached by `AfterSet` for this process; safe to drop). This also covers Trace B since the orphan persists across restart.
   2. **Metric**: expose `wal_prepared_count` so operators can alert on stuck preparations.
-  3. **TTL on Prepared**: stamp `PreparedAt` and reject Commit/Abort past TTL. Risky — would have to tie into request timeout.
-- **Recommendation**: implement #1 + #2. #3 introduces failure modes worth more than the marginal safety win.
+  3. **Surface AfterX errors from the fork**: replace `_ = hook.AfterX(...)` with logged failure handling (requires plumbing a logger into the fork's `dmap` package) so Trace B becomes observable in real time, not just at the next restart sweep.
+  4. **TTL on Prepared**: stamp `PreparedAt` and reject Commit/Abort past TTL. Risky — would have to tie into request timeout.
+- **Recommendation**: implement #1 + #2 first (closes both traces with no fork churn). #3 is a fork edit, schedule with the next fork-rebase. #4 introduces failure modes worth more than the marginal safety win.
 
 ### 8.2 50 ms drain window in `closeSubscribersForLeadershipChange`
 
