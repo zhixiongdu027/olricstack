@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -844,4 +845,71 @@ func testFencedRecord(key string, hkey uint64, value []byte, generation, epoch, 
 	record.OwnerSeq = ownerSeq
 	record.UpdatedAt = time.Now().UTC()
 	return record
+}
+
+// TestMySQLStoreBatchedPreparesAreConcurrentSafe stresses the bbolt.Batch
+// migration: many goroutines call PrepareEntry concurrently against distinct
+// keys. The test verifies (1) every prepare returns a unique WALSeq and (2)
+// every committed record is durably visible. If Batch idempotency were
+// broken (e.g. nextWALSeq side-effects clashing across retried closures),
+// either two records would share a WALSeq or one would be silently lost.
+func TestMySQLStoreBatchedPreparesAreConcurrentSafe(t *testing.T) {
+	cacheStore := newTestStore(t, Config{
+		QueueSize:     1024,
+		FlushInterval: time.Hour, // disable timed flush; we want WAL inspection
+		BatchSize:     1024,
+	})
+	defer closeStore(t, cacheStore)
+
+	const writers = 32
+	const perWriter = 16
+	var wg sync.WaitGroup
+	type result struct {
+		ref    EntryRef
+		walSeq int64
+	}
+	results := make(chan result, writers*perWriter)
+	errs := make(chan error, writers*perWriter)
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(writer int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				key := fmt.Sprintf("w%d-k%d", writer, i)
+				hkey := uint64(writer*1000 + i + 1)
+				rec := testFlushableRecord(key, hkey, []byte(key))
+				rec.WALState = WALStatePrepared
+				rec.FlushMySQL = false
+				prepared, err := cacheStore.PrepareEntry(context.Background(), rec)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if err := cacheStore.CommitEntry(context.Background(), prepared.Ref(), prepared.WALSeq); err != nil {
+					errs <- err
+					return
+				}
+				results <- result{ref: prepared.Ref(), walSeq: prepared.WALSeq}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("concurrent prepare/commit: %v", err)
+	}
+
+	seen := make(map[int64]EntryRef, writers*perWriter)
+	for r := range results {
+		if prev, ok := seen[r.walSeq]; ok {
+			t.Fatalf("duplicate WALSeq %d for refs %+v and %+v", r.walSeq, prev, r.ref)
+		}
+		seen[r.walSeq] = r.ref
+	}
+	if got, want := len(seen), writers*perWriter; got != want {
+		t.Fatalf("expected %d distinct walseqs, got %d", want, got)
+	}
 }

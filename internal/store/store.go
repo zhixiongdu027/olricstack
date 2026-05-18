@@ -584,6 +584,12 @@ func openWAL(path string) (*bolt.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open wal: %w", err)
 	}
+	// MaxBatchDelay caps how long the first caller of a Batch waits before
+	// bbolt commits the merged tx. The default of 10ms shows up directly in
+	// client write latency because PrepareEntry/CommitEntry are on the hot
+	// path. 1ms still lets a few concurrent fsyncs collapse without making
+	// single-writer latency worse than db.Update.
+	db.MaxBatchDelay = time.Millisecond
 	if err := db.Update(func(tx *bolt.Tx) error {
 		if _, err := tx.CreateBucketIfNotExists(walDirtyBucket); err != nil {
 			return err
@@ -597,6 +603,16 @@ func openWAL(path string) (*bolt.DB, error) {
 	return db, nil
 }
 
+// appendDirty stages a record into the WAL. It uses bbolt.Batch so concurrent
+// callers across goroutines can collapse their fsyncs into a single disk flush.
+//
+// Batch idempotency: the closure may run more than once if a sibling call in
+// the same batch returns an error. All side effects either come from tx state
+// (nextWALSeq, dirty.Get, dirty.Stats), are pure functions of the input
+// (record fields), or are written to outer variables that bbolt overwrites
+// atomically on the winning attempt (entry.Record.WALSeq, entry.Record, depth).
+// The bbolt contract guarantees only the final retry's mutations are visible
+// to the caller.
 func (s *MySQLStore) appendDirty(record EntryRecord) (dirtyEntry, int, error) {
 	now := time.Now().UTC()
 	record = record.Clone()
@@ -605,7 +621,9 @@ func (s *MySQLStore) appendDirty(record EntryRecord) (dirtyEntry, int, error) {
 	}
 	entry := dirtyEntry{Record: record}
 	var depth int
-	err := s.wal.Update(func(tx *bolt.Tx) error {
+	err := s.wal.Batch(func(tx *bolt.Tx) error {
+		// Reset per-attempt mutable state so a retry sees a clean slate.
+		entry = dirtyEntry{Record: record.Clone()}
 		dirty := tx.Bucket(walDirtyBucket)
 		key := []byte(walKey(record.Ref()))
 		if existing := dirty.Get(key); existing != nil {
@@ -638,7 +656,7 @@ func (s *MySQLStore) appendDirty(record EntryRecord) (dirtyEntry, int, error) {
 
 func (s *MySQLStore) commitDirty(ref EntryRef, walSeq int64) (int, error) {
 	var depth int
-	err := s.wal.Update(func(tx *bolt.Tx) error {
+	err := s.wal.Batch(func(tx *bolt.Tx) error {
 		dirty := tx.Bucket(walDirtyBucket)
 		key := []byte(walKey(ref))
 		encoded := dirty.Get(key)
@@ -668,7 +686,7 @@ func (s *MySQLStore) commitDirty(ref EntryRef, walSeq int64) (int, error) {
 }
 
 func (s *MySQLStore) abortDirty(ref EntryRef, walSeq int64) error {
-	return s.wal.Update(func(tx *bolt.Tx) error {
+	return s.wal.Batch(func(tx *bolt.Tx) error {
 		dirty := tx.Bucket(walDirtyBucket)
 		key := []byte(walKey(ref))
 		encoded := dirty.Get(key)
