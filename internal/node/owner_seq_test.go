@@ -74,7 +74,11 @@ func TestOwnerSequenceRejectsRollback(t *testing.T) {
 
 func TestOwnerSequenceSurvivesRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "owner_seq.db")
-	first, err := NewOwnerSequence(path)
+	// Reservation = 1 forces a fsync per Stamp, exactly mirroring the old
+	// (pre-batching) persistence model. The restart guarantee is unchanged
+	// in that mode: the next Stamp value is contiguous with the last one
+	// returned before close.
+	first, err := NewOwnerSequenceWithReservation(path, 1)
 	if err != nil {
 		t.Fatalf("new first sequence: %v", err)
 	}
@@ -88,7 +92,7 @@ func TestOwnerSequenceSurvivesRestart(t *testing.T) {
 		t.Fatalf("close first: %v", err)
 	}
 
-	second, err := NewOwnerSequence(path)
+	second, err := NewOwnerSequenceWithReservation(path, 1)
 	if err != nil {
 		t.Fatalf("reopen sequence: %v", err)
 	}
@@ -105,6 +109,88 @@ func TestOwnerSequenceSurvivesRestart(t *testing.T) {
 	}
 	if g != 11 || e != 2 || s != 3 {
 		t.Fatalf("expected (11,2,3) post-restart, got (%d,%d,%d)", g, e, s)
+	}
+}
+
+// TestOwnerSequenceReservationSkipsUnusedRangeOnRestart proves the gap-tolerant
+// guarantee: with reservation N, a Stamp call reserves N seq values in one
+// fsync. After a crash, the recovered sequence jumps to the top of the
+// reservation, so no value ≤ reservedHigh can ever be reused by a future
+// Stamp. The gap (between the highest actually-returned seq and reservedHigh)
+// is invisible to MySQL's strict-lex upsert and is the price of batched
+// fsyncs.
+func TestOwnerSequenceReservationSkipsUnusedRangeOnRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "owner_seq.db")
+	first, err := NewOwnerSequenceWithReservation(path, 10)
+	if err != nil {
+		t.Fatalf("new first sequence: %v", err)
+	}
+	// Two stamps under (5, 3): seq=1 then seq=2. Both within the initial
+	// reservation [1, 10] so only one fsync happened (the new-window write
+	// when we first picked up (5, 3)).
+	for i := 0; i < 2; i++ {
+		if _, _, _, err := first.Stamp(5, 3); err != nil {
+			t.Fatalf("stamp #%d: %v", i, err)
+		}
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close first: %v", err)
+	}
+
+	second, err := NewOwnerSequenceWithReservation(path, 10)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer second.Close()
+
+	// On restart we cannot tell that only seq=1 and seq=2 were used. The
+	// safe move is to assume the whole reservation [1, 10] was consumed
+	// and start handing out values from 11.
+	g, e, s, err := second.Stamp(5, 3)
+	if err != nil {
+		t.Fatalf("stamp after restart: %v", err)
+	}
+	if g != 5 || e != 3 || s != 11 {
+		t.Fatalf("expected (5,3,11) after restart, got (%d,%d,%d)", g, e, s)
+	}
+}
+
+// TestOwnerSequenceReservationAmortizesFsync verifies that under a reservation
+// window of N, N consecutive Stamp() calls in the same (G, E) trigger exactly
+// one persistence event (the reservation set up at Stamp #1). We observe this
+// via reservedHighSnapshot, which only changes when persistLocked() runs.
+func TestOwnerSequenceReservationAmortizesFsync(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "owner_seq.db")
+	const window = 8
+	seq, err := NewOwnerSequenceWithReservation(path, window)
+	if err != nil {
+		t.Fatalf("new sequence: %v", err)
+	}
+	defer seq.Close()
+
+	if _, _, _, err := seq.Stamp(2, 1); err != nil {
+		t.Fatalf("seed stamp: %v", err)
+	}
+	// After the first Stamp in a fresh window: seq=1, reservedHigh=window.
+	if got := seq.reservedHighSnapshot(); got != window {
+		t.Fatalf("after stamp #1: reservedHigh=%d, want %d", got, window)
+	}
+
+	for i := 2; i <= window; i++ {
+		if _, _, _, err := seq.Stamp(2, 1); err != nil {
+			t.Fatalf("stamp #%d: %v", i, err)
+		}
+		if got := seq.reservedHighSnapshot(); got != window {
+			t.Fatalf("after stamp #%d: reservedHigh=%d, want still %d", i, got, window)
+		}
+	}
+
+	// The (window+1)th Stamp must trigger a re-reservation.
+	if _, _, _, err := seq.Stamp(2, 1); err != nil {
+		t.Fatalf("stamp #%d: %v", window+1, err)
+	}
+	if got := seq.reservedHighSnapshot(); got != int64(2*window) {
+		t.Fatalf("after stamp #%d: reservedHigh=%d, want %d", window+1, got, 2*window)
 	}
 }
 
