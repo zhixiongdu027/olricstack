@@ -47,8 +47,8 @@ func TestHostOnlyMySQLDurableWritePath(t *testing.T) {
 	if record.Tombstone {
 		t.Fatalf("expected mysql record for users/%s to be live, got tombstone", key)
 	}
-	if record.Version <= 0 {
-		t.Fatalf("expected mysql record version > 0, got %d", record.Version)
+	if record.OwnerSeq <= 0 {
+		t.Fatalf("expected mysql record owner_seq > 0, got %d", record.OwnerSeq)
 	}
 }
 
@@ -259,11 +259,7 @@ func TestHostOnlyKilledNodePrunedAndReplacementRejoins(t *testing.T) {
 	waitForText(t, ctx, first.logs, "joined topology peers")
 	waitForText(t, ctx, replacement.logs, "joined topology peers")
 
-	key := "host-kill-rejoin:" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	if out, err := first.put(ctx, "users", key, "value-after-rejoin"); err != nil {
-		t.Fatalf("write after replacement rejoin: %v (%s)\nfirst logs:\n%s\nreplacement logs:\n%s",
-			err, strings.TrimSpace(out), strings.TrimSpace(first.logs.String()), strings.TrimSpace(replacement.logs.String()))
-	}
+	key := waitForPutSuccess(t, ctx, first, "users", "host-kill-rejoin", "value-after-rejoin", first, replacement)
 	waitForGetValue(t, ctx, replacement, "users", key, "value-after-rejoin", first, replacement)
 }
 
@@ -410,6 +406,199 @@ func TestHostOnlyWatchdogNetworkJitterExpiresAndRecoversLease(t *testing.T) {
 	if got != "after-jitter" {
 		t.Fatalf("expected recovered cross-node value %q, got %q", "after-jitter", got)
 	}
+}
+
+func TestHostOnlyFiveNodeJoinCrashReplacementJitterAndStorm(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	watchdogAddr, _, cleanupWatchdog := startHostWatchdogWithConfig(t, ctx, hostWatchdogConfig{
+		suspectAfter:     600 * time.Millisecond,
+		expireAfter:      1200 * time.Millisecond,
+		reapInterval:     100 * time.Millisecond,
+		bookwormInterval: 100 * time.Millisecond,
+		leaseTTL:         500 * time.Millisecond,
+	})
+	defer cleanupWatchdog()
+
+	proxy := startTCPProxy(t, ctx, watchdogAddr)
+	defer proxy.close(t)
+
+	repoRoot := repoRoot(t)
+	binDir := t.TempDir()
+	binaries := hostNodeBinaries{
+		nodeBinary:   buildBinary(t, ctx, repoRoot, filepath.Join(binDir, "olric-node"), "./cmd/olric-node", nil),
+		clientBinary: buildBinary(t, ctx, repoRoot, filepath.Join(binDir, "olric-e2e-client"), "./cmd/olric-e2e-client", nil),
+	}
+
+	memberlistPort := mustFreeTCPPort(t)
+	nodes := make([]*hostOlricNode, 0, 5)
+	killedNodes := make(map[*hostOlricNode]bool)
+	defer func() {
+		for _, node := range nodes {
+			if !killedNodes[node] {
+				node.stop(t)
+			}
+		}
+	}()
+	for i := 0; i < 5; i++ {
+		nodeID := fmt.Sprintf("host-only-five-%c", 'a'+rune(i))
+		node := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+			watchdogAddr:   proxy.addr(),
+			nodeID:         nodeID,
+			podIP:          fmt.Sprintf("127.0.0.%d", i+2),
+			bindAddr:       fmt.Sprintf("127.0.0.%d", i+2),
+			memberlistPort: memberlistPort,
+			binaries:       binaries,
+		})
+		nodes = append(nodes, node)
+		waitForClusterAwareness(t, ctx, nodes)
+	}
+
+	runHostTrafficStorm(t, ctx, nodes, 10, 10, "five-before-jitter")
+
+	proxy.pause()
+	for _, node := range nodes {
+		waitForText(t, ctx, node.logs, "topology subscription ended")
+	}
+	waitForPutFailure(t, ctx, nodes[0], "users", "five-jitter-blocked:"+strconv.FormatInt(time.Now().UnixNano(), 10), "during-jitter")
+
+	recoveryOffsets := make(map[*hostOlricNode]int, len(nodes))
+	for _, node := range nodes {
+		recoveryOffsets[node] = node.logs.Len()
+	}
+	proxy.resume()
+	for _, node := range nodes {
+		waitForTextAfter(t, ctx, node.logs, recoveryOffsets[node], "TOPOLOGY_REASON_BOOKWORM")
+	}
+	runHostTrafficStorm(t, ctx, nodes, 8, 8, "five-after-jitter")
+
+	victim := nodes[2]
+	survivors := append([]*hostOlricNode(nil), nodes[:2]...)
+	survivors = append(survivors, nodes[3:]...)
+	pruneOffset := survivors[0].logs.Len()
+	victim.kill(t)
+	killedNodes[victim] = true
+	waitForTopologyWithoutMemberAfter(t, ctx, survivors[0].logs, pruneOffset, victim.nodeID)
+
+	replacement := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   proxy.addr(),
+		nodeID:         "host-only-five-f",
+		podIP:          "127.0.0.7",
+		bindAddr:       "127.0.0.7",
+		memberlistPort: memberlistPort,
+		binaries:       binaries,
+	})
+	nodes = append(nodes, replacement)
+	active := append(survivors, replacement)
+	waitForClusterAwareness(t, ctx, active)
+
+	runHostTrafficStorm(t, ctx, active, 10, 10, "five-after-replacement")
+}
+
+func TestHostOnlyFiveNodeConcurrentCrashJitterReplacementAndTraffic(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	watchdogAddr, _, cleanupWatchdog := startHostWatchdogWithConfig(t, ctx, hostWatchdogConfig{
+		suspectAfter:     600 * time.Millisecond,
+		expireAfter:      1200 * time.Millisecond,
+		reapInterval:     100 * time.Millisecond,
+		bookwormInterval: 100 * time.Millisecond,
+		leaseTTL:         500 * time.Millisecond,
+	})
+	defer cleanupWatchdog()
+
+	proxy := startTCPProxy(t, ctx, watchdogAddr)
+	defer proxy.close(t)
+
+	repoRoot := repoRoot(t)
+	binDir := t.TempDir()
+	binaries := hostNodeBinaries{
+		nodeBinary:   buildBinary(t, ctx, repoRoot, filepath.Join(binDir, "olric-node"), "./cmd/olric-node", nil),
+		clientBinary: buildBinary(t, ctx, repoRoot, filepath.Join(binDir, "olric-e2e-client"), "./cmd/olric-e2e-client", nil),
+	}
+
+	memberlistPort := mustFreeTCPPort(t)
+	nodes := make([]*hostOlricNode, 0, 6)
+	killedNodes := make(map[*hostOlricNode]bool)
+	defer func() {
+		for _, node := range nodes {
+			if !killedNodes[node] {
+				node.stop(t)
+			}
+		}
+	}()
+
+	for i := 0; i < 5; i++ {
+		nodeID := fmt.Sprintf("host-only-concurrent-%c", 'a'+rune(i))
+		node := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+			watchdogAddr:   proxy.addr(),
+			nodeID:         nodeID,
+			podIP:          fmt.Sprintf("127.0.0.%d", i+2),
+			bindAddr:       fmt.Sprintf("127.0.0.%d", i+2),
+			memberlistPort: memberlistPort,
+			binaries:       binaries,
+		})
+		nodes = append(nodes, node)
+		waitForClusterAwareness(t, ctx, nodes)
+	}
+
+	active := append([]*hostOlricNode(nil), nodes...)
+	var activeMu sync.RWMutex
+	trafficCtx, stopTraffic := context.WithCancel(ctx)
+	trafficDone := startBackgroundHostTraffic(t, trafficCtx, &activeMu, &active, 3, "concurrent")
+
+	time.Sleep(500 * time.Millisecond)
+	victim := nodes[1]
+	proxy.pause()
+	victim.kill(t)
+	killedNodes[victim] = true
+	stopTraffic()
+	result := <-trafficDone
+	if result.successes == 0 {
+		t.Fatalf("concurrent traffic had no successful operations before disruption; failures=%d\n%s", result.failures, hostNodeLogs(nodes...))
+	}
+	if result.failures == 0 {
+		t.Fatalf("concurrent disruption did not produce any transient failures; successes=%d", result.successes)
+	}
+
+	survivors := append([]*hostOlricNode(nil), nodes[:1]...)
+	survivors = append(survivors, nodes[2:]...)
+	activeMu.Lock()
+	active = append([]*hostOlricNode(nil), survivors...)
+	activeMu.Unlock()
+
+	for _, node := range survivors {
+		waitForText(t, ctx, node.logs, "topology subscription ended")
+	}
+
+	recoveryOffsets := make(map[*hostOlricNode]int, len(survivors))
+	for _, node := range survivors {
+		recoveryOffsets[node] = node.logs.Len()
+	}
+	proxy.resume()
+	waitForTopologyWithoutMemberAfter(t, ctx, nodes[0].logs, recoveryOffsets[nodes[0]], victim.nodeID)
+	for _, node := range survivors {
+		waitForTextAfter(t, ctx, node.logs, recoveryOffsets[node], "TOPOLOGY_REASON_BOOKWORM")
+	}
+
+	replacement := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   proxy.addr(),
+		nodeID:         "host-only-concurrent-f",
+		podIP:          "127.0.0.7",
+		bindAddr:       "127.0.0.7",
+		memberlistPort: memberlistPort,
+		binaries:       binaries,
+	})
+	nodes = append(nodes, replacement)
+	recovered := append(survivors, replacement)
+	activeMu.Lock()
+	active = append([]*hostOlricNode(nil), recovered...)
+	activeMu.Unlock()
+	waitForClusterAwareness(t, ctx, recovered)
+
+	runHostTrafficStorm(t, ctx, recovered, 10, 10, "concurrent-after-recovery")
 }
 
 type hostOlricNode struct {
@@ -663,6 +852,30 @@ func waitForPutFailure(t *testing.T, ctx context.Context, node *hostOlricNode, d
 	t.Fatalf("put unexpectedly kept succeeding after watchdog demotion\nlast output:\n%s\nnode logs:\n%s", strings.TrimSpace(lastOut), strings.TrimSpace(node.logs.String()))
 }
 
+func waitForPutSuccess(t *testing.T, ctx context.Context, node *hostOlricNode, dmap, keyPrefix, value string, logNodes ...*hostOlricNode) string {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	var lastKey, lastOut string
+	var lastErr error
+	for time.Now().Before(deadline) {
+		lastKey = keyPrefix + ":" + strconv.FormatInt(time.Now().UnixNano(), 10)
+		lastOut, lastErr = node.put(ctx, dmap, lastKey, value)
+		if lastErr == nil {
+			return lastKey
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context ended waiting for put success through %s: %v\nlast key=%s err=%v out=%s\n%s",
+				node.nodeID, ctx.Err(), lastKey, lastErr, strings.TrimSpace(lastOut), hostNodeLogs(logNodes...))
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	t.Fatalf("timed out waiting for put success through %s\nlast key=%s err=%v out=%s\n%s",
+		node.nodeID, lastKey, lastErr, strings.TrimSpace(lastOut), hostNodeLogs(logNodes...))
+	return ""
+}
+
 func waitForGetValue(t *testing.T, ctx context.Context, reader *hostOlricNode, dmap, key, want string, logNodes ...*hostOlricNode) {
 	t.Helper()
 
@@ -684,6 +897,127 @@ func waitForGetValue(t *testing.T, ctx context.Context, reader *hostOlricNode, d
 	}
 	t.Fatalf("timed out waiting for %s/%s=%q through %s\nlast got=%q err=%v out=%s\n%s",
 		dmap, key, want, reader.nodeID, lastGot, lastErr, strings.TrimSpace(lastOut), hostNodeLogs(logNodes...))
+}
+
+func waitForClusterAwareness(t *testing.T, ctx context.Context, nodes []*hostOlricNode) {
+	t.Helper()
+
+	for _, node := range nodes {
+		for _, other := range nodes {
+			if node == other {
+				continue
+			}
+			waitForText(t, ctx, node.logs, `node_id:"`+other.nodeID+`"`)
+		}
+		if len(nodes) > 1 {
+			waitForText(t, ctx, node.logs, "joined topology peers")
+		}
+	}
+}
+
+func runHostTrafficStorm(t *testing.T, ctx context.Context, nodes []*hostOlricNode, writers, writesPerWorker int, prefix string) {
+	t.Helper()
+	if len(nodes) < 2 {
+		t.Fatalf("traffic storm requires at least two nodes, got %d", len(nodes))
+	}
+
+	var failures atomic.Int64
+	var wg sync.WaitGroup
+	for worker := 0; worker < writers; worker++ {
+		worker := worker
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < writesPerWorker; i++ {
+				target := nodes[(worker+i)%len(nodes)]
+				reader := nodes[(worker+i+2)%len(nodes)]
+				if reader == target {
+					reader = nodes[(worker+i+1)%len(nodes)]
+				}
+				key := fmt.Sprintf("%s:%d:%d:%d", prefix, time.Now().UnixNano(), worker, i)
+				value := "value-" + key
+				if out, err := target.put(ctx, "users", key, value); err != nil {
+					t.Logf("storm put failed prefix=%s target=%s key=%s err=%v out=%s", prefix, target.nodeID, key, err, strings.TrimSpace(out))
+					failures.Add(1)
+					continue
+				}
+				got, out, err := reader.get(ctx, "users", key)
+				if err != nil || got != value {
+					t.Logf("storm get failed prefix=%s reader=%s key=%s got=%q err=%v out=%s", prefix, reader.nodeID, key, got, err, strings.TrimSpace(out))
+					failures.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if got := failures.Load(); got != 0 {
+		t.Fatalf("traffic storm %s had %d failures\n%s", prefix, got, hostNodeLogs(nodes...))
+	}
+}
+
+type backgroundTrafficResult struct {
+	successes int64
+	failures  int64
+}
+
+func startBackgroundHostTraffic(t *testing.T, ctx context.Context, activeMu *sync.RWMutex, active *[]*hostOlricNode, writers int, prefix string) <-chan backgroundTrafficResult {
+	t.Helper()
+	if writers <= 0 {
+		writers = 1
+	}
+
+	done := make(chan backgroundTrafficResult, 1)
+	var successes atomic.Int64
+	var failures atomic.Int64
+	var wg sync.WaitGroup
+	for worker := 0; worker < writers; worker++ {
+		worker := worker
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				activeMu.RLock()
+				nodes := append([]*hostOlricNode(nil), (*active)...)
+				activeMu.RUnlock()
+				if len(nodes) < 2 {
+					failures.Add(1)
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+
+				target := nodes[(worker+i)%len(nodes)]
+				reader := nodes[(worker+i+1)%len(nodes)]
+				key := fmt.Sprintf("%s-bg:%d:%d:%d", prefix, time.Now().UnixNano(), worker, i)
+				value := "value-" + key
+				if _, err := target.put(ctx, "users", key, value); err != nil {
+					failures.Add(1)
+					time.Sleep(25 * time.Millisecond)
+					continue
+				}
+				got, _, err := reader.get(ctx, "users", key)
+				if err != nil || got != value {
+					failures.Add(1)
+					time.Sleep(25 * time.Millisecond)
+					continue
+				}
+				successes.Add(1)
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		done <- backgroundTrafficResult{
+			successes: successes.Load(),
+			failures:  failures.Load(),
+		}
+	}()
+	return done
 }
 
 func hostNodeLogs(nodes ...*hostOlricNode) string {

@@ -103,8 +103,8 @@ func TestK3dMySQLDurableWritePath(t *testing.T) {
 	if record.Tombstone {
 		t.Fatalf("expected mysql record for users/%s to be live, got tombstone", key)
 	}
-	if record.Version <= 0 {
-		t.Fatalf("expected mysql record version > 0, got %d", record.Version)
+	if record.OwnerSeq <= 0 {
+		t.Fatalf("expected mysql record owner_seq > 0, got %d", record.OwnerSeq)
 	}
 }
 

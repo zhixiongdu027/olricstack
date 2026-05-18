@@ -76,7 +76,7 @@ func provisionHostMySQL(t *testing.T, clusterHost string) *hostMySQL {
 
 type mysqlRecord struct {
 	WriterID  string
-	Version   int64
+	OwnerSeq  int64
 	Tombstone bool
 }
 
@@ -104,10 +104,10 @@ func waitForMySQLRecord(t *testing.T, ctx context.Context, dsn, dmap, key string
 		queryCtx, queryCancel := context.WithTimeout(ctx, 3*time.Second)
 		var record mysqlRecord
 		err = db.QueryRowContext(queryCtx,
-			"SELECT writer_id, version, tombstone FROM olric_cache_records WHERE dmap = ? AND `key` = ?",
+			"SELECT writer_id, owner_seq, tombstone FROM olric_cache_records WHERE dmap = ? AND `key` = ?",
 			dmap,
 			key,
-		).Scan(&record.WriterID, &record.Version, &record.Tombstone)
+		).Scan(&record.WriterID, &record.OwnerSeq, &record.Tombstone)
 		queryCancel()
 		if err == nil {
 			return record
