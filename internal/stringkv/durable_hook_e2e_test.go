@@ -43,7 +43,7 @@ func TestDurableHookEndToEndAbortPreventsMySQLLeak(t *testing.T) {
 		_ = cacheStore.Close(ctx)
 	}()
 
-	hook, err := NewDurableHook(cacheStore, fenceAt(7, 3), newFakeFenceSequencer())
+	hook, err := NewDurableHook(cacheStore, fenceAt(7, 3), newFakeFenceSequencer(), "test-writer")
 	if err != nil {
 		t.Fatalf("new hook: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestDurableHookConcurrentLoadOnMissDoesNotOverwriteConcurrentPrepare(t *tes
 		_ = cacheStore.Close(ctx)
 	}()
 
-	hook, err := NewDurableHook(cacheStore, fenceAt(7, 3), newFakeFenceSequencer())
+	hook, err := NewDurableHook(cacheStore, fenceAt(7, 3), newFakeFenceSequencer(), "test-writer")
 	if err != nil {
 		t.Fatalf("new hook: %v", err)
 	}

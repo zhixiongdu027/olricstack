@@ -60,6 +60,10 @@ A second follow-up closed the highest-severity remaining gap:
 
 - **§8.6 / F13 (Phase 4 durable handoff) — IMPLEMENTED via synchronous drain (option A)**. `DurableHook` gained `DrainForHandoff(ctx, handoff)`. The fork's `fragment.Move` invokes it under `f.Lock()` before exporting, passing every resident hkey. The hook routes to `MySQLStore.FlushHandoff`, which flushes the matching committed WAL records to MySQL synchronously and deletes them from bbolt. Drain failure aborts migration so the old owner can keep serving until the next retry. Regression tests in `internal/store/store_test.go` and `internal/stringkv/durable_hook_test.go` cover drain success, prepared-skip, mysql-down abort, and empty-set no-op.
 
+A third follow-up closed the F12 equal-fence residual:
+
+- **§8.5 (equal-fence tiebreaker) — IMPLEMENTED via writer_id lex extension**. `EntryRecord` gained a `WriterID` column populated from `NODE_ID` (or `POD_NAME` fallback) at hook construction. `versionedUpsertClause` was extended on both MySQL and SQLite branches with the disjunct `(G=G ∧ E=E ∧ S=S ∧ VALUES(writer_id) > writer_id)`. `S3 / S6 / FenceLE` now operate on the four-tuple `(G, E, S, W)`. `TestMySQLStoreEqualFenceUsesWriterIDTiebreaker` pins the new behaviour.
+
 ---
 
 ## §1 Component Boundary
@@ -178,11 +182,17 @@ We will use these abbreviations in invariant statements:
 ```
 LeaseValid(L, t)     ≡  L.validUntil > t                                                (subscriber.go:208)
 FenceLE(a, b)        ≡  a.G < b.G  ∨  (a.G = b.G ∧ a.E < b.E)
-                          ∨  (a.G = b.G ∧ a.E = b.E ∧ a.S < b.S)                        (store.go:78)
+                          ∨  (a.G = b.G ∧ a.E = b.E ∧ a.S < b.S)
+                          ∨  (a.G = b.G ∧ a.E = b.E ∧ a.S = b.S ∧ a.W < b.W)             (store.go:78, post-§8.5)
 Flushable(r)         ≡  r.FlushMySQL ∧ r.WALState = Committed
                           ∧ r.fence.G > 0 ∧ r.fence.S > 0                               (store.go:847)
 PrimaryEnvelope(e)   ≡  e.role = PRIMARY  ∧  e.validUntil > now()                       (subscriber.go:170)
 ```
+
+`a.W` is the per-owner `writer_id` (`EntryRecord.WriterID`); the
+tiebreaker only matters when the upper triple `(G, E, S)` collides — see
+§8.5 for why the cluster model normally rules this out and why we still
+need the lex extension as a deterministic safety net.
 
 ---
 
@@ -253,7 +263,7 @@ Stated as predicates over all reachable states. Each is proved (forward, golden 
     FenceLE(m_i.fence, m_{i+1}.fence)
 ```
 
-**Enforcer:** `versionedUpsertClause` (`store.go:799`). Every column is wrapped in a `CASE WHEN <newer> THEN VALUES(...) ELSE <self> END`, where `<newer>` is the strict lex predicate on `(generation, epoch, owner_seq)`. SQLite path is symmetric (`store.go:820`).
+**Enforcer:** `versionedUpsertClause` (`store.go:799`). Every column is wrapped in a `CASE WHEN <newer> THEN VALUES(...) ELSE <self> END`, where `<newer>` is the strict lex predicate on `(generation, epoch, owner_seq, writer_id)` (writer_id added in §8.5 as the equal-fence tiebreaker). SQLite path is symmetric (`store.go:820`).
 
 ### S4 — Envelope durability precedes delivery
 
@@ -300,6 +310,8 @@ This follows from S1 + S3 + uniqueness of `(G, E, S)` for a successful E13. The 
 - regression on `(G, E)` returns `ErrOwnerSequenceRollback`.
 
 Persisted before return (`owner_seq.go:98`), so the same `S` cannot be reused after a crash between E9 and E10.
+
+Under the current cluster model `(G, E)` has at most one owner per partition, so `(G, E, S)` is already cluster-unique. The `writer_id` extension in §8.5 turns the comparator on `(G, E, S, W)` into a total order even in pathological cases where two nodes briefly share `(G, E)` — every flushable record then maps to a unique point in the global order.
 
 ---
 
@@ -853,12 +865,12 @@ The 13 scenarios are stated verbatim from `docs/production-robustness-plan.md §
 5. Without S3, MySQL would regress. With S3, the upsert clause sees `(G₁, E₁, S₁) < (G₁, E₂, S₂)` → no column updated → silent skip.
 
 **Defense**:
-- `versionedUpsertClause` strict lex on `(G, E, S)`. The smaller fence loses every column comparison. MySQL row stays at `(G₁, E₂, S₂)`.
+- `versionedUpsertClause` strict lex on `(G, E, S, W)` (writer_id added in §8.5). The smaller fence loses every column comparison. MySQL row stays at `(G₁, E₂, S₂)`.
 - Independent guard: `PurgeBelowGeneration` (`store.go:224`) deletes WAL records with `fence.G < envelope.gen` after a gen bump. If the move from N₁ → N₂ is accompanied by a gen bump (typical: the move corresponds to a watchdog primary change), N₁'s stale records are purged before its flusher runs.
 
 **Residual**: epoch-only changes (same gen, larger epoch) do NOT trigger purge — only generation comparisons. So in the trace above, the purge does not fire, but S3 in the upsert clause still defends. This is correct: the fence triple is the source of truth, not the cleanup helper.
 
-A subtle hazard: if `OwnerSequence.Stamp` is called with `(G₁, E₂)` on N₂ and `(G₁, E₂)` later returns to N₁ (highly unusual but possible during epoch ping-pong), each owner has its own sequence counter for `(G₁, E₂)`. Two writes could end up with the same `S` from different processes. `versionedUpsertClause` has no equal-fence tiebreaker — the second to land wins by virtue of `>` failing for both, falling through to the existing row. So we have last-MySQL-write-wins-when-fence-equal semantics. **This is a S3 corner case** (see §8.5 — equal-fence MySQL conflict, currently relies on cluster never producing two simultaneous owners under same `(G, E)`).
+A subtle hazard: if `OwnerSequence.Stamp` is called with `(G₁, E₂)` on N₂ and `(G₁, E₂)` later returns to N₁ (highly unusual but possible during epoch ping-pong), each owner has its own sequence counter for `(G₁, E₂)`. Two writes could end up with the same `S` from different processes. **Closed by §8.5**: `versionedUpsertClause` now compares `writer_id` lexicographically as the final tiebreaker, so even an exact `(G, E, S)` collision resolves to a deterministic, cluster-stable winner instead of last-MySQL-batch-wins.
 
 ### F13 — Fragment migration occurs while dirty WAL records are unflushed
 
@@ -929,15 +941,16 @@ Each weakness is graded **Severity** (impact on safety / liveness if exploited),
 - **Hardening**: refuse to serve in standalone unless an explicit env (`OLRIC_STANDALONE=1`) is set, AND log a loud warning. Or remove standalone entirely once K8s test infrastructure is consolidated.
 - **Recommendation**: gate behind explicit env; cost is one if-check.
 
-### 8.5 Equal-fence MySQL conflict has no tiebreaker
+### 8.5 Equal-fence MySQL conflict tiebreaker — IMPLEMENTED via writer_id lex extension
 
-- **Severity**: Low under current invariants (cluster never produces two simultaneous owners under same `(G, E)`), Medium if F12's epoch ping-pong scenario becomes real.
-- **Trace**: §7 F12 residual. `versionedUpsertClause` lex strict `>`; equal triples fall through to "keep existing", giving last-MySQL-batch-wins semantics for equal fences.
-- **Defenses in place**: depends on cluster model not generating two writers at the same `(G, E)`.
-- **Hardening**:
-  1. Add a final tiebreaker column (e.g., monotonic node UUID) to the comparator.
-  2. Prove the no-equal-fence invariant formally: `Stamp` only ever returns `(G, E, S)` with strict `S` increment per `(G, E)` per node, but two nodes with the same `(G, E)` can independently produce `S=1`.
-- **Recommendation**: #1 — add a `writer_id` column, include in comparator. ~30 min change. Note `writer_id` is already in the schema design (`docs/durable-string-kv-design.md §"MySQL Record"`) but not yet in the upsert comparator.
+- **Severity (post-fix)**: Closed. The `(G, E, S)` lex now extends to `(G, E, S, W)` where `W = EntryRecord.WriterID`, giving a deterministic, cluster-stable winner even on rare exact-fence collisions.
+- **Trace**: §7 F12 residual (epoch ping-pong producing two writers with the same `(G, E, S)`).
+- **Implementation**:
+  - `EntryRecord.WriterID` (`internal/store/store.go`) — new MySQL column, populated from `NODE_ID` (or `POD_NAME` fallback) at hook construction time.
+  - `stringkv.NewDurableHook` now takes a `writerID string` parameter; rejects empty. `cmd/olric-node/main.go` wires it from the same env vars used by the topology subscriber, so the writer_id matches the cluster's view of the node identity.
+  - `versionedUpsertClause` (`internal/store/store.go`) extended on both MySQL and SQLite branches with the tiebreaker clause `(G=G ∧ E=E ∧ S=S ∧ VALUES(writer_id) > writer_id)`.
+- **Test**: `TestMySQLStoreEqualFenceUsesWriterIDTiebreaker` covers (i) smaller writer_id losing at equal `(G, E, S)`, (ii) larger writer_id winning, (iii) higher owner_seq overriding any writer_id (sanity that the tiebreaker only kicks in on equal triples).
+- **Cluster invariant note**: under the current model `(G, E)` has at most one owner per partition, so a true tie is unreachable in practice. The tiebreaker exists as defense in depth: a future balancer race or replication of an old owner under the same `(G, E)` would otherwise produce non-deterministic last-batch-wins. Cost is one extra `string` column and one extra disjunct in the SQL clause — negligible.
 
 ### 8.6 Fragment migration WAL handoff (Phase 4) — IMPLEMENTED via synchronous drain
 

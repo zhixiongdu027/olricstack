@@ -61,7 +61,16 @@ type EntryRecord struct {
 	Generation   int64     `gorm:"column:generation;not null;index:idx_cache_fence" json:"generation"`
 	Epoch        int64     `gorm:"column:epoch;not null;index:idx_cache_fence" json:"epoch"`
 	OwnerSeq     int64     `gorm:"column:owner_seq;not null;index:idx_cache_fence" json:"owner_seq"`
-	UpdatedAt    time.Time `gorm:"column:updated_at" json:"updated_at"`
+	// WriterID identifies the owner node that produced the record. It is the
+	// final tiebreaker in versionedUpsertClause when (Generation, Epoch,
+	// OwnerSeq) compare equal — a corner case that cannot arise under the
+	// current cluster model (each (G, E) has at most one owner per
+	// partition) but a future epoch ping-pong or a race in the balancer
+	// could allow two nodes to stamp the same triple. Comparing writer_id
+	// lexicographically gives a deterministic, cluster-stable winner
+	// instead of last-MySQL-batch-wins. See §8.5.
+	WriterID  string    `gorm:"column:writer_id;size:128;not null;default:''" json:"writer_id"`
+	UpdatedAt time.Time `gorm:"column:updated_at" json:"updated_at"`
 	// WALSeq is a node-local monotonic identifier assigned at PrepareEntry. It
 	// is never persisted to MySQL — the durable contract is the fence triple
 	// (Generation, Epoch, OwnerSeq). WALSeq exists only to bind a Commit/Abort
@@ -966,19 +975,32 @@ func nextWALSeq(bucket *bolt.Bucket) int64 {
 
 // versionedUpsertClause encodes the durable conflict-resolution rule used by
 // the asynchronous flusher. Conflict resolution is a strict lexicographic
-// comparison of the fence triple (Generation, Epoch, OwnerSeq):
+// comparison of the fence tuple (Generation, Epoch, OwnerSeq, WriterID):
 //
-//	v1 < v2 ⟺ G1<G2  ∨  (G1=G2 ∧ E1<E2)  ∨  (G1=G2 ∧ E1=E2 ∧ S1<S2)
+//	v1 < v2 ⟺  G1<G2
+//	         ∨ (G1=G2 ∧ E1<E2)
+//	         ∨ (G1=G2 ∧ E1=E2 ∧ S1<S2)
+//	         ∨ (G1=G2 ∧ E1=E2 ∧ S1=S2 ∧ W1<W2)   ← writer_id tiebreaker
 //
 // This is what makes a delayed flush from an old owner provably lose to a
 // newer-owner write — local wall-clock time cannot defeat a higher fence.
 // isFlushable() rejects records without G>0 ∧ S>0, so by construction every
 // row reaching this clause carries a fence.
+//
+// The writer_id tiebreaker closes §8.5: under the current cluster model
+// each (G, E) has at most one owner per partition, so the lex comparison
+// on (G, E, S) is already total. But a future balancer race or epoch
+// ping-pong could let two nodes stamp the same triple. Without a
+// tiebreaker the upsert would fall through to "keep existing", giving
+// last-MySQL-batch-wins for equal fences — a non-deterministic outcome.
+// The lex extension over writer_id gives a cluster-stable deterministic
+// winner instead.
 func (s *MySQLStore) versionedUpsertClause() clause.OnConflict {
 	if s.db.Dialector.Name() == "mysql" {
 		newer := "VALUES(generation) > generation OR " +
 			"(VALUES(generation) = generation AND VALUES(epoch) > epoch) OR " +
-			"(VALUES(generation) = generation AND VALUES(epoch) = epoch AND VALUES(owner_seq) > owner_seq)"
+			"(VALUES(generation) = generation AND VALUES(epoch) = epoch AND VALUES(owner_seq) > owner_seq) OR " +
+			"(VALUES(generation) = generation AND VALUES(epoch) = epoch AND VALUES(owner_seq) = owner_seq AND VALUES(writer_id) > writer_id)"
 		return clause.OnConflict{
 			Columns: []clause.Column{{Name: "dmap"}, {Name: "hkey"}},
 			DoUpdates: clause.Assignments(map[string]interface{}{
@@ -990,6 +1012,7 @@ func (s *MySQLStore) versionedUpsertClause() clause.OnConflict {
 				"generation":    gorm.Expr("CASE WHEN " + newer + " THEN VALUES(generation) ELSE generation END"),
 				"epoch":         gorm.Expr("CASE WHEN " + newer + " THEN VALUES(epoch) ELSE epoch END"),
 				"owner_seq":     gorm.Expr("CASE WHEN " + newer + " THEN VALUES(owner_seq) ELSE owner_seq END"),
+				"writer_id":     gorm.Expr("CASE WHEN " + newer + " THEN VALUES(writer_id) ELSE writer_id END"),
 				"updated_at":    gorm.Expr("CASE WHEN " + newer + " THEN VALUES(updated_at) ELSE updated_at END"),
 			}),
 		}
@@ -997,7 +1020,8 @@ func (s *MySQLStore) versionedUpsertClause() clause.OnConflict {
 
 	newer := "excluded.generation > generation OR " +
 		"(excluded.generation = generation AND excluded.epoch > epoch) OR " +
-		"(excluded.generation = generation AND excluded.epoch = epoch AND excluded.owner_seq > owner_seq)"
+		"(excluded.generation = generation AND excluded.epoch = epoch AND excluded.owner_seq > owner_seq) OR " +
+		"(excluded.generation = generation AND excluded.epoch = epoch AND excluded.owner_seq = owner_seq AND excluded.writer_id > writer_id)"
 	return clause.OnConflict{
 		Columns: []clause.Column{{Name: "dmap"}, {Name: "hkey"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
@@ -1009,6 +1033,7 @@ func (s *MySQLStore) versionedUpsertClause() clause.OnConflict {
 			"generation":    gorm.Expr("CASE WHEN " + newer + " THEN excluded.generation ELSE generation END"),
 			"epoch":         gorm.Expr("CASE WHEN " + newer + " THEN excluded.epoch ELSE epoch END"),
 			"owner_seq":     gorm.Expr("CASE WHEN " + newer + " THEN excluded.owner_seq ELSE owner_seq END"),
+			"writer_id":     gorm.Expr("CASE WHEN " + newer + " THEN excluded.writer_id ELSE writer_id END"),
 			"updated_at":    gorm.Expr("CASE WHEN " + newer + " THEN excluded.updated_at ELSE updated_at END"),
 		}),
 	}

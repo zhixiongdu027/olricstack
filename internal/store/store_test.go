@@ -535,6 +535,66 @@ func TestMySQLStoreSameGenerationLowerEpochFlushIsRejected(t *testing.T) {
 	closeStore(t, cacheStore)
 }
 
+// TestMySQLStoreEqualFenceUsesWriterIDTiebreaker covers §8.5: when two
+// records carry the same (Generation, Epoch, OwnerSeq) — possible during a
+// rare epoch ping-pong or a balancer race — the upsert must fall through to
+// a deterministic writer_id lex comparison instead of last-MySQL-batch-wins.
+// We seed a row with writer_id="alpha" then attempt to overwrite first with
+// a smaller writer_id (must lose) and then with a larger one (must win).
+func TestMySQLStoreEqualFenceUsesWriterIDTiebreaker(t *testing.T) {
+	cacheStore := newTestStore(t, Config{})
+	defer closeStore(t, cacheStore)
+
+	seed := testFencedRecord("tied", 17, []byte("from-alpha"), 4, 2, 7)
+	seed.WriterID = "alpha"
+	if !cacheStore.flushEntries([]dirtyEntry{{Record: seed}}) {
+		t.Fatalf("seed alpha: %v", cacheStore.workerError())
+	}
+
+	// Smaller writer_id must lose at equal (G, E, S).
+	loser := testFencedRecord("tied", 17, []byte("from-aardvark"), 4, 2, 7)
+	loser.WriterID = "aardvark"
+	if !cacheStore.flushEntries([]dirtyEntry{{Record: loser}}) {
+		t.Fatalf("flush smaller writer_id: %v", cacheStore.workerError())
+	}
+	got, err := cacheStore.LoadEntry(context.Background(), testRef("tied", 17))
+	if err != nil {
+		t.Fatalf("load after smaller writer: %v", err)
+	}
+	if string(got.EncodedEntry) != "from-alpha" || got.WriterID != "alpha" {
+		t.Fatalf("smaller writer_id should not have won, got value=%q writer=%q", got.EncodedEntry, got.WriterID)
+	}
+
+	// Larger writer_id at equal fence must win deterministically.
+	winner := testFencedRecord("tied", 17, []byte("from-beta"), 4, 2, 7)
+	winner.WriterID = "beta"
+	if !cacheStore.flushEntries([]dirtyEntry{{Record: winner}}) {
+		t.Fatalf("flush larger writer_id: %v", cacheStore.workerError())
+	}
+	got, err = cacheStore.LoadEntry(context.Background(), testRef("tied", 17))
+	if err != nil {
+		t.Fatalf("load after larger writer: %v", err)
+	}
+	if string(got.EncodedEntry) != "from-beta" || got.WriterID != "beta" {
+		t.Fatalf("larger writer_id should have won, got value=%q writer=%q", got.EncodedEntry, got.WriterID)
+	}
+
+	// Sanity: a fully-larger fence still beats writer_id without needing
+	// it to match. Confirms tiebreaker only kicks in on equal (G, E, S).
+	override := testFencedRecord("tied", 17, []byte("from-fence"), 4, 2, 8)
+	override.WriterID = "alpha"
+	if !cacheStore.flushEntries([]dirtyEntry{{Record: override}}) {
+		t.Fatalf("flush higher owner_seq: %v", cacheStore.workerError())
+	}
+	got, err = cacheStore.LoadEntry(context.Background(), testRef("tied", 17))
+	if err != nil {
+		t.Fatalf("load after higher owner_seq: %v", err)
+	}
+	if string(got.EncodedEntry) != "from-fence" {
+		t.Fatalf("higher owner_seq should have won regardless of writer_id, got %q", got.EncodedEntry)
+	}
+}
+
 func TestMySQLStoreDeleteFlushedKeepsNewerWALValue(t *testing.T) {
 	cacheStore := newTestStore(t, Config{FlushInterval: time.Hour})
 	if err := cacheStore.StoreEntry(context.Background(), testRecord("race", 9, []byte("old"))); err != nil {

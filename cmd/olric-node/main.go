@@ -50,7 +50,11 @@ func main() {
 		if err != nil {
 			log.Fatalf("open owner sequence: %v", err)
 		}
-		durableHook, err = stringkv.NewDurableHook(leaseGatedStore, topologyLease, ownerSequence)
+		writerID := envString("NODE_ID", os.Getenv("POD_NAME"))
+		if writerID == "" {
+			log.Fatalf("writer id is required: set NODE_ID or POD_NAME")
+		}
+		durableHook, err = stringkv.NewDurableHook(leaseGatedStore, topologyLease, ownerSequence, writerID)
 		if err != nil {
 			log.Fatalf("create durable hook: %v", err)
 		}

@@ -35,6 +35,9 @@ func TestDurableHookBeforeSetStampsFenceAndPreparesRecord(t *testing.T) {
 	if record.Generation != 7 || record.Epoch != 3 || record.OwnerSeq != 1 {
 		t.Fatalf("expected fence (7,3,1), got (%d,%d,%d)", record.Generation, record.Epoch, record.OwnerSeq)
 	}
+	if record.WriterID != "test-writer" {
+		t.Fatalf("expected writer_id=test-writer, got %q", record.WriterID)
+	}
 	if record.Origin != "client_set" || !recordHasFlushIntent(record) {
 		t.Fatalf("expected client_set flushable-intent record, got %#v", record)
 	}
@@ -44,7 +47,7 @@ func TestDurableHookBeforeSetRejectsExpiredLease(t *testing.T) {
 	backing := newRecordingCommitStore()
 	lease := &fakeFenceLease{}
 	seq := newFakeFenceSequencer()
-	hook, err := NewDurableHook(backing, lease, seq)
+	hook, err := NewDurableHook(backing, lease, seq, "test-writer")
 	if err != nil {
 		t.Fatalf("new hook: %v", err)
 	}
@@ -259,7 +262,7 @@ func TestDurableHookLoadOnMissPropagatesNotFound(t *testing.T) {
 
 func newTestDurableHook(t *testing.T, backing store.CommitStore, lease *fakeFenceLease) *DurableHook {
 	t.Helper()
-	hook, err := NewDurableHook(backing, lease, newFakeFenceSequencer())
+	hook, err := NewDurableHook(backing, lease, newFakeFenceSequencer(), "test-writer")
 	if err != nil {
 		t.Fatalf("new durable hook: %v", err)
 	}

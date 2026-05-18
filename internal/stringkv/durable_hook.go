@@ -55,10 +55,11 @@ type DurableHook struct {
 	committer store.CommitStore
 	lease     FenceLease
 	sequence  FenceSequencer
+	writerID  string
 	now       func() time.Time
 }
 
-func NewDurableHook(committer store.CommitStore, lease FenceLease, sequence FenceSequencer) (*DurableHook, error) {
+func NewDurableHook(committer store.CommitStore, lease FenceLease, sequence FenceSequencer, writerID string) (*DurableHook, error) {
 	if committer == nil {
 		return nil, errors.New("commit store is nil")
 	}
@@ -68,10 +69,14 @@ func NewDurableHook(committer store.CommitStore, lease FenceLease, sequence Fenc
 	if sequence == nil {
 		return nil, errors.New("fence sequencer is nil")
 	}
+	if writerID == "" {
+		return nil, errors.New("writer id is required")
+	}
 	return &DurableHook{
 		committer: committer,
 		lease:     lease,
 		sequence:  sequence,
+		writerID:  writerID,
 		now:       time.Now,
 	}, nil
 }
@@ -114,6 +119,7 @@ func (h *DurableHook) BeforeDelete(ctx context.Context, op olricconfig.DurableOp
 		Generation: g,
 		Epoch:      e,
 		OwnerSeq:   s,
+		WriterID:   h.writerID,
 		UpdatedAt:  h.now().UTC(),
 	}
 	prepared, err := h.committer.PrepareEntry(ctx, record)
@@ -251,6 +257,7 @@ func (h *DurableHook) fencedRecord(op olricconfig.DurableOperation, entry olrics
 		Generation:   g,
 		Epoch:        e,
 		OwnerSeq:     s,
+		WriterID:     h.writerID,
 		UpdatedAt:    now.UTC(),
 	}, nil
 }
