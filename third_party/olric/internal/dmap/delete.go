@@ -146,7 +146,9 @@ func (dm *DMap) deleteKey(ctx context.Context, key string) error {
 				return err
 			}
 			if vErr := hook.VerifyAfterLock(ctx, op); vErr != nil {
-				_ = hook.AfterDelete(ctx, op, vErr)
+				if abortErr := hook.AfterDelete(ctx, op, vErr); abortErr != nil {
+					dm.s.log.V(3).Printf("[ERROR] durable hook abort after verify failure on %s/%s (miss path): %v (verify err: %v)", dm.name, key, abortErr, vErr)
+				}
 				return vErr
 			}
 			// Storage held no entry: the in-memory operation is a no-op, so
@@ -172,7 +174,9 @@ func (dm *DMap) deleteKey(ctx context.Context, key string) error {
 			return err
 		}
 		if vErr := hook.VerifyAfterLock(ctx, op); vErr != nil {
-			_ = hook.AfterDelete(ctx, op, vErr)
+			if abortErr := hook.AfterDelete(ctx, op, vErr); abortErr != nil {
+				dm.s.log.V(3).Printf("[ERROR] durable hook abort after verify failure on %s/%s: %v (verify err: %v)", dm.name, key, abortErr, vErr)
+			}
 			return vErr
 		}
 		// AfterDelete MUST run regardless of the in-memory/quorum result so

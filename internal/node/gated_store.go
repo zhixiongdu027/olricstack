@@ -131,6 +131,19 @@ func (s *LeaseGatedStore) PurgeBelowGeneration(ctx context.Context, minGeneratio
 	return 0, nil
 }
 
+// PreparedCount forwards the inner store's prepared-orphan gauge when
+// available. The lease gate is not enforced — operators read this metric to
+// diagnose WAL state regardless of serving role.
+func (s *LeaseGatedStore) PreparedCount() (int, error) {
+	type counter interface {
+		PreparedCount() (int, error)
+	}
+	if c, ok := s.inner.(counter); ok {
+		return c.PreparedCount()
+	}
+	return 0, nil
+}
+
 func (s *LeaseGatedStore) requireLease() error {
 	if s.lease.ServingAllowed(s.now()) {
 		return nil

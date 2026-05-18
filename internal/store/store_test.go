@@ -309,6 +309,117 @@ func TestMySQLStoreDoesNotFlushLocalOnlyEntries(t *testing.T) {
 	}
 }
 
+// TestMySQLStoreSweepsPreparedOrphansAtStart guards §8.1 hardening #1: a
+// prepared record that survives a crash (or a verify-fail abort that itself
+// failed to write) must not linger across restart. We simulate the crash by
+// preparing a record, then bypassing the normal Close path so the WAL keeps
+// the Prepared entry on disk, then re-open and assert the sweep removed it.
+func TestMySQLStoreSweepsPreparedOrphansAtStart(t *testing.T) {
+	db := newTestDB(t)
+	walPath := filepath.Join(t.TempDir(), "cache.wal")
+
+	first, err := NewMySQLStore(db, Config{
+		WALPath:       walPath,
+		FlushInterval: time.Hour,
+		BatchSize:     128,
+	})
+	if err != nil {
+		t.Fatalf("new first store: %v", err)
+	}
+	if err := first.Start(context.Background()); err != nil {
+		t.Fatalf("start first store: %v", err)
+	}
+	if _, err := first.PrepareEntry(context.Background(), testFlushableRecord("orphan", 51, []byte("value"))); err != nil {
+		t.Fatalf("prepare orphan: %v", err)
+	}
+	count, err := first.PreparedCount()
+	if err != nil {
+		t.Fatalf("count prepared in first: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 prepared record before crash, got %d", count)
+	}
+	// Simulate crash: skip flushLoop drain and Close path; just close bbolt.
+	first.mu.Lock()
+	first.closing = true
+	first.mu.Unlock()
+	if err := first.wal.Close(); err != nil {
+		t.Fatalf("close first wal: %v", err)
+	}
+
+	second, err := NewMySQLStore(db, Config{
+		WALPath:       walPath,
+		FlushInterval: time.Hour,
+		BatchSize:     128,
+	})
+	if err != nil {
+		t.Fatalf("new second store: %v", err)
+	}
+	if err := second.Start(context.Background()); err != nil {
+		t.Fatalf("start second store: %v", err)
+	}
+	defer closeStore(t, second)
+
+	count, err = second.PreparedCount()
+	if err != nil {
+		t.Fatalf("count prepared after sweep: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected sweep to remove prepared orphan, %d remain", count)
+	}
+	if _, err := second.LoadEntry(context.Background(), testRef("orphan", 51)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("swept orphan still loadable: %v", err)
+	}
+}
+
+// TestMySQLStorePreparedCountReflectsLifecycle covers §8.1 hardening #2: the
+// gauge must rise on Prepare and fall on Commit/Abort so operators can alert
+// on stuck preparations.
+func TestMySQLStorePreparedCountReflectsLifecycle(t *testing.T) {
+	cacheStore := newTestStore(t, Config{FlushInterval: time.Hour})
+	defer closeStore(t, cacheStore)
+
+	count, err := cacheStore.PreparedCount()
+	if err != nil {
+		t.Fatalf("initial count: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 initially, got %d", count)
+	}
+
+	prepared, err := cacheStore.PrepareEntry(context.Background(), testFlushableRecord("alpha", 61, []byte("v1")))
+	if err != nil {
+		t.Fatalf("prepare alpha: %v", err)
+	}
+	aborted, err := cacheStore.PrepareEntry(context.Background(), testFlushableRecord("beta", 62, []byte("v2")))
+	if err != nil {
+		t.Fatalf("prepare beta: %v", err)
+	}
+
+	count, err = cacheStore.PreparedCount()
+	if err != nil {
+		t.Fatalf("count after prepare: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 prepared, got %d", count)
+	}
+
+	if err := cacheStore.CommitEntry(context.Background(), prepared.Ref(), prepared.WALSeq); err != nil {
+		t.Fatalf("commit alpha: %v", err)
+	}
+	if err := cacheStore.AbortEntry(context.Background(), aborted.Ref(), aborted.WALSeq); err != nil {
+		t.Fatalf("abort beta: %v", err)
+	}
+
+	count, err = cacheStore.PreparedCount()
+	if err != nil {
+		t.Fatalf("count after finalize: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 after commit+abort, got %d", count)
+	}
+}
+
 func TestMySQLStoreDoesNotFlushPreparedEntriesBeforeCommit(t *testing.T) {
 	db := newTestDB(t)
 	walPath := filepath.Join(t.TempDir(), "cache.wal")

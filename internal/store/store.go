@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -201,6 +202,12 @@ func (s *MySQLStore) Start(context.Context) error {
 		return nil
 	}
 	s.startOnce.Do(func() {
+		swept, err := s.sweepPreparedOrphans()
+		if err != nil {
+			log.Printf("wal prepared orphan sweep failed: %v", err)
+		} else if swept > 0 {
+			log.Printf("wal prepared orphan sweep removed %d records", swept)
+		}
 		s.mu.Lock()
 		s.started = true
 		s.mu.Unlock()
@@ -208,6 +215,81 @@ func (s *MySQLStore) Start(context.Context) error {
 		go s.flushLoop()
 	})
 	return nil
+}
+
+// sweepPreparedOrphans deletes WAL records left in WALStatePrepared by a
+// previous process. A Prepared record can survive across restart only if the
+// owning process crashed between PrepareEntry and Commit/Abort, OR if a
+// VerifyAfterLock-fail / pre-condition-fail path executed `_ = hook.AfterX`
+// and the abort's bbolt write itself failed. Either way, no in-flight goroutine
+// of the *current* process can finalize them — they cannot reach MySQL
+// (isFlushable filters Prepared) and they cannot be reused (the next write to
+// the same key overwrites them via appendDirty), so dropping them at boot is
+// safe and reclaims bbolt space.
+//
+// Sweep runs before flushLoop starts and before any caller can issue a new
+// PrepareEntry, so there is no race with live writers.
+func (s *MySQLStore) sweepPreparedOrphans() (int, error) {
+	var swept int
+	err := s.wal.Update(func(tx *bolt.Tx) error {
+		dirty := tx.Bucket(walDirtyBucket)
+		if dirty == nil {
+			return nil
+		}
+		var stale [][]byte
+		cursor := dirty.Cursor()
+		for key, encoded := cursor.First(); key != nil; key, encoded = cursor.Next() {
+			var entry dirtyEntry
+			if err := json.Unmarshal(encoded, &entry); err != nil {
+				return err
+			}
+			if entry.Record.WALState == WALStatePrepared {
+				stale = append(stale, append([]byte(nil), key...))
+			}
+		}
+		for _, key := range stale {
+			if err := dirty.Delete(key); err != nil {
+				return err
+			}
+		}
+		swept = len(stale)
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("sweep prepared wal records: %w", err)
+	}
+	return swept, nil
+}
+
+// PreparedCount reports the number of WAL records currently in
+// WALStatePrepared. Operators can scrape it as a backpressure / orphan
+// indicator: a steady non-zero value past one flushInterval suggests stuck
+// preparations (process crashed mid-mutation, or Olric mutation failed but
+// AbortEntry's bbolt write also failed). Healthy steady-state is 0; transient
+// spikes during high-throughput writes are normal.
+func (s *MySQLStore) PreparedCount() (int, error) {
+	var count int
+	err := s.wal.View(func(tx *bolt.Tx) error {
+		dirty := tx.Bucket(walDirtyBucket)
+		if dirty == nil {
+			return nil
+		}
+		cursor := dirty.Cursor()
+		for key, encoded := cursor.First(); key != nil; key, encoded = cursor.Next() {
+			var entry dirtyEntry
+			if err := json.Unmarshal(encoded, &entry); err != nil {
+				return err
+			}
+			if entry.Record.WALState == WALStatePrepared {
+				count++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("count prepared wal records: %w", err)
+	}
+	return count, nil
 }
 
 // PurgeBelowGeneration removes WAL records whose fence Generation is strictly

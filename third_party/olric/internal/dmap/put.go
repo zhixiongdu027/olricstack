@@ -342,14 +342,18 @@ func (dm *DMap) putOnCluster(e *env) error {
 		if vErr := hook.VerifyAfterLock(e.ctx, outOfLockOp); vErr != nil {
 			// Lease moved between prepare and lock. Abort the prepared
 			// record by routing through AfterSet with the verify error.
-			_ = hook.AfterSet(e.ctx, outOfLockOp, vErr)
+			if abortErr := hook.AfterSet(e.ctx, outOfLockOp, vErr); abortErr != nil {
+				dm.s.log.V(3).Printf("[ERROR] durable hook abort after verify failure on %s/%s: %v (verify err: %v)", e.dmap, e.key, abortErr, vErr)
+			}
 			return vErr
 		}
 	}
 
 	if err = dm.checkPutConditions(e); err != nil {
 		if hook != nil && outOfLockPrepared {
-			_ = hook.AfterSet(e.ctx, outOfLockOp, err)
+			if abortErr := hook.AfterSet(e.ctx, outOfLockOp, err); abortErr != nil {
+				dm.s.log.V(3).Printf("[ERROR] durable hook abort after checkPutConditions on %s/%s: %v (mut err: %v)", e.dmap, e.key, abortErr, err)
+			}
 		}
 		return err
 	}
@@ -357,7 +361,9 @@ func (dm *DMap) putOnCluster(e *env) error {
 	if dm.config != nil && dm.config.evictionPolicy == config.LRUEviction {
 		if err = dm.setLRUEvictionStats(e); err != nil {
 			if hook != nil && outOfLockPrepared {
-				_ = hook.AfterSet(e.ctx, outOfLockOp, err)
+				if abortErr := hook.AfterSet(e.ctx, outOfLockOp, err); abortErr != nil {
+					dm.s.log.V(3).Printf("[ERROR] durable hook abort after setLRUEvictionStats on %s/%s: %v (mut err: %v)", e.dmap, e.key, abortErr, err)
+				}
 			}
 			return err
 		}

@@ -49,6 +49,13 @@ A re-walk against the live tree confirmed every code anchor in §6/§7 still res
 - **§S5 delete/expire `VerifyAfterLock`** description tightened. Earlier text called it a "no-op when the fence was stamped under the same lock"; in fact `LeaseTracker.mu` and `frag.lock` are independent mutexes, so the verify call closes a small but real interleaving window. Replaced with the precise statement.
 - **§8.1 Trace B** added. Verify-fail / pre-condition-fail paths route through `_ = hook.AfterX(...)` (`put.go:345,352,360`, `delete.go:149,175`) — if the abort's bbolt write fails, the error is swallowed and a Prepared orphan persists silently. Added hardening item #3 to surface these errors at the source.
 
+A follow-up commit closed the actionable gaps surfaced above:
+
+- **§8.1 hardening #1 (boot-time sweep)** — `MySQLStore.Start` now calls `sweepPreparedOrphans` before `flushLoop` starts. Crash-leftover Prepared records are dropped on restart.
+- **§8.1 hardening #2 (PreparedCount gauge)** — `MySQLStore.PreparedCount()` exposes the live count, forwarded by `LeaseGatedStore.PreparedCount`.
+- **§8.1 hardening #3 (surface fork abort errors)** — five `_ = hook.AfterX(...)` call sites in the fork (`put.go` / `delete.go`) now log via `dm.s.log.V(3).Printf("[ERROR] durable hook abort after ...")` when the abort itself fails.
+- New regression tests `TestMySQLStoreSweepsPreparedOrphansAtStart` and `TestMySQLStorePreparedCountReflectsLifecycle` pin the behavior.
+
 ---
 
 ## §1 Component Boundary
@@ -876,16 +883,15 @@ Each weakness is graded **Severity** (impact on safety / liveness if exploited),
 ### 8.1 Orphan `Prepared` WAL records after process crash mid-mutation
 
 - **Severity**: Low. Records cannot reach MySQL (`isFlushable`), cannot be reused by Replay, and are overwritten on the next write to the same key. No invariant violated.
-- **Detectability**: Low. There is no metric for `WALStatePrepared` count. Bbolt growth is the only indirect signal.
-- **Trace A — crash mid-mutation**: §6.4 Cβ. Process dies after `PrepareEntry` (`store.go:600`) but before `CommitEntry` or `AbortEntry` (`store.go:639`/`670`).
-- **Trace B — verify-fail with abort I/O failure (added in this audit)**: `BeforeSet` succeeds; the fork acquires `frag.Lock()`; `VerifyAfterLock` returns non-nil (lease moved). The fork routes through `_ = hook.AfterSet(e.ctx, op, vErr)` (`put.go:345`, mirrored at `delete.go:149,175`). `AfterSet → finalize → AbortEntry` runs in `bbolt.Batch`; if the bbolt write fails (disk full, fsync error, db closing), the error is silently swallowed by the leading `_ =`. The prepared record stays in the WAL with no caller aware of the leak. Same story for `checkPutConditions` / `setLRUEvictionStats` failure branches at `put.go:352, 360`.
+- **Detectability**: Medium since this audit. `MySQLStore.PreparedCount()` exposes a real-time gauge (`store.go:sweepPreparedOrphans` / `PreparedCount`); operators can alert on a steady non-zero value past one flushInterval.
+- **Trace A — crash mid-mutation**: §6.4 Cβ. Process dies after `PrepareEntry` (`store.go:600`) but before `CommitEntry` or `AbortEntry` (`store.go:639`/`670`). Closed by hardening #1.
+- **Trace B — verify-fail with abort I/O failure**: `BeforeSet` succeeds; the fork acquires `frag.Lock()`; `VerifyAfterLock` returns non-nil (lease moved). The fork routes through `hook.AfterSet(e.ctx, op, vErr)` and now logs `[ERROR] durable hook abort after verify failure ...` if the abort itself fails (`put.go` after this audit; mirrored in `delete.go`). Same story for `checkPutConditions` / `setLRUEvictionStats` failure branches. Closed by hardening #1 (boot sweep) + #3 (real-time logging).
 - **Defenses already in place**: `Replay` skips Prepared (`store.go:283`), `PurgeBelowGeneration` skips Prepared (`store.go:249`), `isFlushable` rejects Prepared (`store.go:851`).
-- **Hardening**:
-  1. **Boot-time sweep**: at `MySQLStore.Start`, walk dirty bucket once and Abort all `Prepared` records older than some retention (their fragment was never reached by `AfterSet` for this process; safe to drop). This also covers Trace B since the orphan persists across restart.
-  2. **Metric**: expose `wal_prepared_count` so operators can alert on stuck preparations.
-  3. **Surface AfterX errors from the fork**: replace `_ = hook.AfterX(...)` with logged failure handling (requires plumbing a logger into the fork's `dmap` package) so Trace B becomes observable in real time, not just at the next restart sweep.
-  4. **TTL on Prepared**: stamp `PreparedAt` and reject Commit/Abort past TTL. Risky — would have to tie into request timeout.
-- **Recommendation**: implement #1 + #2 first (closes both traces with no fork churn). #3 is a fork edit, schedule with the next fork-rebase. #4 introduces failure modes worth more than the marginal safety win.
+- **Hardening status**:
+  1. **Boot-time sweep — IMPLEMENTED**. `MySQLStore.Start` calls `sweepPreparedOrphans` before flushLoop launches (`store.go:Start` / `sweepPreparedOrphans`). Drops every Prepared record left by a previous process; safe because `startOnce` ordering rules out races with live writers. Closes Trace A and the persistent residue of Trace B.
+  2. **PreparedCount metric — IMPLEMENTED**. `MySQLStore.PreparedCount()` returns the live gauge; `LeaseGatedStore.PreparedCount` forwards. Wiring to a Prometheus exporter is left to the API-binding work (cf. §1 ingress note).
+  3. **Surface AfterX errors from the fork — IMPLEMENTED**. Five `_ = hook.AfterX(...)` call sites in `put.go` / `delete.go` now log via `dm.s.log.V(3).Printf("[ERROR] durable hook abort after ...")` when the abort returns non-nil. Trace B is observable in real time, not just at the next restart sweep.
+  4. **TTL on Prepared — DEFERRED**. Stamp `PreparedAt` and reject Commit/Abort past TTL. Risky — would have to tie into request timeout. Still tracked here for completeness; revisit only if PreparedCount metric reveals actual long-lived stragglers.
 
 ### 8.2 50 ms drain window in `closeSubscribersForLeadershipChange`
 
