@@ -51,16 +51,16 @@ type EntryRef struct {
 }
 
 type EntryRecord struct {
-	DMap         string    `gorm:"primaryKey;size:256;column:dmap" json:"dmap"`
-	Key          string    `gorm:"column:key;size:512;not null;index:idx_olric_entry_lookup" json:"key"`
-	HKey         uint64    `gorm:"primaryKey;column:hkey" json:"hkey"`
-	EncodedEntry []byte    `gorm:"column:encoded_entry;type:longblob" json:"encoded_entry"`
-	TTL          int64     `gorm:"column:ttl;not null" json:"ttl"`
-	Timestamp    int64     `gorm:"column:timestamp;not null" json:"timestamp"`
-	Tombstone    bool      `gorm:"column:tombstone;not null" json:"tombstone"`
-	Generation   int64     `gorm:"column:generation;not null;index:idx_cache_fence" json:"generation"`
-	Epoch        int64     `gorm:"column:epoch;not null;index:idx_cache_fence" json:"epoch"`
-	OwnerSeq     int64     `gorm:"column:owner_seq;not null;index:idx_cache_fence" json:"owner_seq"`
+	DMap         string `gorm:"primaryKey;size:256;column:dmap" json:"dmap"`
+	Key          string `gorm:"column:key;size:512;not null;index:idx_olric_entry_lookup" json:"key"`
+	HKey         uint64 `gorm:"primaryKey;column:hkey" json:"hkey"`
+	EncodedEntry []byte `gorm:"column:encoded_entry;type:longblob" json:"encoded_entry"`
+	TTL          int64  `gorm:"column:ttl;not null" json:"ttl"`
+	Timestamp    int64  `gorm:"column:timestamp;not null" json:"timestamp"`
+	Tombstone    bool   `gorm:"column:tombstone;not null" json:"tombstone"`
+	Generation   int64  `gorm:"column:generation;not null;index:idx_cache_fence" json:"generation"`
+	Epoch        int64  `gorm:"column:epoch;not null;index:idx_cache_fence" json:"epoch"`
+	OwnerSeq     int64  `gorm:"column:owner_seq;not null;index:idx_cache_fence" json:"owner_seq"`
 	// WriterID identifies the owner node that produced the record. It is the
 	// final tiebreaker in versionedUpsertClause when (Generation, Epoch,
 	// OwnerSeq) compare equal — a corner case that cannot arise under the
@@ -427,19 +427,8 @@ func (s *MySQLStore) FlushHandoff(ctx context.Context, refs []EntryRef) error {
 	if len(refs) == 0 {
 		return nil
 	}
-	s.mu.Lock()
-	if s.closing {
-		s.mu.Unlock()
-		return errors.New("cache store is closed")
-	}
-	s.mu.Unlock()
-
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
 	entries := make([]dirtyEntry, 0, len(refs))
-	err := s.wal.View(func(tx *bolt.Tx) error {
+	err := s.withHandoffEntries(ctx, func(tx *bolt.Tx) error {
 		dirty := tx.Bucket(walDirtyBucket)
 		if dirty == nil {
 			return nil
@@ -463,6 +452,65 @@ func (s *MySQLStore) FlushHandoff(ctx context.Context, refs []EntryRef) error {
 	if err != nil {
 		return fmt.Errorf("collect handoff records: %w", err)
 	}
+	return s.flushHandoffEntries(entries)
+}
+
+// FlushHandoffPartition synchronously flushes every committed WAL record for
+// dmap whose hkey belongs to partitionID under partitionCount. This is the
+// production handoff path: scanning the WAL by partition covers records that
+// are no longer resident in the in-memory fragment, such as committed
+// tombstones or evicted-but-dirty writes.
+func (s *MySQLStore) FlushHandoffPartition(ctx context.Context, dmap string, partitionID, partitionCount uint64) error {
+	if dmap == "" {
+		return errors.New("handoff dmap is empty")
+	}
+	if partitionCount == 0 {
+		return errors.New("handoff partition count is zero")
+	}
+	if partitionID >= partitionCount {
+		return fmt.Errorf("handoff partition id %d out of range %d", partitionID, partitionCount)
+	}
+	entries := make([]dirtyEntry, 0)
+	err := s.withHandoffEntries(ctx, func(tx *bolt.Tx) error {
+		dirty := tx.Bucket(walDirtyBucket)
+		if dirty == nil {
+			return nil
+		}
+		cursor := dirty.Cursor()
+		for _, encoded := cursor.First(); encoded != nil; _, encoded = cursor.Next() {
+			var entry dirtyEntry
+			if err := json.Unmarshal(encoded, &entry); err != nil {
+				return err
+			}
+			record := entry.Record
+			if record.DMap != dmap || record.HKey%partitionCount != partitionID || !isFlushable(record) {
+				continue
+			}
+			entries = append(entries, entry)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("collect handoff partition records: %w", err)
+	}
+	return s.flushHandoffEntries(entries)
+}
+
+func (s *MySQLStore) withHandoffEntries(ctx context.Context, collect func(*bolt.Tx) error) error {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return errors.New("cache store is closed")
+	}
+	s.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.wal.View(collect)
+}
+
+func (s *MySQLStore) flushHandoffEntries(entries []dirtyEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}

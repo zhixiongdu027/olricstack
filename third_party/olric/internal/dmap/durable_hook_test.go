@@ -127,9 +127,11 @@ func TestDurableHookFollowsOwnerWhenIngressIsNotOwner(t *testing.T) {
 }
 
 type recordingDurableHook struct {
-	mu      sync.Mutex
-	origins []string
-	loadErr error
+	mu           sync.Mutex
+	origins      []string
+	handoffCalls []config.DurableHandoff
+	loadErr      error
+	handoffErr   error
 }
 
 func (h *recordingDurableHook) BeforeSet(ctx context.Context, op config.DurableOperation) (config.DurableOperation, error) {
@@ -164,7 +166,10 @@ func (h *recordingDurableHook) VerifyAfterLock(ctx context.Context, op config.Du
 }
 
 func (h *recordingDurableHook) DrainForHandoff(ctx context.Context, handoff config.DurableHandoff) error {
-	return nil
+	h.mu.Lock()
+	h.handoffCalls = append(h.handoffCalls, handoff)
+	h.mu.Unlock()
+	return h.handoffErr
 }
 
 func (h *recordingDurableHook) LoadOnMiss(ctx context.Context, op config.DurableOperation) (storage.Entry, error) {
@@ -186,6 +191,14 @@ func (h *recordingDurableHook) requireOrigins(t *testing.T, origins ...string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	require.Equal(t, origins, h.origins)
+}
+
+func (h *recordingDurableHook) requireHandoff(t *testing.T, count int) config.DurableHandoff {
+	t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	require.Len(t, h.handoffCalls, count)
+	return h.handoffCalls[count-1]
 }
 
 func mustPrimaryFragment(t *testing.T, dm *DMap, hkey uint64) *fragment {

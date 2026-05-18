@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +41,10 @@ type appConfig struct {
 	clientset kubernetes.Interface
 	health    *stackwatchdog.LeadershipHealth
 	terminate func(int)
+
+	topologyMu      sync.Mutex
+	topologyService *topology.Service
+	topologyGen     int64
 }
 
 func main() {
@@ -136,6 +142,7 @@ func runWithLeaderElection(ctx context.Context, cfg *appConfig) {
 				}
 			},
 			OnStoppedLeading: func() {
+				cfg.demoteTopology()
 				cfg.health.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, 0)
 				log.Printf("watchdog lost leadership, exiting for pod restart")
 				cfg.terminate(1)
@@ -158,10 +165,7 @@ func runPrimary(ctx context.Context, cfg *appConfig) error {
 	if err != nil {
 		return err
 	}
-	cfg.health.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY, generation)
-	defer cfg.health.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, 0)
-
-	topologyService := topology.NewServiceWithConfig(topology.Config{
+	topologyCfg := topology.Config{
 		SuspectAfter:     envDuration("SUSPECT_AFTER", 20*time.Second),
 		ExpireAfter:      envDuration("EXPIRE_AFTER", 30*time.Second),
 		ReapInterval:     envDuration("REAP_INTERVAL", 15*time.Second),
@@ -170,14 +174,23 @@ func runPrimary(ctx context.Context, cfg *appConfig) error {
 		WatchdogID:       cfg.identity,
 		Generation:       generation,
 		Role:             topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY,
-	})
+	}
+	epochHealthInterval := envDuration("WATCHDOG_EPOCH_HEALTH_INTERVAL", 5*time.Second)
+	epochFailureThreshold := envInt("WATCHDOG_EPOCH_FAILURE_THRESHOLD", 3)
+	if err := validateWatchdogTiming(topologyCfg, epochHealthInterval, epochFailureThreshold); err != nil {
+		return err
+	}
+	cfg.health.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY, generation)
+	defer cfg.health.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, 0)
+
+	topologyService := topology.NewServiceWithConfig(topologyCfg)
+	cfg.setTopologyService(topologyService, generation)
+	defer cfg.clearTopologyService(topologyService)
 	topologyService.AddLeadershipObserver(cfg.health)
+	defer topologyService.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, generation)
 	go topologyService.RunReaper(ctx)
 	go topologyService.RunBookworm(ctx)
-	go watchEpochHealth(ctx, topologyService, cfg.terminate,
-		envDuration("WATCHDOG_EPOCH_HEALTH_INTERVAL", 5*time.Second),
-		envInt("WATCHDOG_EPOCH_FAILURE_THRESHOLD", 3),
-	)
+	go watchEpochHealth(ctx, topologyService, cfg.terminate, epochHealthInterval, epochFailureThreshold)
 
 	if cfg.k8sClient != nil {
 		topologyService.SetEpochStore(epochStore)
@@ -198,6 +211,47 @@ func runPrimary(ctx context.Context, cfg *appConfig) error {
 	}
 
 	return serveTopology(ctx, cfg, topologyService)
+}
+
+func (cfg *appConfig) setTopologyService(service *topology.Service, generation int64) {
+	cfg.topologyMu.Lock()
+	cfg.topologyService = service
+	cfg.topologyGen = generation
+	cfg.topologyMu.Unlock()
+}
+
+func (cfg *appConfig) clearTopologyService(service *topology.Service) {
+	cfg.topologyMu.Lock()
+	if cfg.topologyService == service {
+		cfg.topologyService = nil
+		cfg.topologyGen = 0
+	}
+	cfg.topologyMu.Unlock()
+}
+
+func (cfg *appConfig) demoteTopology() {
+	cfg.topologyMu.Lock()
+	service := cfg.topologyService
+	generation := cfg.topologyGen
+	cfg.topologyMu.Unlock()
+	if service != nil {
+		service.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, generation)
+	}
+}
+
+func validateWatchdogTiming(cfg topology.Config, epochHealthInterval time.Duration, epochFailureThreshold int) error {
+	if epochHealthInterval <= 0 || epochFailureThreshold <= 0 {
+		return nil
+	}
+	degradedWindow := epochHealthInterval * time.Duration(epochFailureThreshold)
+	bound := cfg.LeaseTTL
+	if cfg.ExpireAfter < bound {
+		bound = cfg.ExpireAfter
+	}
+	if degradedWindow >= bound {
+		return fmt.Errorf("invalid watchdog timing: epoch degraded window %s must be smaller than min lease/expire window %s", degradedWindow, bound)
+	}
+	return nil
 }
 
 // watchEpochHealth terminates the process when topology epoch persistence has

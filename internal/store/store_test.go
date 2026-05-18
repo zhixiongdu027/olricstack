@@ -973,6 +973,67 @@ func TestMySQLStoreFlushHandoffDrainsCommittedRecords(t *testing.T) {
 	}
 }
 
+func TestMySQLStoreFlushHandoffPartitionDrainsNonResidentRecords(t *testing.T) {
+	db := newTestDB(t)
+	walPath := filepath.Join(t.TempDir(), "cache.wal")
+	cacheStore := newTestStoreWithDB(t, db, Config{
+		WALPath:       walPath,
+		FlushInterval: time.Hour,
+		BatchSize:     128,
+	})
+	defer closeStore(t, cacheStore)
+
+	ctx := context.Background()
+	live := testFlushableRecord("resident", 7, []byte("live"))
+	live.DMap = "shared"
+	if err := cacheStore.StoreEntry(ctx, live); err != nil {
+		t.Fatalf("store live: %v", err)
+	}
+	tombstone := testFencedRecord("deleted", 17, nil, 1, 1, 1000)
+	tombstone.DMap = "shared"
+	tombstone.Tombstone = true
+	preparedTombstone, err := cacheStore.PrepareEntry(ctx, tombstone)
+	if err != nil {
+		t.Fatalf("prepare tombstone: %v", err)
+	}
+	if err := cacheStore.CommitEntry(ctx, preparedTombstone.Ref(), preparedTombstone.WALSeq); err != nil {
+		t.Fatalf("commit tombstone: %v", err)
+	}
+	otherPartition := testFlushableRecord("other", 8, []byte("other"))
+	otherPartition.DMap = "shared"
+	if err := cacheStore.StoreEntry(ctx, otherPartition); err != nil {
+		t.Fatalf("store other partition: %v", err)
+	}
+	otherDMap := testFlushableRecord("other-dmap", 27, []byte("other-dmap"))
+	otherDMap.DMap = "private"
+	if err := cacheStore.StoreEntry(ctx, otherDMap); err != nil {
+		t.Fatalf("store other dmap: %v", err)
+	}
+
+	if err := cacheStore.FlushHandoffPartition(ctx, "shared", 7, 10); err != nil {
+		t.Fatalf("flush handoff partition: %v", err)
+	}
+
+	for _, ref := range []EntryRef{
+		{DMap: "shared", HKey: 7},
+		{DMap: "shared", HKey: 17},
+	} {
+		if got, ok, err := cacheStore.loadDirty(ref); err != nil || ok {
+			t.Fatalf("expected drained wal for %+v, ok=%v rec=%+v err=%v", ref, ok, got, err)
+		}
+	}
+	if _, ok, err := cacheStore.loadDirty(EntryRef{DMap: "shared", HKey: 8}); err != nil || !ok {
+		t.Fatalf("other partition record should remain, ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := cacheStore.loadDirty(EntryRef{DMap: "private", HKey: 27}); err != nil || !ok {
+		t.Fatalf("other dmap record should remain, ok=%v err=%v", ok, err)
+	}
+	eventually(t, func() bool {
+		_, err := cacheStore.LoadEntry(ctx, EntryRef{DMap: "shared", HKey: 17})
+		return errors.Is(err, ErrNotFound)
+	})
+}
+
 // TestMySQLStoreFlushHandoffSkipsPreparedAndAbsentRecords ensures the drain
 // path never tries to flush in-flight (Prepared) writes — committing one
 // from outside a hook would corrupt the WAL — and is idempotent when called

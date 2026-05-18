@@ -34,6 +34,22 @@ func TestServiceRegistersHeartbeatAndReturnsTopology(t *testing.T) {
 	}
 }
 
+func TestGetTopologyPersistsEpochBeforeReturning(t *testing.T) {
+	store := &recordingEpochStore{}
+	service := NewServiceWithConfig(Config{EpochStore: store})
+	if err := service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1)}); err != nil {
+		t.Fatalf("register heartbeat: %v", err)
+	}
+
+	resp, err := service.GetTopology(context.Background(), &topologypb.TopologyQuery{StackId: "stack-a"})
+	if err != nil {
+		t.Fatalf("get topology: %v", err)
+	}
+	if store.savedEpoch != resp.GetEpoch() {
+		t.Fatalf("expected GetTopology to persist epoch %d before return, saved %d", resp.GetEpoch(), store.savedEpoch)
+	}
+}
+
 func TestServiceKeepsStacksIsolated(t *testing.T) {
 	service := NewService()
 	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1)})
@@ -478,4 +494,17 @@ func (s *flakyEpochStore) LoadEpoch(context.Context, string) (int64, error) {
 
 func (s *flakyEpochStore) SaveEpoch(context.Context, string, int64) error {
 	return s.err
+}
+
+type recordingEpochStore struct {
+	savedEpoch int64
+}
+
+func (s *recordingEpochStore) LoadEpoch(context.Context, string) (int64, error) {
+	return 0, nil
+}
+
+func (s *recordingEpochStore) SaveEpoch(_ context.Context, _ string, epoch int64) error {
+	s.savedEpoch = epoch
+	return nil
 }

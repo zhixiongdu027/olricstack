@@ -19,9 +19,11 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/olric-data/olric/config"
 	"github.com/olric-data/olric/internal/cluster/partitions"
 	"github.com/olric-data/olric/internal/testcluster"
 	"github.com/olric-data/olric/internal/testutil"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDMap_Fragment(t *testing.T) {
@@ -121,3 +123,30 @@ func TestDMap_Fragment_Concurrent_Access(t *testing.T) {
 		}
 	}
 }
+
+func TestFragmentMoveDrainsEvenWhenResidentSetIsEmpty(t *testing.T) {
+	hook := &recordingDurableHook{}
+	cfg := testutil.NewConfig()
+	cfg.DurableHook = hook
+	cluster := testcluster.New(NewService)
+	s := cluster.AddMember(testcluster.NewEnvironment(cfg)).(*Service)
+	defer cluster.Shutdown()
+
+	dm, err := s.NewDMap("mydmap")
+	require.NoError(t, err)
+
+	part := dm.getPartitionByHKey(123, partitions.PRIMARY)
+	f, err := dm.loadOrCreateFragment(part)
+	require.NoError(t, err)
+
+	err = f.Move(part, "dmap.mydmap", nil)
+	require.NoError(t, err)
+
+	handoff := hook.requireHandoff(t, 1)
+	require.Equal(t, "mydmap", handoff.DMap)
+	require.Equal(t, part.ID(), handoff.PartitionID)
+	require.Equal(t, s.config.PartitionCount, handoff.PartitionCount)
+	require.Empty(t, handoff.HKeys)
+}
+
+var _ config.DurableHook = (*recordingDurableHook)(nil)

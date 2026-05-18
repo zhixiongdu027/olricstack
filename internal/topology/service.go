@@ -175,7 +175,11 @@ func (s *Service) GetTopology(ctx context.Context, req *topologypb.TopologyQuery
 		return nil, err
 	}
 	s.pruneExpiredLocked(req.GetStackId(), state, time.Now())
-	return s.envelopeFor(req.GetStackId(), state, topologypb.TopologyReason_TOPOLOGY_REASON_BOOKWORM), nil
+	envelope := s.envelopeFor(req.GetStackId(), state, topologypb.TopologyReason_TOPOLOGY_REASON_BOOKWORM)
+	if err := s.saveEpochLocked(ctx, req.GetStackId(), envelope.GetEpoch()); err != nil {
+		return nil, err
+	}
+	return envelope, nil
 }
 
 func (s *Service) Watch(stream topologypb.TopologyControl_WatchServer) error {
@@ -488,15 +492,15 @@ func (s *Service) AddLeadershipObserver(observer LeadershipObserver) {
 // closeSubscribersForLeadershipChange demotes every active stream to a
 // standby state in two phases:
 //
-//   Phase 1 (under s.mu): drain any pending envelope from each subscriber
-//   channel, post a fresh PRIMARY_CHANGE envelope, and remove the subscriber
-//   from the per-stack map so no later broadcast can target it.
+//	Phase 1 (under s.mu): drain any pending envelope from each subscriber
+//	channel, post a fresh PRIMARY_CHANGE envelope, and remove the subscriber
+//	from the per-stack map so no later broadcast can target it.
 //
-//   Phase 2 (outside s.mu, after a short drain window): close sub.done so the
-//   Watch goroutine returns. The drain window lets Watch's select pick the
-//   standby envelope from sub.ch first; closing sub.done immediately would
-//   leave the Go runtime free to pick the done branch instead, dropping the
-//   demotion signal on the wire and forcing nodes to wait for the lease TTL.
+//	Phase 2 (outside s.mu, after a short drain window): close sub.done so the
+//	Watch goroutine returns. The drain window lets Watch's select pick the
+//	standby envelope from sub.ch first; closing sub.done immediately would
+//	leave the Go runtime free to pick the done branch instead, dropping the
+//	demotion signal on the wire and forcing nodes to wait for the lease TTL.
 func (s *Service) closeSubscribersForLeadershipChange() {
 	type pendingSub struct {
 		stackID  string

@@ -22,10 +22,10 @@ var (
 //
 // A static interface assertion at the bottom of this file pins this contract.
 type LeaseGatedStore struct {
-	inner    store.CacheStore
-	commit   store.CommitStore // optional; nil if inner does not support 2PC
-	lease    *LeaseTracker
-	now      func() time.Time
+	inner  store.CacheStore
+	commit store.CommitStore // optional; nil if inner does not support 2PC
+	lease  *LeaseTracker
+	now    func() time.Time
 }
 
 func NewLeaseGatedStore(inner store.CacheStore, lease *LeaseTracker) (*LeaseGatedStore, error) {
@@ -156,6 +156,19 @@ func (s *LeaseGatedStore) FlushHandoff(ctx context.Context, refs []store.EntryRe
 	}
 	if d, ok := s.inner.(drainer); ok {
 		return d.FlushHandoff(ctx, refs)
+	}
+	return nil
+}
+
+// FlushHandoffPartition forwards a partition-scoped synchronous handoff drain
+// to the inner store. See FlushHandoff for why the lease gate is intentionally
+// not enforced here.
+func (s *LeaseGatedStore) FlushHandoffPartition(ctx context.Context, dmap string, partitionID, partitionCount uint64) error {
+	type drainer interface {
+		FlushHandoffPartition(context.Context, string, uint64, uint64) error
+	}
+	if d, ok := s.inner.(drainer); ok {
+		return d.FlushHandoffPartition(ctx, dmap, partitionID, partitionCount)
 	}
 	return nil
 }

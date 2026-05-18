@@ -101,11 +101,16 @@ The preferred implementation keeps Olric as a black-box in-process engine behind
 
 See [Durable String KV Design](docs/durable-string-kv-design.md) for the authoritative persistence architecture, proxy-layer persistence boundary, operation-origin matrix, WAL model, and failure tests.
 
-Watchdog reconciles Pod observations by Pod name first and only falls back to Pod IP for nodes without a known Pod name. This avoids marking an old member terminal when Kubernetes rapidly reuses an IP for a different Pod. If a primary Watchdog loses its Kubernetes Lease, it marks itself not ready, closes existing topology streams, and terminates the process so nodes reconnect to the newly promoted primary.
+Watchdog reconciles Pod observations by Pod name first and only falls back to Pod IP for nodes without a known Pod name. This avoids marking an old member terminal when Kubernetes rapidly reuses an IP for a different Pod. If a primary Watchdog loses its Kubernetes Lease, it sends a standby topology envelope to active streams, marks itself not ready, and terminates the process so nodes reconnect to the newly promoted primary.
 
 ## Kubernetes
 
 The bootstrap Operator creates only the Watchdog Deployment/Service for each `OlricStack`. Each Watchdog then reads its own `OlricStack` and reconciles that stack's Olric StatefulSet and headless Service. This keeps high-frequency Olric control local to the stack and reduces pressure on the global Operator.
+
+The Olric headless Service is an internal cluster/memberlist endpoint, not the
+durable business API. Durable clients must enter through the string KV service
+boundary once an external transport is bound; calling the native Olric port
+directly bypasses the first serving-lease gate.
 
 Install the CRD and RBAC:
 

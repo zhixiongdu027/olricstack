@@ -137,13 +137,16 @@ The production implementation must satisfy these invariants:
 - Make owner readiness depend on durable handoff completion.
 - Add migration/rebalance crash tests.
 
-**Status (option A — synchronous drain before handoff)**: implemented. The
-`config.DurableHook` interface gained `DrainForHandoff(ctx, handoff)`, the
-fork's `fragment.Move` calls it under the fragment lock before exporting,
-the owner-side hook routes to `MySQLStore.FlushHandoff`, and a drain failure
-aborts the migration so the old owner keeps serving until retry. See
-`docs/formal-interaction-model.md §8.6 / F13` for the full proof walk and
-test list. Options B and C are not currently planned.
+**Status (option A — synchronous partition drain before handoff)**:
+implemented. The `config.DurableHook` interface gained
+`DrainForHandoff(ctx, handoff)`, the fork's `fragment.Move` calls it under the
+fragment lock before exporting, and the owner-side hook routes to
+`MySQLStore.FlushHandoffPartition`. The store drains committed WAL records by
+`(DMap, PartitionID, PartitionCount)`, not just by resident in-memory hkeys, so
+committed tombstones and evicted-but-dirty records are included. A drain
+failure aborts the migration so the old owner keeps serving until retry. See
+`docs/formal-interaction-model.md §8.6 / F13` for the full proof walk and test
+list. Options B and C are not currently planned.
 
 #### Phase 5: Operational Backpressure And Observability
 

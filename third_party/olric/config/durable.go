@@ -27,15 +27,16 @@ type DurableOperation struct {
 }
 
 // DurableHandoff describes a single fragment that is about to be migrated
-// away from the local node. The fork populates DMap, PartitionID and the
-// full set of HKeys currently resident in the fragment, then invokes
-// DurableHook.DrainForHandoff under the fragment lock. The hook is expected
-// to flush every committed WAL record for these HKeys synchronously before
-// returning nil.
+// away from the local node. The fork populates DMap, PartitionID and
+// PartitionCount, then invokes DurableHook.DrainForHandoff under the fragment
+// lock. HKeys contains the resident in-memory keys as a compatibility hint, but
+// a durable implementation should drain by partition scope so tombstones and
+// evicted-but-dirty records are covered too.
 type DurableHandoff struct {
-	DMap        string
-	PartitionID uint64
-	HKeys       []uint64
+	DMap           string
+	PartitionID    uint64
+	PartitionCount uint64
+	HKeys          []uint64
 }
 
 type DurableHook interface {
@@ -67,9 +68,9 @@ type DurableHook interface {
 	// DrainForHandoff is called by the fork immediately before exporting a
 	// fragment's payload during partition rebalance / migration. The hook
 	// must synchronously flush every committed durable record for the given
-	// (DMap, HKeys) to its terminal store (MySQL) before returning nil. A
-	// non-nil return aborts the migration: the fork releases the fragment
-	// lock without exporting, and the cluster balancer is expected to
-	// retry. Hooks that do not maintain a durable WAL may return nil.
+	// partition to its terminal store (MySQL) before returning nil. A non-nil
+	// return aborts the migration: the fork releases the fragment lock without
+	// exporting, and the cluster balancer is expected to retry. Hooks that do
+	// not maintain a durable WAL may return nil.
 	DrainForHandoff(ctx context.Context, handoff DurableHandoff) error
 }

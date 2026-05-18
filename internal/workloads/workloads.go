@@ -30,6 +30,9 @@ const (
 	OlricDataMountPath  = "/var/lib/olricstack"
 
 	WatchdogClusterRoleName = "olricstack-watchdog"
+
+	AnnotationServiceScope = "olric.io/service-scope"
+	ServiceScopeInternal   = "internal-cluster-only"
 )
 
 func StackLabels(stack *olricv1alpha1.OlricStack, component string) map[string]string {
@@ -166,9 +169,10 @@ func OlricHeadlessService(stack *olricv1alpha1.OlricStack) *corev1.Service {
 	labels := StackLabels(stack, ComponentOlricNode)
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      OlricName(stack),
-			Namespace: stack.Namespace,
-			Labels:    labels,
+			Name:        OlricName(stack),
+			Namespace:   stack.Namespace,
+			Labels:      labels,
+			Annotations: map[string]string{AnnotationServiceScope: ServiceScopeInternal},
 		},
 		Spec: corev1.ServiceSpec{
 			ClusterIP: "None",

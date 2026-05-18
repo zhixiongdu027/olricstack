@@ -459,6 +459,31 @@ func TestDurableHookDrainForHandoffForwardsToCommitStore(t *testing.T) {
 	}
 }
 
+func TestDurableHookDrainForHandoffPrefersPartitionDrain(t *testing.T) {
+	backing := newRecordingCommitStore()
+	hook := newTestDurableHook(t, backing, fenceAt(1, 1))
+
+	err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{
+		DMap:           "users",
+		PartitionID:    7,
+		PartitionCount: 271,
+		HKeys:          []uint64{101},
+	})
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(backing.partitionHandoffCalls) != 1 {
+		t.Fatalf("expected one partition drain call, got %d", len(backing.partitionHandoffCalls))
+	}
+	got := backing.partitionHandoffCalls[0]
+	if got.dmap != "users" || got.partitionID != 7 || got.partitionCount != 271 {
+		t.Fatalf("unexpected partition drain call: %+v", got)
+	}
+	if len(backing.handoffCalls) != 0 {
+		t.Fatalf("hkey fallback should not run when partition drain is available")
+	}
+}
+
 func TestDurableHookDrainForHandoffSurfacesFailure(t *testing.T) {
 	backing := newRecordingCommitStore()
 	backing.handoffErr = errors.New("mysql is down")

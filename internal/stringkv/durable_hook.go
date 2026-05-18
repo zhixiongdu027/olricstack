@@ -43,8 +43,8 @@ type FenceSequencer interface {
 //     gate, to close any window where the lease lapsed mid-call.
 //
 //  2. After*(op, mutErr) runs unconditionally:
-//        mutErr == nil ⇒ CommitEntry(WALSeq)
-//        mutErr != nil ⇒ AbortEntry(WALSeq)
+//     mutErr == nil ⇒ CommitEntry(WALSeq)
+//     mutErr != nil ⇒ AbortEntry(WALSeq)
 //     This makes prepared records that never reached cluster-wide success
 //     unflushable to MySQL, satisfying FT-1 and FT-2.
 //
@@ -204,7 +204,7 @@ func (h *DurableHook) LoadOnMiss(ctx context.Context, op olricconfig.DurableOper
 // fragment to MySQL synchronously, so the new owner can take over without
 // the old WAL holding writes that have already been acknowledged. The fork
 // calls this from inside the per-fragment write lock during partition
-// rebalance, so no concurrent BeforeX/AfterX runs against these keys.
+// rebalance, so no concurrent BeforeX/AfterX runs against this partition.
 //
 // A non-nil return aborts the migration. The fork then leaves the fragment
 // in place; the cluster balancer is expected to retry. Aborting on drain
@@ -215,17 +215,27 @@ func (h *DurableHook) LoadOnMiss(ctx context.Context, op olricconfig.DurableOper
 //   - If the old owner is then evicted or its WAL volume is wiped, the
 //     unflushed write is lost.
 //
-// We defer the heavy lifting to MySQLStore.FlushHandoff via the optional
-// `drainer` interface on the committer; hooks wired with an inner that
-// does not implement it (test profiles) treat this as a no-op.
+// We prefer partition-scoped draining because the in-memory resident hkey set
+// does not include tombstones or evicted-but-dirty records. The older hkey-list
+// path remains as a compatibility fallback for test doubles and non-partition
+// stores.
 func (h *DurableHook) DrainForHandoff(ctx context.Context, handoff olricconfig.DurableHandoff) error {
+	type partitionDrainer interface {
+		FlushHandoffPartition(context.Context, string, uint64, uint64) error
+	}
+	if flusher, ok := h.committer.(partitionDrainer); ok && handoff.PartitionCount > 0 {
+		if err := flusher.FlushHandoffPartition(ctx, handoff.DMap, handoff.PartitionID, handoff.PartitionCount); err != nil {
+			return fmt.Errorf("drain partition %d for %s: %w", handoff.PartitionID, handoff.DMap, err)
+		}
+		return nil
+	}
 	if len(handoff.HKeys) == 0 {
 		return nil
 	}
-	type drainer interface {
+	type refDrainer interface {
 		FlushHandoff(context.Context, []store.EntryRef) error
 	}
-	flusher, ok := h.committer.(drainer)
+	flusher, ok := h.committer.(refDrainer)
 	if !ok {
 		return nil
 	}

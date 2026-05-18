@@ -92,15 +92,14 @@ func (f *fragment) Move(part *partitions.Partition, name string, owners []discov
 			hkeys = append(hkeys, hkey)
 			return true
 		})
-		if len(hkeys) > 0 {
-			if err := hook.DrainForHandoff(f.service.ctx, config.DurableHandoff{
-				DMap:        dmapName,
-				PartitionID: part.ID(),
-				HKeys:       hkeys,
-			}); err != nil {
-				f.service.log.V(2).Printf("[ERROR] durable handoff drain failed for dmap=%s part=%d: %v", dmapName, part.ID(), err)
-				return err
-			}
+		if err := hook.DrainForHandoff(f.service.ctx, config.DurableHandoff{
+			DMap:           dmapName,
+			PartitionID:    part.ID(),
+			PartitionCount: f.service.config.PartitionCount,
+			HKeys:          hkeys,
+		}); err != nil {
+			f.service.log.V(2).Printf("[ERROR] durable handoff drain failed for dmap=%s part=%d: %v", dmapName, part.ID(), err)
+			return err
 		}
 	}
 

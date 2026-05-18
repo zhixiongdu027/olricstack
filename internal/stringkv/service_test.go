@@ -226,11 +226,18 @@ var _ store.CacheStore = (*recordingStore)(nil)
 
 type recordingCommitStore struct {
 	*recordingStore
-	nextVersion    int64
-	committedCount int
-	abortedCount   int
-	handoffCalls   [][]store.EntryRef
-	handoffErr     error
+	nextVersion           int64
+	committedCount        int
+	abortedCount          int
+	handoffCalls          [][]store.EntryRef
+	partitionHandoffCalls []partitionHandoffCall
+	handoffErr            error
+}
+
+type partitionHandoffCall struct {
+	dmap           string
+	partitionID    uint64
+	partitionCount uint64
 }
 
 func newRecordingCommitStore() *recordingCommitStore {
@@ -289,5 +296,14 @@ var _ store.CommitStore = (*recordingCommitStore)(nil)
 func (s *recordingCommitStore) FlushHandoff(ctx context.Context, refs []store.EntryRef) error {
 	cloned := append([]store.EntryRef(nil), refs...)
 	s.handoffCalls = append(s.handoffCalls, cloned)
+	return s.handoffErr
+}
+
+func (s *recordingCommitStore) FlushHandoffPartition(ctx context.Context, dmap string, partitionID, partitionCount uint64) error {
+	s.partitionHandoffCalls = append(s.partitionHandoffCalls, partitionHandoffCall{
+		dmap:           dmap,
+		partitionID:    partitionID,
+		partitionCount: partitionCount,
+	})
 	return s.handoffErr
 }

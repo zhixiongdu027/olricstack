@@ -81,6 +81,9 @@ func TestControllerReconcilesOlricResourcesForOwnStack(t *testing.T) {
 	if service.Spec.ClusterIP != "None" {
 		t.Fatalf("expected headless service, got clusterIP %q", service.Spec.ClusterIP)
 	}
+	if service.Annotations[workloads.AnnotationServiceScope] != workloads.ServiceScopeInternal {
+		t.Fatalf("expected internal-only Olric service annotation, got %#v", service.Annotations)
+	}
 	if len(service.Spec.Ports) != 2 || service.Spec.Ports[0].Name != "olric" || service.Spec.Ports[0].Port != workloads.OlricPort || service.Spec.Ports[1].Name != "memberlist" || service.Spec.Ports[1].Port != workloads.MemberlistPort {
 		t.Fatalf("expected Olric and memberlist service ports, got %#v", service.Spec.Ports)
 	}
