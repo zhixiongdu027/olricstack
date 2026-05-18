@@ -56,6 +56,10 @@ A follow-up commit closed the actionable gaps surfaced above:
 - **§8.1 hardening #3 (surface fork abort errors)** — five `_ = hook.AfterX(...)` call sites in the fork (`put.go` / `delete.go`) now log via `dm.s.log.V(3).Printf("[ERROR] durable hook abort after ...")` when the abort itself fails.
 - New regression tests `TestMySQLStoreSweepsPreparedOrphansAtStart` and `TestMySQLStorePreparedCountReflectsLifecycle` pin the behavior.
 
+A second follow-up closed the highest-severity remaining gap:
+
+- **§8.6 / F13 (Phase 4 durable handoff) — IMPLEMENTED via synchronous drain (option A)**. `DurableHook` gained `DrainForHandoff(ctx, handoff)`. The fork's `fragment.Move` invokes it under `f.Lock()` before exporting, passing every resident hkey. The hook routes to `MySQLStore.FlushHandoff`, which flushes the matching committed WAL records to MySQL synchronously and deletes them from bbolt. Drain failure aborts migration so the old owner can keep serving until the next retry. Regression tests in `internal/store/store_test.go` and `internal/stringkv/durable_hook_test.go` cover drain success, prepared-skip, mysql-down abort, and empty-set no-op.
+
 ---
 
 ## §1 Component Boundary
@@ -868,11 +872,12 @@ A subtle hazard: if `OwnerSequence.Stamp` is called with `(G₁, E₂)` on N₂ 
 5. Client thinks the write succeeded; MySQL has nothing; new GET on N₂ misses, LoadOnMiss returns ErrKeyNotFound → S1 violated.
 
 **Defense**:
-- **Currently incomplete**, acknowledged in `docs/production-robustness-plan.md §"Phase 4: Durable Ownership Handoff"` as Known Production Gap #5. There is no migration handoff for dirty WAL records.
-- **Partial protection**: N₁ keeps its bbolt WAL across membership changes — there is no automatic clear on migration. The flusher continues running on N₁ and will drain to MySQL on its own schedule. So provided N₁ stays alive long enough for one flush tick, the record reaches MySQL even after migration.
-- **Failure mode**: if N₁ restarts AND its WAL is on ephemeral storage, the record is lost. The Operator deploys Olric as a StatefulSet with PVCs (`internal/workloads/workloads.go` builds `VolumeClaimTemplates`), so this is mitigated in production-grade deployments.
+- **Synchronous drain on handoff (Phase 4 option A, IMPLEMENTED)**: `fragment.Move` (`third_party/olric/internal/dmap/fragment.go`) now collects every resident `hkey` in the migrating fragment and calls `DurableHook.DrainForHandoff` while still holding `f.Lock()`. The hook (`internal/stringkv/durable_hook.go::DrainForHandoff`) translates the set into `EntryRef`s and forwards them to `MySQLStore.FlushHandoff` (`internal/store/store.go`) which synchronously flushes every committed WAL record for those refs to MySQL and removes them from bbolt. The whole drain runs inside the fragment lock so no concurrent `BeforeX/AfterX` can race.
+- **Drain failure aborts migration**: if `FlushHandoff` returns an error (MySQL outage, disk failure), `DrainForHandoff` propagates it, `fragment.Move` returns the error, and the cluster balancer leaves the fragment on N₁. The old owner remains write-serving until the next flush tick clears the WAL, at which point the next balancer cycle can retry. No silent data loss.
+- **Prepared records left alone**: in-flight prepares (`WALStatePrepared`) are skipped by `FlushHandoff` so their `BeforeX/AfterX` finalize protocol is unaffected. They cannot reach MySQL anyway (see §S2).
+- **Defense in depth**: even if a future regression skips the drain, N₁ keeps its bbolt WAL across membership changes; the flusher continues running on N₁ and will drain to MySQL on its own schedule. The Operator deploys Olric as a StatefulSet with PVCs (`internal/workloads/workloads.go` builds `VolumeClaimTemplates`), so the WAL volume survives Pod restart.
 
-**Residual**: this is the biggest known production gap. Forwarded to §8.6 (fragment migration WAL handoff). The §9 TLA+ migration list has this scenario flagged for explicit modeling once Phase 4 is implemented.
+**Residual**: rare — the only remaining gap is "old owner crashes between drain and re-handoff, losing a partition's worth of acked writes that *just* arrived after the drain ran". Mitigated in practice by the drain being synchronous (the rebalance flow holds the fragment lock the whole time, so no new writes land between drain and handoff complete). The §9 TLA+ migration list still tracks this scenario for explicit modelling once we lift the proofs to TLA+.
 
 ---
 
@@ -934,13 +939,18 @@ Each weakness is graded **Severity** (impact on safety / liveness if exploited),
   2. Prove the no-equal-fence invariant formally: `Stamp` only ever returns `(G, E, S)` with strict `S` increment per `(G, E)` per node, but two nodes with the same `(G, E)` can independently produce `S=1`.
 - **Recommendation**: #1 — add a `writer_id` column, include in comparator. ~30 min change. Note `writer_id` is already in the schema design (`docs/durable-string-kv-design.md §"MySQL Record"`) but not yet in the upsert comparator.
 
-### 8.6 Fragment migration WAL handoff not implemented (Phase 4)
+### 8.6 Fragment migration WAL handoff (Phase 4) — IMPLEMENTED via synchronous drain
 
-- **Severity**: High in pathological deployments (ephemeral WAL volume + rapid migration), Low in StatefulSet-with-PVC default deployments.
-- **Trace**: §7 F13. No mechanism to flush old-owner committed WAL before handoff or transfer WAL state with the fragment.
-- **Defenses in place**: PVC-backed WAL persists across Pod restart; flusher resumes after restart and drains to MySQL.
-- **Hardening**: implement Phase 4 from `docs/production-robustness-plan.md`. Three options listed there; "force new owner to create equivalent durable checkpoint before becoming write-ready" is the simplest to bolt on.
-- **Recommendation**: this is the only weakness here that could cause silent data loss under expected deployment shapes. Prioritize for the next hardening sprint.
+- **Severity (post-fix)**: Low. A drain failure aborts migration cleanly; the old owner keeps the WAL until the next flush succeeds, then the balancer can retry. No silent data loss path remains under expected deployment shapes (StatefulSet + PVC).
+- **Trace**: §7 F13. Fork's `fragment.Move` (`third_party/olric/internal/dmap/fragment.go`) now calls `DurableHook.DrainForHandoff` inside `f.Lock()` before exporting in-memory state.
+- **Implementation**:
+  - `config.DurableHandoff{DMap, PartitionID, HKeys}` carries the handoff descriptor.
+  - `stringkv.DurableHook.DrainForHandoff` builds `EntryRef`s and forwards to `LeaseGatedStore.FlushHandoff` → `MySQLStore.FlushHandoff`.
+  - `FlushHandoff` collects only `isFlushable` records (no Prepared, no records without a fence), runs them through the existing `flushEntries` + `versionedUpsertClause` path, then `deleteFlushed`.
+  - On any error the WAL is left intact and the error propagates back up through the fork, aborting the migration.
+- **Tests**: `TestMySQLStoreFlushHandoffDrainsCommittedRecords`, `TestMySQLStoreFlushHandoffSkipsPreparedAndAbsentRecords`, `TestMySQLStoreFlushHandoffSurfacesFlushFailure`, `TestDurableHookDrainForHandoff{ForwardsToCommitStore,SurfacesFailure,NoOpOnEmpty}`.
+- **Cost**: every fragment migration now incurs one synchronous MySQL batch upsert latency (~tens of ms for typical batches). Acceptable for OlricStack (cache-with-MySQL-truth model).
+- **Residual / future work**: Phase 4 options B (cross-node WAL state transfer) and C (new-owner barrier checkpoint) would be needed only if option A's MySQL dependency during migration is unacceptable. Not currently planned.
 
 ### 8.7 No singleflight for concurrent `LoadOnMiss` on the same key
 

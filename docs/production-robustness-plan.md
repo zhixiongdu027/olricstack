@@ -94,7 +94,7 @@ The production implementation must satisfy these invariants:
    fencing must use topology/owner epochs and per-owner monotonic sequences.
 5. Fragment migration/rebalance does not yet define durable WAL handoff. Memory
    transfer without durable transfer can lose unflushed owner-local WAL state if
-   the old owner disappears.
+   the old owner disappears. **(Closed by Phase 4 option A — see below.)**
 6. WAL replay and serving lease checks need separate semantics. Local recovery
    should not be blocked by a normal serving lease, but replayed records must
    still be validated against ownership/fence state before serving.
@@ -136,6 +136,14 @@ The production implementation must satisfy these invariants:
   before it becomes write-ready.
 - Make owner readiness depend on durable handoff completion.
 - Add migration/rebalance crash tests.
+
+**Status (option A — synchronous drain before handoff)**: implemented. The
+`config.DurableHook` interface gained `DrainForHandoff(ctx, handoff)`, the
+fork's `fragment.Move` calls it under the fragment lock before exporting,
+the owner-side hook routes to `MySQLStore.FlushHandoff`, and a drain failure
+aborts the migration so the old owner keeps serving until retry. See
+`docs/formal-interaction-model.md §8.6 / F13` for the full proof walk and
+test list. Options B and C are not currently planned.
 
 #### Phase 5: Operational Backpressure And Observability
 

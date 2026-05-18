@@ -226,9 +226,11 @@ var _ store.CacheStore = (*recordingStore)(nil)
 
 type recordingCommitStore struct {
 	*recordingStore
-	nextVersion     int64
-	committedCount  int
-	abortedCount    int
+	nextVersion    int64
+	committedCount int
+	abortedCount   int
+	handoffCalls   [][]store.EntryRef
+	handoffErr     error
 }
 
 func newRecordingCommitStore() *recordingCommitStore {
@@ -283,3 +285,9 @@ func (s *recordingCommitStore) storePrepared(record store.EntryRecord) (store.En
 }
 
 var _ store.CommitStore = (*recordingCommitStore)(nil)
+
+func (s *recordingCommitStore) FlushHandoff(ctx context.Context, refs []store.EntryRef) error {
+	cloned := append([]store.EntryRef(nil), refs...)
+	s.handoffCalls = append(s.handoffCalls, cloned)
+	return s.handoffErr
+}

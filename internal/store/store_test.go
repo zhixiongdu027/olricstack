@@ -864,6 +864,145 @@ func TestMySQLStorePurgeBelowGenerationIsNoOpWhenMinIsZero(t *testing.T) {
 	}
 }
 
+// TestMySQLStoreFlushHandoffDrainsCommittedRecords covers §8.6 / Phase 4
+// fragment handoff drain. A committed record must reach MySQL and leave the
+// WAL synchronously so the new owner can serve the key after migration.
+func TestMySQLStoreFlushHandoffDrainsCommittedRecords(t *testing.T) {
+	db := newTestDB(t)
+	walPath := filepath.Join(t.TempDir(), "cache.wal")
+	cacheStore := newTestStoreWithDB(t, db, Config{
+		WALPath:       walPath,
+		FlushInterval: time.Hour,
+		BatchSize:     128,
+	})
+	defer closeStore(t, cacheStore)
+
+	ctx := context.Background()
+	rec := testFlushableRecord("hand:1", 71, []byte("v1"))
+	rec.DMap = "shared"
+	if err := cacheStore.StoreEntry(ctx, rec); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	rec2 := testFlushableRecord("hand:2", 72, []byte("v2"))
+	rec2.DMap = "shared"
+	if err := cacheStore.StoreEntry(ctx, rec2); err != nil {
+		t.Fatalf("store rec2: %v", err)
+	}
+
+	if err := cacheStore.FlushHandoff(ctx, []EntryRef{
+		{DMap: "shared", HKey: 71},
+		{DMap: "shared", HKey: 72},
+	}); err != nil {
+		t.Fatalf("flush handoff: %v", err)
+	}
+
+	// The dirty WAL must be empty for both refs.
+	if got, _, _ := cacheStore.loadDirty(EntryRef{DMap: "shared", HKey: 71}); got.HKey != 0 {
+		t.Fatalf("wal entry 71 still present after handoff: %+v", got)
+	}
+	if got, _, _ := cacheStore.loadDirty(EntryRef{DMap: "shared", HKey: 72}); got.HKey != 0 {
+		t.Fatalf("wal entry 72 still present after handoff: %+v", got)
+	}
+	// MySQL must hold the latest value.
+	loaded, err := cacheStore.LoadEntry(ctx, EntryRef{DMap: "shared", HKey: 71})
+	if err != nil {
+		t.Fatalf("load 71 after handoff: %v", err)
+	}
+	if string(loaded.EncodedEntry) != "v1" {
+		t.Fatalf("expected MySQL row for 71 = v1, got %q", loaded.EncodedEntry)
+	}
+}
+
+// TestMySQLStoreFlushHandoffSkipsPreparedAndAbsentRecords ensures the drain
+// path never tries to flush in-flight (Prepared) writes — committing one
+// from outside a hook would corrupt the WAL — and is idempotent when called
+// against keys that were already flushed.
+func TestMySQLStoreFlushHandoffSkipsPreparedAndAbsentRecords(t *testing.T) {
+	db := newTestDB(t)
+	walPath := filepath.Join(t.TempDir(), "cache.wal")
+	cacheStore := newTestStoreWithDB(t, db, Config{
+		WALPath:       walPath,
+		FlushInterval: time.Hour,
+		BatchSize:     128,
+	})
+	defer closeStore(t, cacheStore)
+
+	ctx := context.Background()
+	prep := testFlushableRecord("prep", 81, []byte("inflight"))
+	prep.DMap = "shared"
+	prepared, err := cacheStore.PrepareEntry(ctx, prep)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+
+	if err := cacheStore.FlushHandoff(ctx, []EntryRef{
+		{DMap: "shared", HKey: 81}, // Prepared — skip
+		{DMap: "shared", HKey: 82}, // absent — skip
+	}); err != nil {
+		t.Fatalf("flush handoff with prepared+absent: %v", err)
+	}
+
+	// Prepared record must still be in the WAL, untouched.
+	got, ok, err := cacheStore.loadDirty(EntryRef{DMap: "shared", HKey: 81})
+	if err != nil {
+		t.Fatalf("load prepared after handoff: %v", err)
+	}
+	if !ok || got.WALState != WALStatePrepared || got.WALSeq != prepared.WALSeq {
+		t.Fatalf("prepared record disturbed by handoff: ok=%v rec=%+v", ok, got)
+	}
+
+	// Empty input must also be a no-op.
+	if err := cacheStore.FlushHandoff(ctx, nil); err != nil {
+		t.Fatalf("flush handoff with nil refs: %v", err)
+	}
+}
+
+// TestMySQLStoreFlushHandoffSurfacesFlushFailure pins the handoff abort
+// behaviour: when MySQL is unreachable the drain returns an error and the
+// WAL keeps the record so the next regular flush (or a balancer retry) can
+// re-attempt.
+func TestMySQLStoreFlushHandoffSurfacesFlushFailure(t *testing.T) {
+	db := newTestDB(t)
+	walPath := filepath.Join(t.TempDir(), "cache.wal")
+	cacheStore := newTestStoreWithDB(t, db, Config{
+		WALPath:       walPath,
+		FlushInterval: time.Hour,
+		BatchSize:     128,
+	})
+
+	ctx := context.Background()
+	rec := testFlushableRecord("hand:fail", 91, []byte("v"))
+	rec.DMap = "shared"
+	if err := cacheStore.StoreEntry(ctx, rec); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	// Slam the SQLite db shut to simulate MySQL outage.
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("db handle: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close sql db: %v", err)
+	}
+
+	if err := cacheStore.FlushHandoff(ctx, []EntryRef{{DMap: "shared", HKey: 91}}); err == nil {
+		t.Fatalf("expected flush handoff to surface mysql failure, got nil")
+	}
+
+	// WAL must still hold the record so the next flush can retry.
+	got, ok, _ := cacheStore.loadDirty(EntryRef{DMap: "shared", HKey: 91})
+	if !ok || got.HKey != 91 {
+		t.Fatalf("expected wal record preserved after failed handoff, got ok=%v rec=%+v", ok, got)
+	}
+
+	// Skip closeStore: it would block on flushLoop draining a closed DB.
+	cacheStore.mu.Lock()
+	cacheStore.closing = true
+	cacheStore.mu.Unlock()
+	_ = cacheStore.wal.Close()
+}
+
 func newTestStore(t *testing.T, cfg Config) *MySQLStore {
 	t.Helper()
 

@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/olric-data/olric/config"
 	"github.com/olric-data/olric/events"
 	"github.com/olric-data/olric/internal/cluster/partitions"
 	"github.com/olric-data/olric/internal/discovery"
@@ -76,6 +77,32 @@ func (f *fragment) Name() string {
 func (f *fragment) Move(part *partitions.Partition, name string, owners []discovery.Member) error {
 	f.Lock()
 	defer f.Unlock()
+
+	// Drain committed dirty WAL records belonging to this fragment to the
+	// terminal store BEFORE exporting in-memory state. Without this step
+	// the old owner could finish handoff while its bbolt still holds
+	// acknowledged-but-not-yet-flushed writes (Formal Safety Target #5 /
+	// production-robustness-plan §"Phase 4: Durable Ownership Handoff").
+	// A drain failure aborts the migration: the balancer is expected to
+	// retry, and the old owner remains write-serving until the WAL clears.
+	if hook := f.service.config.DurableHook; hook != nil {
+		dmapName := strings.TrimPrefix(name, "dmap.")
+		hkeys := make([]uint64, 0)
+		f.storage.RangeHKey(func(hkey uint64) bool {
+			hkeys = append(hkeys, hkey)
+			return true
+		})
+		if len(hkeys) > 0 {
+			if err := hook.DrainForHandoff(f.service.ctx, config.DurableHandoff{
+				DMap:        dmapName,
+				PartitionID: part.ID(),
+				HKeys:       hkeys,
+			}); err != nil {
+				f.service.log.V(2).Printf("[ERROR] durable handoff drain failed for dmap=%s part=%d: %v", dmapName, part.ID(), err)
+				return err
+			}
+		}
+	}
 
 	i := f.storage.TransferIterator()
 	if !i.Next() {

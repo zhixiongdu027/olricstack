@@ -389,6 +389,84 @@ func (s *MySQLStore) Replay(ctx context.Context, f func(EntryRecord) error) erro
 	return nil
 }
 
+// FlushHandoff synchronously flushes every committed WAL record matching
+// (dmap, hkey) in refs to the terminal store (MySQL) and deletes the
+// corresponding WAL entries. It is the engineering counterpart to Formal
+// Safety Target #5 — ownership transfer must not complete until the new
+// owner has an equivalent durable source — by emptying the old owner's
+// dirty WAL for the migrating fragment before the fork hands off.
+//
+// Behavior:
+//
+//   - Records in WALStatePrepared are left alone (the matching mutation is
+//     still in-flight or already abort-pending). They cannot reach MySQL
+//     and the new owner will never observe them; they are either GC'd by
+//     the next write to the same key or by the boot sweep on restart.
+//   - Records not currently in the dirty bucket are ignored (already
+//     flushed, never written, or aborted).
+//   - If MySQL is unreachable, FlushHandoff returns the underlying error so
+//     the caller (DurableHook.DrainForHandoff) can abort the migration.
+//   - When the configured store has no MySQL backend (db==nil, i.e. the
+//     WAL-only test profile) the WAL entries are removed without an upsert
+//     so callers can still exercise the handoff path deterministically.
+//
+// Safety: callers MUST hold the per-fragment write lock for every ref in
+// the set so no concurrent BeforeX/AfterX runs against these keys. The
+// fork's fragment.Move satisfies this by calling DrainForHandoff inside
+// f.Lock().
+func (s *MySQLStore) FlushHandoff(ctx context.Context, refs []EntryRef) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return errors.New("cache store is closed")
+	}
+	s.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	entries := make([]dirtyEntry, 0, len(refs))
+	err := s.wal.View(func(tx *bolt.Tx) error {
+		dirty := tx.Bucket(walDirtyBucket)
+		if dirty == nil {
+			return nil
+		}
+		for _, ref := range refs {
+			encoded := dirty.Get([]byte(walKey(ref)))
+			if encoded == nil {
+				continue
+			}
+			var entry dirtyEntry
+			if err := json.Unmarshal(encoded, &entry); err != nil {
+				return err
+			}
+			if !isFlushable(entry.Record) {
+				continue
+			}
+			entries = append(entries, entry)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("collect handoff records: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+
+	if !s.flushEntries(entries) {
+		return fmt.Errorf("flush handoff records: %w", s.workerError())
+	}
+	if err := s.deleteFlushed(entries); err != nil {
+		return fmt.Errorf("delete flushed handoff records: %w", err)
+	}
+	return nil
+}
+
 func (s *MySQLStore) LoadEntry(ctx context.Context, ref EntryRef) (EntryRecord, error) {
 	if record, ok, err := s.loadDirty(ref); err != nil {
 		return EntryRecord{}, err

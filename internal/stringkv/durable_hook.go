@@ -194,6 +194,45 @@ func (h *DurableHook) LoadOnMiss(ctx context.Context, op olricconfig.DurableOper
 	return entry, nil
 }
 
+// DrainForHandoff flushes every committed WAL record for the migrating
+// fragment to MySQL synchronously, so the new owner can take over without
+// the old WAL holding writes that have already been acknowledged. The fork
+// calls this from inside the per-fragment write lock during partition
+// rebalance, so no concurrent BeforeX/AfterX runs against these keys.
+//
+// A non-nil return aborts the migration. The fork then leaves the fragment
+// in place; the cluster balancer is expected to retry. Aborting on drain
+// failure is preferable to handing off with stale dirty WAL because:
+//
+//   - The new owner has no view of these records, so a client GET on the
+//     new owner would miss until the old owner's flusher catches up.
+//   - If the old owner is then evicted or its WAL volume is wiped, the
+//     unflushed write is lost.
+//
+// We defer the heavy lifting to MySQLStore.FlushHandoff via the optional
+// `drainer` interface on the committer; hooks wired with an inner that
+// does not implement it (test profiles) treat this as a no-op.
+func (h *DurableHook) DrainForHandoff(ctx context.Context, handoff olricconfig.DurableHandoff) error {
+	if len(handoff.HKeys) == 0 {
+		return nil
+	}
+	type drainer interface {
+		FlushHandoff(context.Context, []store.EntryRef) error
+	}
+	flusher, ok := h.committer.(drainer)
+	if !ok {
+		return nil
+	}
+	refs := make([]store.EntryRef, 0, len(handoff.HKeys))
+	for _, hkey := range handoff.HKeys {
+		refs = append(refs, store.EntryRef{DMap: handoff.DMap, HKey: hkey})
+	}
+	if err := flusher.FlushHandoff(ctx, refs); err != nil {
+		return fmt.Errorf("drain partition %d for %s: %w", handoff.PartitionID, handoff.DMap, err)
+	}
+	return nil
+}
+
 func (h *DurableHook) fencedRecord(op olricconfig.DurableOperation, entry olricstorage.Entry, origin string, flush bool) (store.EntryRecord, error) {
 	g, e, s, err := h.stampFence()
 	if err != nil {

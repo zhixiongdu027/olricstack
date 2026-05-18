@@ -144,6 +144,22 @@ func (s *LeaseGatedStore) PreparedCount() (int, error) {
 	return 0, nil
 }
 
+// FlushHandoff forwards a synchronous handoff drain to the inner store. The
+// lease gate is intentionally not enforced: the fork calls this from inside
+// the fragment lock during partition migration and the lease may already be
+// in transition. The underlying store performs no fence stamp during
+// handoff — it only flushes records that already carry a committed fence,
+// so there is no S5 window to protect here.
+func (s *LeaseGatedStore) FlushHandoff(ctx context.Context, refs []store.EntryRef) error {
+	type drainer interface {
+		FlushHandoff(context.Context, []store.EntryRef) error
+	}
+	if d, ok := s.inner.(drainer); ok {
+		return d.FlushHandoff(ctx, refs)
+	}
+	return nil
+}
+
 func (s *LeaseGatedStore) requireLease() error {
 	if s.lease.ServingAllowed(s.now()) {
 		return nil

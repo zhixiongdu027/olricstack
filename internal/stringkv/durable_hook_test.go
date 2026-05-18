@@ -425,3 +425,59 @@ func TestDurableHookVerifyAfterLockRejectsGenerationChange(t *testing.T) {
 		t.Fatalf("expected ErrLeaseExpired on generation change, got %v", err)
 	}
 }
+
+// TestDurableHookDrainForHandoffForwardsToCommitStore guards §8.6 Phase 4:
+// the hook must translate (DMap, []HKey) into EntryRefs and call the
+// underlying store's FlushHandoff, surfacing any failure to the fork so
+// migration aborts instead of proceeding with stale dirty WAL.
+func TestDurableHookDrainForHandoffForwardsToCommitStore(t *testing.T) {
+	backing := newRecordingCommitStore()
+	hook := newTestDurableHook(t, backing, fenceAt(1, 1))
+
+	err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{
+		DMap:        "users",
+		PartitionID: 7,
+		HKeys:       []uint64{101, 202, 303},
+	})
+	if err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(backing.handoffCalls) != 1 {
+		t.Fatalf("expected exactly one FlushHandoff call, got %d", len(backing.handoffCalls))
+	}
+	got := backing.handoffCalls[0]
+	if len(got) != 3 {
+		t.Fatalf("expected 3 refs forwarded, got %d", len(got))
+	}
+	for i, expected := range []uint64{101, 202, 303} {
+		if got[i].DMap != "users" || got[i].HKey != expected {
+			t.Fatalf("ref[%d] = %+v, expected dmap=users hkey=%d", i, got[i], expected)
+		}
+	}
+}
+
+func TestDurableHookDrainForHandoffSurfacesFailure(t *testing.T) {
+	backing := newRecordingCommitStore()
+	backing.handoffErr = errors.New("mysql is down")
+	hook := newTestDurableHook(t, backing, fenceAt(1, 1))
+
+	err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{
+		DMap:  "users",
+		HKeys: []uint64{1},
+	})
+	if err == nil || !errors.Is(err, backing.handoffErr) {
+		t.Fatalf("expected wrapped handoff error, got %v", err)
+	}
+}
+
+func TestDurableHookDrainForHandoffNoOpOnEmpty(t *testing.T) {
+	backing := newRecordingCommitStore()
+	hook := newTestDurableHook(t, backing, fenceAt(1, 1))
+
+	if err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{DMap: "users"}); err != nil {
+		t.Fatalf("drain empty: %v", err)
+	}
+	if len(backing.handoffCalls) != 0 {
+		t.Fatalf("expected no FlushHandoff call for empty hkey set, got %d", len(backing.handoffCalls))
+	}
+}

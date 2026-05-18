@@ -163,6 +163,10 @@ func (h *recordingDurableHook) VerifyAfterLock(ctx context.Context, op config.Du
 	return nil
 }
 
+func (h *recordingDurableHook) DrainForHandoff(ctx context.Context, handoff config.DurableHandoff) error {
+	return nil
+}
+
 func (h *recordingDurableHook) LoadOnMiss(ctx context.Context, op config.DurableOperation) (storage.Entry, error) {
 	h.record(op.Origin)
 	if h.loadErr != nil {
