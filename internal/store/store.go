@@ -2,18 +2,14 @@ package store
 
 import (
 	"context"
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
 	"sync"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -74,7 +70,7 @@ type EntryRecord struct {
 	// WALSeq is a node-local monotonic identifier assigned at PrepareEntry. It
 	// is never persisted to MySQL — the durable contract is the fence triple
 	// (Generation, Epoch, OwnerSeq). WALSeq exists only to bind a Commit/Abort
-	// call back to the exact prepared record in bbolt.
+	// call back to the exact prepared record in the local WAL.
 	WALSeq     int64  `gorm:"-" json:"wal_seq,omitempty"`
 	Origin     string `gorm:"-" json:"origin,omitempty"`
 	FlushMySQL bool   `gorm:"-" json:"flush_mysql,omitempty"`
@@ -145,16 +141,10 @@ type dirtyEntry struct {
 	Record EntryRecord `json:"record"`
 }
 
-var (
-	walDirtyBucket = []byte("dirty")
-	walMetaBucket  = []byte("meta")
-	walSeqKey      = []byte("wal_seq")
-)
-
 type MySQLStore struct {
 	db     *gorm.DB
 	cfg    Config
-	wal    *bolt.DB
+	wal    *pebbleWAL
 	notify chan struct{}
 	done   chan struct{}
 	closed chan struct{}
@@ -198,7 +188,7 @@ func newStore(db *gorm.DB, cfg Config) (*MySQLStore, error) {
 		done:   make(chan struct{}),
 		closed: make(chan struct{}),
 	}
-	wal, err := openWAL(cfg.WALPath)
+	wal, err := openPebbleWAL(cfg.WALPath, cfg.QueueSize)
 	if err != nil {
 		return nil, err
 	}
@@ -230,40 +220,16 @@ func (s *MySQLStore) Start(context.Context) error {
 // previous process. A Prepared record can survive across restart only if the
 // owning process crashed between PrepareEntry and Commit/Abort, OR if a
 // VerifyAfterLock-fail / pre-condition-fail path executed `_ = hook.AfterX`
-// and the abort's bbolt write itself failed. Either way, no in-flight goroutine
+// and the abort's WAL write itself failed. Either way, no in-flight goroutine
 // of the *current* process can finalize them — they cannot reach MySQL
 // (isFlushable filters Prepared) and they cannot be reused (the next write to
 // the same key overwrites them via appendDirty), so dropping them at boot is
-// safe and reclaims bbolt space.
+// safe and reclaims WAL space.
 //
 // Sweep runs before flushLoop starts and before any caller can issue a new
 // PrepareEntry, so there is no race with live writers.
 func (s *MySQLStore) sweepPreparedOrphans() (int, error) {
-	var swept int
-	err := s.wal.Update(func(tx *bolt.Tx) error {
-		dirty := tx.Bucket(walDirtyBucket)
-		if dirty == nil {
-			return nil
-		}
-		var stale [][]byte
-		cursor := dirty.Cursor()
-		for key, encoded := cursor.First(); key != nil; key, encoded = cursor.Next() {
-			var entry dirtyEntry
-			if err := json.Unmarshal(encoded, &entry); err != nil {
-				return err
-			}
-			if entry.Record.WALState == WALStatePrepared {
-				stale = append(stale, append([]byte(nil), key...))
-			}
-		}
-		for _, key := range stale {
-			if err := dirty.Delete(key); err != nil {
-				return err
-			}
-		}
-		swept = len(stale)
-		return nil
-	})
+	swept, err := s.wal.SweepPrepared()
 	if err != nil {
 		return 0, fmt.Errorf("sweep prepared wal records: %w", err)
 	}
@@ -274,27 +240,10 @@ func (s *MySQLStore) sweepPreparedOrphans() (int, error) {
 // WALStatePrepared. Operators can scrape it as a backpressure / orphan
 // indicator: a steady non-zero value past one flushInterval suggests stuck
 // preparations (process crashed mid-mutation, or Olric mutation failed but
-// AbortEntry's bbolt write also failed). Healthy steady-state is 0; transient
+// AbortEntry's WAL write also failed). Healthy steady-state is 0; transient
 // spikes during high-throughput writes are normal.
 func (s *MySQLStore) PreparedCount() (int, error) {
-	var count int
-	err := s.wal.View(func(tx *bolt.Tx) error {
-		dirty := tx.Bucket(walDirtyBucket)
-		if dirty == nil {
-			return nil
-		}
-		cursor := dirty.Cursor()
-		for key, encoded := cursor.First(); key != nil; key, encoded = cursor.Next() {
-			var entry dirtyEntry
-			if err := json.Unmarshal(encoded, &entry); err != nil {
-				return err
-			}
-			if entry.Record.WALState == WALStatePrepared {
-				count++
-			}
-		}
-		return nil
-	})
+	count, err := s.wal.PreparedCount()
 	if err != nil {
 		return 0, fmt.Errorf("count prepared wal records: %w", err)
 	}
@@ -327,31 +276,7 @@ func (s *MySQLStore) PurgeBelowGeneration(ctx context.Context, minGeneration int
 		return 0, err
 	}
 
-	var purged int
-	err := s.wal.Update(func(tx *bolt.Tx) error {
-		dirty := tx.Bucket(walDirtyBucket)
-		cursor := dirty.Cursor()
-		var stale [][]byte
-		for key, encoded := cursor.First(); key != nil; key, encoded = cursor.Next() {
-			var entry dirtyEntry
-			if err := json.Unmarshal(encoded, &entry); err != nil {
-				return err
-			}
-			if entry.Record.WALState == WALStatePrepared {
-				continue
-			}
-			if entry.Record.Generation > 0 && entry.Record.Generation < minGeneration {
-				stale = append(stale, append([]byte(nil), key...))
-			}
-		}
-		for _, key := range stale {
-			if err := dirty.Delete(key); err != nil {
-				return err
-			}
-		}
-		purged = len(stale)
-		return nil
-	})
+	purged, err := s.wal.PurgeBelowGeneration(minGeneration)
 	if err != nil {
 		return 0, fmt.Errorf("purge below generation %d: %w", minGeneration, err)
 	}
@@ -359,34 +284,7 @@ func (s *MySQLStore) PurgeBelowGeneration(ctx context.Context, minGeneration int
 }
 
 func (s *MySQLStore) Replay(ctx context.Context, f func(EntryRecord) error) error {
-	expired := make([]EntryRef, 0)
-	err := s.wal.View(func(tx *bolt.Tx) error {
-		cursor := tx.Bucket(walDirtyBucket).Cursor()
-		for _, encoded := cursor.First(); encoded != nil; _, encoded = cursor.Next() {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			var entry dirtyEntry
-			if err := json.Unmarshal(encoded, &entry); err != nil {
-				return err
-			}
-			record := entry.Record.Clone()
-			if record.WALState == WALStatePrepared {
-				continue
-			}
-			if record.Tombstone {
-				continue
-			}
-			if isExpired(record.TTL, time.Now()) {
-				expired = append(expired, record.Ref())
-				continue
-			}
-			if err := f(record); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	expired, err := s.wal.Replay(ctx, f)
 	if err != nil {
 		return fmt.Errorf("replay wal: %w", err)
 	}
@@ -427,28 +325,10 @@ func (s *MySQLStore) FlushHandoff(ctx context.Context, refs []EntryRef) error {
 	if len(refs) == 0 {
 		return nil
 	}
-	entries := make([]dirtyEntry, 0, len(refs))
-	err := s.withHandoffEntries(ctx, func(tx *bolt.Tx) error {
-		dirty := tx.Bucket(walDirtyBucket)
-		if dirty == nil {
-			return nil
-		}
-		for _, ref := range refs {
-			encoded := dirty.Get([]byte(walKey(ref)))
-			if encoded == nil {
-				continue
-			}
-			var entry dirtyEntry
-			if err := json.Unmarshal(encoded, &entry); err != nil {
-				return err
-			}
-			if !isFlushable(entry.Record) {
-				continue
-			}
-			entries = append(entries, entry)
-		}
-		return nil
-	})
+	if err := s.ensureOpen(ctx); err != nil {
+		return err
+	}
+	entries, err := s.wal.ScanFlushableRefs(refs)
 	if err != nil {
 		return fmt.Errorf("collect handoff records: %w", err)
 	}
@@ -470,33 +350,17 @@ func (s *MySQLStore) FlushHandoffPartition(ctx context.Context, dmap string, par
 	if partitionID >= partitionCount {
 		return fmt.Errorf("handoff partition id %d out of range %d", partitionID, partitionCount)
 	}
-	entries := make([]dirtyEntry, 0)
-	err := s.withHandoffEntries(ctx, func(tx *bolt.Tx) error {
-		dirty := tx.Bucket(walDirtyBucket)
-		if dirty == nil {
-			return nil
-		}
-		cursor := dirty.Cursor()
-		for _, encoded := cursor.First(); encoded != nil; _, encoded = cursor.Next() {
-			var entry dirtyEntry
-			if err := json.Unmarshal(encoded, &entry); err != nil {
-				return err
-			}
-			record := entry.Record
-			if record.DMap != dmap || record.HKey%partitionCount != partitionID || !isFlushable(record) {
-				continue
-			}
-			entries = append(entries, entry)
-		}
-		return nil
-	})
+	if err := s.ensureOpen(ctx); err != nil {
+		return err
+	}
+	entries, err := s.wal.ScanFlushablePartition(dmap, partitionID, partitionCount)
 	if err != nil {
 		return fmt.Errorf("collect handoff partition records: %w", err)
 	}
 	return s.flushHandoffEntries(entries)
 }
 
-func (s *MySQLStore) withHandoffEntries(ctx context.Context, collect func(*bolt.Tx) error) error {
+func (s *MySQLStore) ensureOpen(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
@@ -507,7 +371,7 @@ func (s *MySQLStore) withHandoffEntries(ctx context.Context, collect func(*bolt.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return s.wal.View(collect)
+	return nil
 }
 
 func (s *MySQLStore) flushHandoffEntries(entries []dirtyEntry) error {
@@ -793,155 +657,20 @@ func (s *MySQLStore) flushEntries(entries []dirtyEntry) bool {
 	return true
 }
 
-func openWAL(path string) (*bolt.DB, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("create wal dir: %w", err)
-	}
-	db, err := bolt.Open(path, 0o600, &bolt.Options{Timeout: time.Second})
-	if err != nil {
-		return nil, fmt.Errorf("open wal: %w", err)
-	}
-	// MaxBatchDelay caps how long the first caller of a Batch waits before
-	// bbolt commits the merged tx. The default of 10ms shows up directly in
-	// client write latency because PrepareEntry/CommitEntry are on the hot
-	// path. 1ms still lets a few concurrent fsyncs collapse without making
-	// single-writer latency worse than db.Update.
-	db.MaxBatchDelay = time.Millisecond
-	if err := db.Update(func(tx *bolt.Tx) error {
-		if _, err := tx.CreateBucketIfNotExists(walDirtyBucket); err != nil {
-			return err
-		}
-		_, err := tx.CreateBucketIfNotExists(walMetaBucket)
-		return err
-	}); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("init wal: %w", err)
-	}
-	return db, nil
-}
-
-// appendDirty stages a record into the WAL. It uses bbolt.Batch so concurrent
-// callers across goroutines can collapse their fsyncs into a single disk flush.
-//
-// Batch idempotency: the closure may run more than once if a sibling call in
-// the same batch returns an error. All side effects either come from tx state
-// (nextWALSeq, dirty.Get, dirty.Stats), are pure functions of the input
-// (record fields), or are written to outer variables that bbolt overwrites
-// atomically on the winning attempt (entry.Record.WALSeq, entry.Record, depth).
-// The bbolt contract guarantees only the final retry's mutations are visible
-// to the caller.
 func (s *MySQLStore) appendDirty(record EntryRecord) (dirtyEntry, int, error) {
-	now := time.Now().UTC()
-	record = record.Clone()
-	if record.UpdatedAt.IsZero() {
-		record.UpdatedAt = now
-	}
-	entry := dirtyEntry{Record: record}
-	var depth int
-	err := s.wal.Batch(func(tx *bolt.Tx) error {
-		// Reset per-attempt mutable state so a retry sees a clean slate.
-		entry = dirtyEntry{Record: record.Clone()}
-		dirty := tx.Bucket(walDirtyBucket)
-		key := []byte(walKey(record.Ref()))
-		if existing := dirty.Get(key); existing != nil {
-			var current dirtyEntry
-			if err := json.Unmarshal(existing, &current); err != nil {
-				return err
-			}
-			if shouldPreserveDirtyRecord(current.Record, entry.Record) {
-				entry.Record = current.Record.Clone()
-				depth = dirty.Stats().KeyN
-				return nil
-			}
-		} else if dirty.Stats().KeyN >= s.cfg.QueueSize {
-			return ErrQueueFull
-		}
-		meta := tx.Bucket(walMetaBucket)
-		entry.Record.WALSeq = nextWALSeq(meta)
-		encoded, err := json.Marshal(entry)
-		if err != nil {
-			return err
-		}
-		if err := dirty.Put(key, encoded); err != nil {
-			return err
-		}
-		depth = dirty.Stats().KeyN
-		return nil
-	})
-	return entry, depth, err
+	return s.wal.Prepare(record)
 }
 
 func (s *MySQLStore) commitDirty(ref EntryRef, walSeq int64) (int, error) {
-	var depth int
-	err := s.wal.Batch(func(tx *bolt.Tx) error {
-		dirty := tx.Bucket(walDirtyBucket)
-		key := []byte(walKey(ref))
-		encoded := dirty.Get(key)
-		if encoded == nil {
-			return ErrNotFound
-		}
-		var entry dirtyEntry
-		if err := json.Unmarshal(encoded, &entry); err != nil {
-			return err
-		}
-		if entry.Record.WALSeq != walSeq {
-			return ErrNotFound
-		}
-		entry.Record.WALState = WALStateCommitted
-		entry.Record.FlushMySQL = true
-		encoded, err := json.Marshal(entry)
-		if err != nil {
-			return err
-		}
-		if err := dirty.Put(key, encoded); err != nil {
-			return err
-		}
-		depth = dirty.Stats().KeyN
-		return nil
-	})
-	return depth, err
+	return s.wal.Commit(ref, walSeq)
 }
 
 func (s *MySQLStore) abortDirty(ref EntryRef, walSeq int64) error {
-	return s.wal.Batch(func(tx *bolt.Tx) error {
-		dirty := tx.Bucket(walDirtyBucket)
-		key := []byte(walKey(ref))
-		encoded := dirty.Get(key)
-		if encoded == nil {
-			// Already gone — abort is idempotent.
-			return nil
-		}
-		var entry dirtyEntry
-		if err := json.Unmarshal(encoded, &entry); err != nil {
-			return err
-		}
-		if entry.Record.WALSeq != walSeq {
-			// Superseded by a newer prepare; do not touch the live record.
-			return nil
-		}
-		if entry.Record.WALState == WALStateCommitted {
-			return errors.New("cannot abort committed wal record")
-		}
-		return dirty.Delete(key)
-	})
+	return s.wal.Abort(ref, walSeq)
 }
 
 func (s *MySQLStore) loadDirty(ref EntryRef) (EntryRecord, bool, error) {
-	var record EntryRecord
-	var ok bool
-	err := s.wal.View(func(tx *bolt.Tx) error {
-		encoded := tx.Bucket(walDirtyBucket).Get([]byte(walKey(ref)))
-		if encoded == nil {
-			return nil
-		}
-		var entry dirtyEntry
-		if err := json.Unmarshal(encoded, &entry); err != nil {
-			return err
-		}
-		record = entry.Record.Clone()
-		ok = true
-		return nil
-	})
+	record, ok, err := s.wal.Load(ref)
 	if err != nil {
 		return EntryRecord{}, false, fmt.Errorf("load dirty wal entry %s: %w", walKey(ref), err)
 	}
@@ -949,76 +678,15 @@ func (s *MySQLStore) loadDirty(ref EntryRef) (EntryRecord, bool, error) {
 }
 
 func (s *MySQLStore) loadDirtyBatch(limit int) ([]dirtyEntry, error) {
-	entries := make([]dirtyEntry, 0, limit)
-	err := s.wal.View(func(tx *bolt.Tx) error {
-		cursor := tx.Bucket(walDirtyBucket).Cursor()
-		for key, encoded := cursor.First(); key != nil && len(entries) < limit; key, encoded = cursor.Next() {
-			var entry dirtyEntry
-			if err := json.Unmarshal(encoded, &entry); err != nil {
-				return err
-			}
-			entries = append(entries, entry)
-		}
-		return nil
-	})
-	return entries, err
+	return s.wal.Scan(limit)
 }
 
 func (s *MySQLStore) loadFlushableBatch(limit int) ([]dirtyEntry, error) {
-	entries := make([]dirtyEntry, 0, limit)
-	err := s.wal.View(func(tx *bolt.Tx) error {
-		cursor := tx.Bucket(walDirtyBucket).Cursor()
-		for key, encoded := cursor.First(); key != nil && len(entries) < limit; key, encoded = cursor.Next() {
-			var entry dirtyEntry
-			if err := json.Unmarshal(encoded, &entry); err != nil {
-				return err
-			}
-			if !isFlushable(entry.Record) {
-				continue
-			}
-			entries = append(entries, entry)
-		}
-		return nil
-	})
-	return entries, err
+	return s.wal.ScanFlushable(limit)
 }
 
 func (s *MySQLStore) deleteFlushed(entries []dirtyEntry) error {
-	return s.wal.Update(func(tx *bolt.Tx) error {
-		dirty := tx.Bucket(walDirtyBucket)
-		for _, flushed := range entries {
-			key := []byte(walKey(flushed.Record.Ref()))
-			encoded := dirty.Get(key)
-			if encoded == nil {
-				continue
-			}
-			var current dirtyEntry
-			if err := json.Unmarshal(encoded, &current); err != nil {
-				return err
-			}
-			if current.Record.WALSeq == flushed.Record.WALSeq {
-				if err := dirty.Delete(key); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	})
-}
-
-// nextWALSeq returns a strictly-monotonic per-WAL identifier used to bind a
-// prepared dirty record to its later Commit/Abort call. It is *not* persisted
-// to MySQL — fence (Generation, Epoch, OwnerSeq) is the only durable ordering.
-func nextWALSeq(bucket *bolt.Bucket) int64 {
-	var current uint64
-	if encoded := bucket.Get(walSeqKey); len(encoded) == 8 {
-		current = binary.BigEndian.Uint64(encoded)
-	}
-	next := current + 1
-	var encoded [8]byte
-	binary.BigEndian.PutUint64(encoded[:], next)
-	_ = bucket.Put(walSeqKey, encoded[:])
-	return int64(next)
+	return s.wal.DeleteIfSeq(entries)
 }
 
 // versionedUpsertClause encodes the durable conflict-resolution rule used by
@@ -1085,10 +753,6 @@ func (s *MySQLStore) versionedUpsertClause() clause.OnConflict {
 			"updated_at":    gorm.Expr("CASE WHEN " + newer + " THEN excluded.updated_at ELSE updated_at END"),
 		}),
 	}
-}
-
-func walKey(ref EntryRef) string {
-	return ref.DMap + "\x00" + strconv.FormatUint(ref.HKey, 10)
 }
 
 func isExpired(ttl int64, now time.Time) bool {

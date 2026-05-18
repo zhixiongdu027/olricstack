@@ -339,7 +339,7 @@ func TestMySQLStoreSweepsPreparedOrphansAtStart(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("expected 1 prepared record before crash, got %d", count)
 	}
-	// Simulate crash: skip flushLoop drain and Close path; just close bbolt.
+	// Simulate crash: skip flushLoop drain and Close path; just close the WAL.
 	first.mu.Lock()
 	first.closing = true
 	first.mu.Unlock()
@@ -466,7 +466,7 @@ func TestMySQLStoreDoesNotFlushPreparedEntriesBeforeCommit(t *testing.T) {
 // TestMySQLStoreLateFlushFromPreviousOwnerLosesToCurrentOwner is the FT-3/FT-6
 // regression. It mimics the production race that motivated owner-fenced
 // versioning: an old owner with generation=N writes and commits a record
-// locally but its flusher stalls (e.g. MySQL outage, bbolt stuck behind a
+// locally but its flusher stalls (e.g. MySQL outage, WAL IO stuck behind a
 // fsync). Meanwhile a new primary elects a new owner under generation=N+1
 // which writes and successfully flushes its own value. When the old owner's
 // flusher eventually drains, the fence triple comparison must reject the
@@ -1218,11 +1218,11 @@ func testFencedRecord(key string, hkey uint64, value []byte, generation, epoch, 
 	return record
 }
 
-// TestMySQLStoreBatchedPreparesAreConcurrentSafe stresses the bbolt.Batch
-// migration: many goroutines call PrepareEntry concurrently against distinct
+// TestMySQLStoreBatchedPreparesAreConcurrentSafe stresses the WAL sequence
+// allocation: many goroutines call PrepareEntry concurrently against distinct
 // keys. The test verifies (1) every prepare returns a unique WALSeq and (2)
 // every committed record is durably visible. If Batch idempotency were
-// broken (e.g. nextWALSeq side-effects clashing across retried closures),
+// broken (e.g. local sequence allocation raced across concurrent prepares),
 // either two records would share a WALSeq or one would be silently lost.
 func TestMySQLStoreBatchedPreparesAreConcurrentSafe(t *testing.T) {
 	cacheStore := newTestStore(t, Config{
