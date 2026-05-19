@@ -728,6 +728,93 @@ func TestWALStoreDoesNotReplayPreparedRecords(t *testing.T) {
 	closeStore(t, second)
 }
 
+// TestReplayDropsExpiredEntriesWithoutTombstone pins D1 first-layer fix.
+// Before: Replay returned expired refs; MySQLStore.Replay called DeleteEntry
+// on each, producing a Generation=0 "tombstone" WAL record that isFlushable
+// rejected. Result: the local WAL accumulated unflushable records forever
+// and MySQL was never informed of the expiration (which is correct on its
+// own — Replay has no lease and cannot stamp a fenced tombstone — but the
+// local pollution was a real bug).
+// After: Replay deletes expired entries from the WAL in place and never
+// produces a tombstone record. MySQL state is left untouched; durable row
+// cleanup is the business layer's responsibility.
+func TestReplayDropsExpiredEntriesWithoutTombstone(t *testing.T) {
+	db := newTestDB(t)
+	walPath := filepath.Join(t.TempDir(), "cache.wal")
+
+	first, err := NewMySQLStore(db, Config{
+		WALPath:       walPath,
+		FlushInterval: time.Hour,
+		BatchSize:     128,
+	})
+	if err != nil {
+		t.Fatalf("new first store: %v", err)
+	}
+	if err := first.Start(context.Background()); err != nil {
+		t.Fatalf("start first store: %v", err)
+	}
+	rec := testFlushableRecord("expiring", 51, []byte("value"))
+	rec.TTL = time.Now().Add(-time.Second).UnixMilli() // already expired
+	if err := first.StoreEntry(context.Background(), rec); err != nil {
+		t.Fatalf("store expired value: %v", err)
+	}
+	// Simulate crash so the expired record survives onto disk untouched.
+	first.mu.Lock()
+	first.closing = true
+	first.mu.Unlock()
+	if err := first.wal.Close(); err != nil {
+		t.Fatalf("close first wal: %v", err)
+	}
+
+	second, err := NewMySQLStore(db, Config{
+		WALPath:       walPath,
+		FlushInterval: time.Hour,
+		BatchSize:     128,
+	})
+	if err != nil {
+		t.Fatalf("new second store: %v", err)
+	}
+
+	var replayed []EntryRecord
+	if err := second.Replay(context.Background(), func(record EntryRecord) error {
+		replayed = append(replayed, record)
+		return nil
+	}); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(replayed) != 0 {
+		t.Fatalf("expired record must not be replayed into memory: %#v", replayed)
+	}
+
+	// The pebble dirty bucket must no longer hold the expired record.
+	if _, ok, err := second.loadDirty(testRef("expiring", 51)); err != nil {
+		t.Fatalf("load dirty after replay: %v", err)
+	} else if ok {
+		t.Fatal("expired record must be dropped from WAL during replay")
+	}
+
+	// And there must be no Generation=0 ghost tombstone left behind. Scan
+	// every remaining dirty entry — none should reference this ref.
+	entries, err := second.loadDirtyBatch(128)
+	if err != nil {
+		t.Fatalf("scan dirty: %v", err)
+	}
+	for _, e := range entries {
+		if e.Record.HKey == 51 && e.Record.DMap == rec.DMap {
+			t.Fatalf("replay left a ghost record for expired key: %#v", e.Record)
+		}
+	}
+
+	// MySQL state must be unaffected by replay — no row was ever flushed for
+	// this key (it expired before any flusher tick), and no tombstone gets
+	// stamped by replay either.
+	if _, err := second.LoadEntry(context.Background(), testRef("expiring", 51)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected expired key to be NotFound, got %v", err)
+	}
+
+	closeStore(t, second)
+}
+
 func TestWALStoreReplaysCommittedPreparedRecords(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "cache.wal")
 	first, err := NewWALStore(Config{WALPath: walPath})

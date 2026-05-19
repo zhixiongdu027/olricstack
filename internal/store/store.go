@@ -284,14 +284,8 @@ func (s *MySQLStore) PurgeBelowGeneration(ctx context.Context, minGeneration int
 }
 
 func (s *MySQLStore) Replay(ctx context.Context, f func(EntryRecord) error) error {
-	expired, err := s.wal.Replay(ctx, f)
-	if err != nil {
+	if err := s.wal.Replay(ctx, f); err != nil {
 		return fmt.Errorf("replay wal: %w", err)
-	}
-	for _, ref := range expired {
-		if err := s.DeleteEntry(ctx, ref); err != nil {
-			return err
-		}
 	}
 	return nil
 }

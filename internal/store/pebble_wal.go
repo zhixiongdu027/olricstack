@@ -281,18 +281,28 @@ func (w *pebbleWAL) PurgeBelowGeneration(minGeneration int64) (int, error) {
 	})
 }
 
-func (w *pebbleWAL) Replay(ctx context.Context, f func(EntryRecord) error) ([]EntryRef, error) {
+// Replay iterates committed (non-Prepared, non-tombstone, non-expired) dirty
+// records and hands each to f for in-memory engine rehydration. Expired
+// records found during the scan are deleted from the WAL in place — the
+// previous behaviour returned them so MySQLStore could call DeleteEntry, but
+// that produced a Generation=0 tombstone which isFlushable rejects, leaving
+// the bbolt/pebble dirty bucket polluted with records that could never reach
+// MySQL. Replay runs before the node has a serving lease, so it has no
+// authority to stamp a fenced tombstone anyway; the right thing for local
+// recovery is to drop the local copy and let MySQL-side TTL/GC handle the
+// durable row independently.
+func (w *pebbleWAL) Replay(ctx context.Context, f func(EntryRecord) error) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.checkOpenLocked(); err != nil {
-		return nil, err
+		return err
 	}
-	expired := make([]EntryRef, 0)
-	err := w.forEachDirty(func(_ []byte, record EntryRecord) error {
+
+	var expiredKeys [][]byte
+	err := w.forEachDirty(func(key []byte, record EntryRecord) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		record = record.Clone()
 		if record.WALState == WALStatePrepared {
 			return nil
 		}
@@ -300,15 +310,33 @@ func (w *pebbleWAL) Replay(ctx context.Context, f func(EntryRecord) error) ([]En
 			return nil
 		}
 		if isExpired(record.TTL, time.Now()) {
-			expired = append(expired, record.Ref())
+			expiredKeys = append(expiredKeys, append([]byte(nil), key...))
 			return nil
 		}
-		return f(record)
+		return f(record.Clone())
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return expired, nil
+
+	if len(expiredKeys) == 0 {
+		return nil
+	}
+	batch := w.db.NewIndexedBatch()
+	defer batch.Close()
+	for _, key := range expiredKeys {
+		if err := batch.Delete(key, nil); err != nil {
+			return err
+		}
+	}
+	if err := batch.Commit(walSyncWriteOptions); err != nil {
+		return err
+	}
+	w.depth -= len(expiredKeys)
+	if w.depth < 0 {
+		w.depth = 0
+	}
+	return nil
 }
 
 func (w *pebbleWAL) scanDirty(limit int, keep func(EntryRecord) bool) ([]dirtyEntry, error) {
