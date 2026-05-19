@@ -10,6 +10,7 @@ import (
 
 	topologypb "github.com/zhixiongdu/olricstack/api/topology/v1"
 	stackwatchdog "github.com/zhixiongdu/olricstack/internal/watchdog"
+	"google.golang.org/protobuf/proto"
 )
 
 type Config struct {
@@ -414,9 +415,7 @@ func (s *Service) standbyEnvelope(stackID string) *topologypb.TopologyEnvelope {
 }
 
 func cloneEnvelope(envelope *topologypb.TopologyEnvelope) *topologypb.TopologyEnvelope {
-	out := *envelope
-	out.Members = append([]*topologypb.Member(nil), envelope.GetMembers()...)
-	return &out
+	return proto.Clone(envelope).(*topologypb.TopologyEnvelope)
 }
 
 func closeSubscriber(sub *subscriber) {

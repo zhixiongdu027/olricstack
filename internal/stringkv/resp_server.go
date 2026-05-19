@@ -8,6 +8,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tidwall/redcon"
@@ -15,10 +17,18 @@ import (
 
 const DefaultDMap = "__default__"
 
+// DefaultRESPShutdownGrace is the default time RESPServer.Shutdown waits for
+// in-flight commands to finish before force-closing client connections.
+const DefaultRESPShutdownGrace = 2 * time.Second
+
 type RESPServerConfig struct {
 	Addr           string
 	DefaultDMap    string
 	CommandTimeout time.Duration
+	// ShutdownGrace bounds how long Shutdown waits for in-flight commands to
+	// complete before force-closing remaining client connections. Zero falls
+	// back to DefaultRESPShutdownGrace.
+	ShutdownGrace time.Duration
 }
 
 type RESPServer struct {
@@ -26,7 +36,12 @@ type RESPServer struct {
 	addr           string
 	defaultDMap    string
 	commandTimeout time.Duration
+	shutdownGrace  time.Duration
 	server         *redcon.Server
+
+	running  atomic.Bool
+	stopping atomic.Bool
+	inflight sync.WaitGroup
 }
 
 func NewRESPServer(service *Service, cfg RESPServerConfig) (*RESPServer, error) {
@@ -44,22 +59,64 @@ func NewRESPServer(service *Service, cfg RESPServerConfig) (*RESPServer, error) 
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
+	grace := cfg.ShutdownGrace
+	if grace <= 0 {
+		grace = DefaultRESPShutdownGrace
+	}
 	s := &RESPServer{
 		service:        service,
 		addr:           cfg.Addr,
 		defaultDMap:    defaultDMap,
 		commandTimeout: timeout,
+		shutdownGrace:  grace,
 	}
-	s.server = redcon.NewServer(cfg.Addr, s.handle, nil, nil)
+	s.server = redcon.NewServer(cfg.Addr, s.handle, s.onAccept, nil)
 	return s, nil
 }
 
 func (s *RESPServer) ListenAndServe() error {
+	s.running.Store(true)
+	defer s.running.Store(false)
 	return s.server.ListenAndServe()
 }
 
+// Shutdown stops accepting new connections, waits up to ShutdownGrace for
+// in-flight commands to complete, then closes the underlying redcon server
+// (which force-closes any remaining client connections). It is safe to call
+// multiple times; subsequent calls return nil.
+//
+// Implementation note: redcon.Server.Close is itself forceful — it closes the
+// listener AND every accepted connection in one shot. To get a real drain we
+// must NOT call Close until inflight reaches zero (or the grace window
+// expires). Until that happens, new connections are rejected by onAccept and
+// new commands on existing connections are rejected by handle.
 func (s *RESPServer) Shutdown() error {
+	if !s.stopping.CompareAndSwap(false, true) {
+		return nil
+	}
+	if !s.running.Load() {
+		return nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.inflight.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Clean drain: every handler returned and flushed its response.
+	case <-time.After(s.shutdownGrace):
+		// Grace exceeded. Falling through to Close will force every
+		// remaining connection shut, which is what production callers want
+		// when a misbehaving client is holding the server hostage.
+	}
 	return s.server.Close()
+}
+
+func (s *RESPServer) onAccept(_ redcon.Conn) bool {
+	return !s.stopping.Load()
 }
 
 func (s *RESPServer) handle(conn redcon.Conn, cmd redcon.Command) {
@@ -67,6 +124,14 @@ func (s *RESPServer) handle(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteError("ERR empty command")
 		return
 	}
+	if s.stopping.Load() {
+		conn.WriteError("ERR server is shutting down")
+		_ = conn.Close()
+		return
+	}
+	s.inflight.Add(1)
+	defer s.inflight.Done()
+
 	name := strings.ToUpper(argString(cmd.Args[0]))
 	switch name {
 	case "HELLO":
@@ -241,14 +306,42 @@ func ServeRESP(ctx context.Context, service *Service, cfg RESPServerConfig) erro
 	}()
 	select {
 	case <-ctx.Done():
-		if err := server.Shutdown(); err != nil && !strings.Contains(err.Error(), "not serving") {
-			return err
+		// Bound the time we spend draining so a hung client cannot block the
+		// surrounding shutdown sequence indefinitely.
+		shutdownCh := make(chan error, 1)
+		go func() { shutdownCh <- server.Shutdown() }()
+		select {
+		case shutdownErr := <-shutdownCh:
+			if shutdownErr != nil && !isListenerClosed(shutdownErr) {
+				return shutdownErr
+			}
+			return nil
+		case <-time.After(server.shutdownGrace + time.Second):
+			return fmt.Errorf("resp server shutdown exceeded grace window")
 		}
-		return nil
 	case err := <-errCh:
-		if err != nil && !errors.Is(err, net.ErrClosed) {
+		if err != nil && !isListenerClosed(err) {
 			return err
 		}
 		return nil
 	}
+}
+
+// isListenerClosed reports whether err is the benign "listener already closed"
+// signal raised by redcon.Server.Close or by an underlying net.Listener that
+// has been shut down. We accept it as a clean stop instead of propagating it.
+func isListenerClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	// redcon.Server.Close returns errors.New("not serving") when the server
+	// has not started or has already stopped. There is no exported sentinel
+	// to compare against, so we fall back to a tightly-scoped string match
+	// that only succeeds for that specific message. Keep this disjunction
+	// narrow so dependency upgrades that change the wording surface as a
+	// real error rather than a silent miss.
+	return err.Error() == "not serving"
 }

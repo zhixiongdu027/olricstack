@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -87,6 +88,10 @@ func TestRESPServerRejectsDMCommands(t *testing.T) {
 }
 
 func startTestRESPServer(t *testing.T, dmap *fakeDMap) (*RESPServer, string) {
+	return startTestRESPServerWithConfig(t, dmap, RESPServerConfig{CommandTimeout: time.Second})
+}
+
+func startTestRESPServerWithConfig(t *testing.T, dmap *fakeDMap, cfg RESPServerConfig) (*RESPServer, string) {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -94,12 +99,15 @@ func startTestRESPServer(t *testing.T, dmap *fakeDMap) (*RESPServer, string) {
 	}
 	addr := listener.Addr().String()
 	_ = listener.Close()
+	if cfg.Addr == "" {
+		cfg.Addr = addr
+	}
+	if cfg.CommandTimeout <= 0 {
+		cfg.CommandTimeout = time.Second
+	}
 
 	service := newTestService(t, newFakeProviderForDMap(DefaultDMap, dmap), nil).Service
-	server, err := NewRESPServer(service, RESPServerConfig{
-		Addr:           addr,
-		CommandTimeout: time.Second,
-	})
+	server, err := NewRESPServer(service, cfg)
 	if err != nil {
 		t.Fatalf("new resp server: %v", err)
 	}
@@ -115,8 +123,8 @@ func startTestRESPServer(t *testing.T, dmap *fakeDMap) (*RESPServer, string) {
 			t.Fatal("resp server did not stop")
 		}
 	})
-	waitForTCP(t, addr)
-	return server, addr
+	waitForTCP(t, cfg.Addr)
+	return server, cfg.Addr
 }
 
 func newFakeProviderForDMap(name string, dmap *fakeDMap) *fakeProvider {
@@ -135,4 +143,148 @@ func waitForTCP(t *testing.T, addr string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("tcp server %s did not become ready", addr)
+}
+
+// TestRESPServerShutdownDrainsInflightCommand pins F6: Shutdown must wait for
+// an in-flight command to finish (within ShutdownGrace) instead of force-
+// closing the client mid-write.
+func TestRESPServerShutdownDrainsInflightCommand(t *testing.T) {
+	dmap := newFakeDMap()
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	var once sync.Once
+	dmap.setHook = func(ctx context.Context, key, value string, ttl time.Duration) error {
+		once.Do(func() { close(entered) })
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	server, addr := startTestRESPServerWithConfig(t, dmap, RESPServerConfig{
+		CommandTimeout: 5 * time.Second,
+		ShutdownGrace:  2 * time.Second,
+	})
+
+	client := redis.NewClient(&redis.Options{Addr: addr, Protocol: 3})
+	defer client.Close()
+
+	setErr := make(chan error, 1)
+	go func() {
+		setErr <- client.Set(context.Background(), "alice", "A", 0).Err()
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("set never reached the dmap hook")
+	}
+
+	shutdownErr := make(chan error, 1)
+	go func() { shutdownErr <- server.Shutdown() }()
+
+	// Shutdown must not return before the in-flight command unblocks.
+	select {
+	case err := <-shutdownErr:
+		t.Fatalf("Shutdown returned before drain finished: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case err := <-shutdownErr:
+		if err != nil {
+			t.Fatalf("shutdown after drain: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not return after command released")
+	}
+
+	if err := <-setErr; err != nil {
+		t.Fatalf("set should have completed during drain: %v", err)
+	}
+	if dmap.values["alice"] != "A" {
+		t.Fatalf("expected alice=A after drain, got %q", dmap.values["alice"])
+	}
+}
+
+// TestRESPServerShutdownForceClosesAfterGrace pins the second half of F6: if a
+// command will not finish within ShutdownGrace, Shutdown must return after the
+// grace window and force-close the underlying connection so the surrounding
+// shutdown sequence can proceed.
+func TestRESPServerShutdownForceClosesAfterGrace(t *testing.T) {
+	dmap := newFakeDMap()
+	stuck := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-stuck:
+		default:
+			close(stuck)
+		}
+	})
+	dmap.setHook = func(ctx context.Context, _, _ string, _ time.Duration) error {
+		select {
+		case <-stuck:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	// CommandTimeout is intentionally larger than ShutdownGrace: the in-flight
+	// command will not unblock within grace, forcing Shutdown to fall through
+	// the grace branch and close the redcon server.
+	server, addr := startTestRESPServerWithConfig(t, dmap, RESPServerConfig{
+		CommandTimeout: 2 * time.Second,
+		ShutdownGrace:  100 * time.Millisecond,
+	})
+
+	client := redis.NewClient(&redis.Options{Addr: addr, Protocol: 3})
+	defer client.Close()
+
+	setDone := make(chan error, 1)
+	go func() {
+		setDone <- client.Set(context.Background(), "alice", "A", 0).Err()
+	}()
+
+	// Give the command time to enter the hook before triggering shutdown.
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	if err := server.Shutdown(); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// Shutdown should return shortly after the grace window — bound it so a
+	// regression that drops the force-close path fails loudly.
+	if elapsed > time.Second {
+		t.Fatalf("shutdown took %s, expected close-after-grace", elapsed)
+	}
+
+	// The forced connection close should surface as an error on the client.
+	select {
+	case err := <-setDone:
+		if err == nil {
+			t.Fatal("expected forced shutdown to fail the in-flight command")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("client SET never returned after forced shutdown")
+	}
+}
+
+// TestRESPServerShutdownIsIdempotent guards against the previous "not serving"
+// string-match path: calling Shutdown twice must not return an error.
+func TestRESPServerShutdownIsIdempotent(t *testing.T) {
+	dmap := newFakeDMap()
+	server, _ := startTestRESPServer(t, dmap)
+	if err := server.Shutdown(); err != nil {
+		t.Fatalf("first shutdown: %v", err)
+	}
+	if err := server.Shutdown(); err != nil {
+		t.Fatalf("second shutdown should be a no-op, got %v", err)
+	}
 }

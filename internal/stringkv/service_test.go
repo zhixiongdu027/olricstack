@@ -117,8 +117,9 @@ func (p *fakeProvider) DMap(name string) (DMap, error) {
 }
 
 type fakeDMap struct {
-	values map[string]string
-	ttls   map[string]time.Duration
+	values  map[string]string
+	ttls    map[string]time.Duration
+	setHook func(ctx context.Context, key, value string, ttl time.Duration) error
 }
 
 func newFakeDMap() *fakeDMap {
@@ -137,6 +138,11 @@ func (d *fakeDMap) Get(ctx context.Context, key string) (string, error) {
 }
 
 func (d *fakeDMap) Set(ctx context.Context, key, value string, ttl time.Duration) error {
+	if d.setHook != nil {
+		if err := d.setHook(ctx, key, value, ttl); err != nil {
+			return err
+		}
+	}
 	d.values[key] = value
 	d.ttls[key] = ttl
 	return nil

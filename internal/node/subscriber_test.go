@@ -9,6 +9,7 @@ import (
 	topologypb "github.com/zhixiongdu/olricstack/api/topology/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestNewSubscriberRequiresIdentity(t *testing.T) {
@@ -354,6 +355,7 @@ func (s *fakeWatchStream) RecvMsg(m any) error {
 	if !ok {
 		return errors.New("unexpected recv message type")
 	}
-	*target = *envelope
+	proto.Reset(target)
+	proto.Merge(target, envelope)
 	return nil
 }
