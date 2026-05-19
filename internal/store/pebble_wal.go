@@ -31,11 +31,15 @@ type pebbleWAL struct {
 	closed    bool
 }
 
-func openPebbleWAL(path string, queueSize int) (*pebbleWAL, error) {
+func openPebbleWAL(path string, queueSize int, listener *pebble.EventListener) (*pebbleWAL, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, fmt.Errorf("create wal dir: %w", err)
 	}
-	db, err := pebble.Open(path, &pebble.Options{})
+	opts := &pebble.Options{}
+	if listener != nil {
+		opts.EventListener = listener
+	}
+	db, err := pebble.Open(path, opts)
 	if err != nil {
 		return nil, fmt.Errorf("open wal: %w", err)
 	}
@@ -47,6 +51,18 @@ func openPebbleWAL(path string, queueSize int) (*pebbleWAL, error) {
 	}
 	w.depth = depth
 	return w, nil
+}
+
+// Metrics returns a snapshot of the underlying Pebble database metrics. It is
+// safe to call concurrently with WAL operations. The returned pointer must be
+// treated as read-only.
+func (w *pebbleWAL) Metrics() *pebble.Metrics {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return nil
+	}
+	return w.db.Metrics()
 }
 
 func (w *pebbleWAL) Close() error {

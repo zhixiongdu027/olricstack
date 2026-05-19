@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/cockroachdb/pebble"
 	"github.com/zhixiongdu/olricstack/internal/store"
 )
 
@@ -142,6 +143,20 @@ func (s *LeaseGatedStore) PreparedCount() (int, error) {
 		return c.PreparedCount()
 	}
 	return 0, nil
+}
+
+// PebbleMetrics forwards the inner store's Pebble metrics snapshot when
+// available. Returns nil if the inner store does not back its WAL with
+// Pebble. The lease gate is intentionally not enforced — metrics are
+// readable in any serving role.
+func (s *LeaseGatedStore) PebbleMetrics() *pebble.Metrics {
+	type sampler interface {
+		PebbleMetrics() *pebble.Metrics
+	}
+	if m, ok := s.inner.(sampler); ok {
+		return m.PebbleMetrics()
+	}
+	return nil
 }
 
 // FlushHandoff forwards a synchronous handoff drain to the inner store. The

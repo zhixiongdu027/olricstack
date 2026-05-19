@@ -142,6 +142,34 @@ func TestMySQLStoreFlushBackoffAfterFailure(t *testing.T) {
 	}
 }
 
+// TestConfigDefaultsApplyFlushTimeout pins the new FlushTimeout default. A
+// zero-valued FlushTimeout would silently restore the pre-fix behaviour
+// (CreateInBatches with no context), so this guards the regression boundary.
+func TestConfigDefaultsApplyFlushTimeout(t *testing.T) {
+	cfg := Config{}.withDefaults()
+	if cfg.FlushTimeout <= 0 {
+		t.Fatalf("FlushTimeout default must be positive, got %s", cfg.FlushTimeout)
+	}
+	explicit := Config{FlushTimeout: 5 * time.Second}.withDefaults()
+	if explicit.FlushTimeout != 5*time.Second {
+		t.Fatalf("explicit FlushTimeout must survive defaults, got %s", explicit.FlushTimeout)
+	}
+}
+
+// TestPebbleMetricsExposed pins the observability surface added for §3.1.
+// The metrics handle must be non-nil while the store is open and nil after
+// Close so a leaked Prometheus scrape cannot read freed memory.
+func TestPebbleMetricsExposed(t *testing.T) {
+	cacheStore := newTestStore(t, Config{FlushInterval: time.Hour})
+	if m := cacheStore.PebbleMetrics(); m == nil {
+		t.Fatal("PebbleMetrics returned nil while store is open")
+	}
+	closeStore(t, cacheStore)
+	if m := cacheStore.PebbleMetrics(); m != nil {
+		t.Fatalf("PebbleMetrics must return nil after close, got %#v", m)
+	}
+}
+
 func TestMySQLStoreRejectsStoreAfterClose(t *testing.T) {
 	cacheStore := newTestStore(t, Config{})
 	closeStore(t, cacheStore)

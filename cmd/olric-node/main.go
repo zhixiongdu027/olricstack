@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cockroachdb/pebble"
 	olric "github.com/olric-data/olric"
 	olricconfig "github.com/olric-data/olric/config"
 	topologypb "github.com/zhixiongdu/olricstack/api/topology/v1"
@@ -288,12 +289,15 @@ func buildCacheStore() (store.CacheStore, error) {
 		log.Printf("storage mode: memory only")
 		return nil, nil
 	}
+	listener := newPebbleEventLogger()
 	cfg := store.Config{
-		QueueSize:     envInt("DIRTY_QUEUE_SIZE", 1024),
-		FlushInterval: envDuration("FLUSH_INTERVAL", time.Second),
-		BatchSize:     envInt("FLUSH_BATCH_SIZE", 256),
-		WALPath:       envString("WAL_PATH", "/var/lib/olricstack/cache.wal"),
-		FlushBackoff:  envDuration("FLUSH_BACKOFF", time.Second),
+		QueueSize:           envInt("DIRTY_QUEUE_SIZE", 1024),
+		FlushInterval:       envDuration("FLUSH_INTERVAL", time.Second),
+		BatchSize:           envInt("FLUSH_BATCH_SIZE", 256),
+		WALPath:             envString("WAL_PATH", "/var/lib/olricstack/cache.wal"),
+		FlushBackoff:        envDuration("FLUSH_BACKOFF", time.Second),
+		FlushTimeout:        envDuration("FLUSH_TIMEOUT", 30*time.Second),
+		PebbleEventListener: listener,
 	}
 	if mode == "wal" {
 		log.Printf("storage mode: memory + local wal")
@@ -423,4 +427,28 @@ func envInt64(name string, fallback int64) int64 {
 		return fallback
 	}
 	return parsed
+}
+
+// newPebbleEventLogger returns a Pebble EventListener that surfaces the
+// operationally-significant lifecycle events to the standard logger. The
+// noisy events (every flush/compaction begin/end, every WAL/manifest
+// rotation) are intentionally left as no-ops — at sustained write rates
+// those fire dozens of times per second and would drown the log without
+// adding diagnostic value. We keep the events that signal real trouble:
+// background errors, write stalls, and disk-slow detections.
+func newPebbleEventLogger() *pebble.EventListener {
+	return &pebble.EventListener{
+		BackgroundError: func(err error) {
+			log.Printf("[ERROR] pebble background: %v", err)
+		},
+		WriteStallBegin: func(info pebble.WriteStallBeginInfo) {
+			log.Printf("[WARN] pebble write stall begin: %s", info.Reason)
+		},
+		WriteStallEnd: func() {
+			log.Printf("[WARN] pebble write stall end")
+		},
+		DiskSlow: func(info pebble.DiskSlowInfo) {
+			log.Printf("[WARN] pebble disk slow: path=%s duration=%s", info.Path, info.Duration)
+		},
+	}
 }

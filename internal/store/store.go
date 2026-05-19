@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/pebble"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -116,6 +117,16 @@ type Config struct {
 	BatchSize     int
 	WALPath       string
 	FlushBackoff  time.Duration
+	// FlushTimeout bounds a single MySQL upsert batch. Without it, a hung
+	// connection would freeze flushLoop indefinitely while new writes pile up
+	// in the dirty queue until QueueSize triggers ErrQueueFull. Defaults to
+	// 30s — long enough for normal slow paths, short enough to surface a
+	// truly stuck flusher within one operator alert window.
+	FlushTimeout time.Duration
+	// PebbleEventListener receives Pebble lifecycle events (write stalls,
+	// compactions, disk-slow). Optional; nil disables structured event
+	// observability and lets pebble use its built-in logger.
+	PebbleEventListener *pebble.EventListener
 }
 
 func (c Config) withDefaults() Config {
@@ -133,6 +144,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.FlushBackoff <= 0 {
 		c.FlushBackoff = c.FlushInterval
+	}
+	if c.FlushTimeout <= 0 {
+		c.FlushTimeout = 30 * time.Second
 	}
 	return c
 }
@@ -188,7 +202,7 @@ func newStore(db *gorm.DB, cfg Config) (*MySQLStore, error) {
 		done:   make(chan struct{}),
 		closed: make(chan struct{}),
 	}
-	wal, err := openPebbleWAL(cfg.WALPath, cfg.QueueSize)
+	wal, err := openPebbleWAL(cfg.WALPath, cfg.QueueSize, cfg.PebbleEventListener)
 	if err != nil {
 		return nil, err
 	}
@@ -248,6 +262,14 @@ func (s *MySQLStore) PreparedCount() (int, error) {
 		return 0, fmt.Errorf("count prepared wal records: %w", err)
 	}
 	return count, nil
+}
+
+// PebbleMetrics returns a point-in-time snapshot of Pebble's internal metrics
+// (LSM levels, write stalls, compaction stats, disk space, etc.). Intended
+// for Prometheus exporters or ad-hoc operator inspection. Returns nil if the
+// underlying WAL has been closed.
+func (s *MySQLStore) PebbleMetrics() *pebble.Metrics {
+	return s.wal.Metrics()
 }
 
 // PurgeBelowGeneration removes WAL records whose fence Generation is strictly
@@ -639,7 +661,9 @@ func (s *MySQLStore) flushEntries(entries []dirtyEntry) bool {
 		return true
 	}
 
-	err := s.db.Clauses(s.versionedUpsertClause()).CreateInBatches(records, s.cfg.BatchSize).Error
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.FlushTimeout)
+	defer cancel()
+	err := s.db.WithContext(ctx).Clauses(s.versionedUpsertClause()).CreateInBatches(records, s.cfg.BatchSize).Error
 	if err != nil {
 		s.setWorkerError(fmt.Errorf("flush dirty records: %w", err))
 		return false
