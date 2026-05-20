@@ -73,7 +73,6 @@ jobs:
       - name: Kind e2e
         env:
           E2E_KIND_CLUSTER: olric-e2e-nightly
-          E2E_MYSQL_HOST: 127.0.0.1
           E2E_MYSQL_PORT: "3306"
           E2E_MYSQL_USER: root
           E2E_MYSQL_PASSWORD: password
