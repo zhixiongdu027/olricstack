@@ -142,7 +142,8 @@ func deployTestStack(t *testing.T, ctx context.Context, env *kindEnv, stackName 
 	env.applyYAML(t, fmt.Sprintf(testMySQLSecretYAML, opts.mysqlSecretName, env.namespace, base64DSN(opts.mysqlDSN)))
 	env.applyYAML(t, fmt.Sprintf(testStackYAML, stackName, env.namespace, nodeImage, opts.sidecarImage, watchdogImage, opts.mysqlSecretName))
 
-	env.waitForDeploymentReady(t, ctx, env.namespace, stackName+"-olric")
+	env.waitForAvailableDeployment(t, ctx, env.namespace, stackName+"-watchdog")
+	env.waitForAvailableDeployment(t, ctx, env.namespace, stackName+"-olric")
 	env.assertLeaseExists(t, ctx, env.namespace, stackName+"-watchdog")
 	env.assertConfigMapHasGeneration(t, ctx, env.namespace, stackName+"-topology")
 	env.assertServiceEndpoints(t, ctx, env.namespace, stackName+"-watchdog")
