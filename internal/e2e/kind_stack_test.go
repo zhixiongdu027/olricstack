@@ -142,10 +142,10 @@ func deployTestStack(t *testing.T, ctx context.Context, env *kindEnv, stackName 
 	env.applyYAML(t, fmt.Sprintf(testMySQLSecretYAML, opts.mysqlSecretName, env.namespace, base64DSN(opts.mysqlDSN)))
 	env.applyYAML(t, fmt.Sprintf(testStackYAML, stackName, env.namespace, nodeImage, opts.sidecarImage, watchdogImage, opts.mysqlSecretName))
 
-	env.waitForAvailableDeployment(t, ctx, env.namespace, stackName+"-watchdog")
+	env.waitForDeploymentExists(t, ctx, env.namespace, stackName+"-watchdog")
+	env.waitForLeaseHolder(t, ctx, env.namespace, stackName+"-watchdog")
+	env.waitForConfigMapGeneration(t, ctx, env.namespace, stackName+"-topology")
 	env.waitForAvailableDeployment(t, ctx, env.namespace, stackName+"-olric")
-	env.assertLeaseExists(t, ctx, env.namespace, stackName+"-watchdog")
-	env.assertConfigMapHasGeneration(t, ctx, env.namespace, stackName+"-topology")
 	env.assertServiceEndpoints(t, ctx, env.namespace, stackName+"-watchdog")
 	env.assertServiceEndpoints(t, ctx, env.namespace, stackName+"-olric")
 }
@@ -270,6 +270,22 @@ func (e *kindEnv) waitForAvailableDeployment(t *testing.T, ctx context.Context, 
 	t.Fatalf("deployment %s/%s did not become available within timeout", namespace, name)
 }
 
+func (e *kindEnv) waitForDeploymentExists(t *testing.T, ctx context.Context, namespace, name string) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Minute)
+	for time.Now().Before(deadline) {
+		cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "deployment", name, "-o", "name")
+		out, err := cmd.CombinedOutput()
+		if err == nil && strings.TrimSpace(string(out)) != "" {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	e.dumpDiagnostics(t, namespace)
+	t.Fatalf("deployment %s/%s did not appear within timeout", namespace, name)
+}
+
 func (e *kindEnv) waitForDeploymentReady(t *testing.T, ctx context.Context, namespace, name string) {
 	t.Helper()
 	cmd := e.kubectlCmd(ctx, "-n", namespace, "wait", "--for=condition=available", "deployment/"+name, "--timeout=120s")
@@ -289,6 +305,24 @@ func (e *kindEnv) assertLeaseExists(t *testing.T, ctx context.Context, namespace
 	}
 }
 
+func (e *kindEnv) waitForLeaseHolder(t *testing.T, ctx context.Context, namespace, name string) string {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Minute)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		holder, err := e.readLeaseHolder(ctx, namespace, name)
+		if err == nil && holder != "" {
+			return holder
+		}
+		lastErr = err
+		time.Sleep(time.Second)
+	}
+	e.dumpDiagnostics(t, namespace)
+	t.Fatalf("lease %s/%s did not get a holder within timeout: %v", namespace, name, lastErr)
+	return ""
+}
+
 func (e *kindEnv) assertConfigMapHasGeneration(t *testing.T, ctx context.Context, namespace, name string) {
 	t.Helper()
 	cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "configmap", name, "-o", "jsonpath={.data.watchdogGeneration}")
@@ -299,6 +333,24 @@ func (e *kindEnv) assertConfigMapHasGeneration(t *testing.T, ctx context.Context
 	if strings.TrimSpace(string(out)) == "" {
 		t.Fatalf("expected configmap %s/%s to contain watchdogGeneration", namespace, name)
 	}
+}
+
+func (e *kindEnv) waitForConfigMapGeneration(t *testing.T, ctx context.Context, namespace, name string) int64 {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Minute)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		generation, err := e.readConfigMapGeneration(ctx, namespace, name)
+		if err == nil && generation > 0 {
+			return generation
+		}
+		lastErr = err
+		time.Sleep(time.Second)
+	}
+	e.dumpDiagnostics(t, namespace)
+	t.Fatalf("configmap %s/%s did not get watchdogGeneration within timeout: %v", namespace, name, lastErr)
+	return 0
 }
 
 func (e *kindEnv) assertServiceEndpoints(t *testing.T, ctx context.Context, namespace, name string) {
