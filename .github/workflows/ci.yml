@@ -1,0 +1,145 @@
+name: ci
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  push:
+    branches:
+      - master
+      - main
+      - "harden-*"
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Verify
+        run: make verify
+
+  host-e2e:
+    name: host e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: password
+        ports:
+          - 13306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ppassword"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Host lifecycle e2e
+        env:
+          E2E_MYSQL_PORT: "13306"
+          E2E_MYSQL_USER: root
+          E2E_MYSQL_PASSWORD: password
+        run: |
+          go test -tags=e2e ./internal/e2e \
+            -run '^TestHost(DataLifecycleMatrix|OnlyRollingRestartPreservesLiveDataAndDropsExpiredData|OnlyTwoNodeSetWithTTLExpiresAndDoesNotReviveOnRestart)$' \
+            -count=1 -v
+
+  kind-e2e:
+    name: kind cluster e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_DATABASE: olric_e2e
+          MYSQL_ROOT_PASSWORD: password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ppassword"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install kind
+        env:
+          KIND_VERSION: v0.31.0
+        run: |
+          curl -fsSL -o kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x kind
+          sudo mv kind /usr/local/bin/kind
+      - name: Install kubectl
+        run: |
+          KUBECTL_VERSION="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+          curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+      - name: Create kind cluster
+        run: kind create cluster --name olric-e2e --wait 120s
+      - name: Run kind e2e
+        env:
+          E2E_KIND_CLUSTER: olric-e2e
+          E2E_MYSQL_HOST: 127.0.0.1
+          E2E_MYSQL_PORT: "3306"
+          E2E_MYSQL_USER: root
+          E2E_MYSQL_PASSWORD: password
+          E2E_MYSQL_DATABASE: olric_e2e
+        run: make e2e-kind
+      - name: Collect kind diagnostics
+        if: failure()
+        run: |
+          mkdir -p artifacts/kind
+          kubectl --context kind-olric-e2e get pods -A -o wide > artifacts/kind/pods.txt || true
+          kubectl --context kind-olric-e2e get events -A --sort-by=.lastTimestamp > artifacts/kind/events.txt || true
+          kubectl --context kind-olric-e2e logs -n olric-system deploy/olricstack-operator --all-containers=true > artifacts/kind/operator.log || true
+          kind export logs --name olric-e2e artifacts/kind/cluster || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: kind-diagnostics
+          path: artifacts/kind
+
+  third-party:
+    name: third party olric
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: third_party/olric/go.mod
+          cache: true
+          cache-dependency-path: third_party/olric/go.sum
+      - name: Test fork
+        working-directory: third_party/olric
+        run: go test -count=1 ./...

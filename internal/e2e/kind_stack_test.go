@@ -19,8 +19,8 @@ func base64DSN(dsn string) string {
 	return base64.StdEncoding.EncodeToString([]byte(dsn))
 }
 
-func TestK3dStackReconcilesThroughWatchdog(t *testing.T) {
-	env := requireK3dEnv(t)
+func TestKindStackReconcilesThroughWatchdog(t *testing.T) {
+	env := requireKindEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
@@ -29,8 +29,8 @@ func TestK3dStackReconcilesThroughWatchdog(t *testing.T) {
 	deployTestStack(t, ctx, env, stackName, testStackOptions{})
 }
 
-func TestK3dWatchdogFailoverReconnectsOlricNode(t *testing.T) {
-	env := requireK3dEnv(t)
+func TestKindWatchdogFailoverReconnectsOlricNode(t *testing.T) {
+	env := requireKindEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -75,8 +75,8 @@ func TestK3dWatchdogFailoverReconnectsOlricNode(t *testing.T) {
 	env.waitForNodeLogContains(t, ctx, env.namespace, nodePodName, nextToken)
 }
 
-func TestK3dMySQLDurableWritePath(t *testing.T) {
-	env := requireK3dEnv(t)
+func TestKindMySQLDurableWritePath(t *testing.T) {
+	env := requireKindEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
@@ -111,21 +111,26 @@ func (o testStackOptions) withDefaults(stackName string) testStackOptions {
 	if o.mysqlSecretName == "" {
 		o.mysqlSecretName = stackName + "-mysql"
 	}
-	if o.mysqlDSN == "" {
-		o.mysqlDSN = envOrDefault("E2E_MYSQL_DSN", "root:password@tcp(host.k3d.internal:3306)/olric_e2e?parseTime=true")
-	}
 	if o.sidecarImage == "" {
 		o.sidecarImage = envOrDefault("E2E_SIDECAR_IMAGE", "olricstack/olric-sidecar:e2e")
 	}
 	return o
 }
 
-func deployTestStack(t *testing.T, ctx context.Context, env *k3dEnv, stackName string, opts testStackOptions) {
+func deployTestStack(t *testing.T, ctx context.Context, env *kindEnv, stackName string, opts testStackOptions) {
 	t.Helper()
 
 	opts = opts.withDefaults(stackName)
 	nodeImage := envOrDefault("E2E_NODE_IMAGE", "olricstack/olric-node:e2e")
 	watchdogImage := envOrDefault("E2E_WATCHDOG_IMAGE", "olricstack/watchdog:e2e")
+	if opts.mysqlDSN == "" {
+		mysqlHost := envOrDefault("E2E_MYSQL_HOST", env.hostGateway(t))
+		mysqlPort := envOrDefault("E2E_MYSQL_PORT", "3306")
+		mysqlUser := envOrDefault("E2E_MYSQL_USER", "root")
+		mysqlPassword := envOrDefault("E2E_MYSQL_PASSWORD", "password")
+		mysqlDatabase := envOrDefault("E2E_MYSQL_DATABASE", "olric_e2e")
+		opts.mysqlDSN = fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true", mysqlUser, mysqlPassword, mysqlHost, mysqlPort, mysqlDatabase)
+	}
 
 	env.ensureNamespace(t, ctx)
 	env.ensureOperatorNamespace(t, ctx)
@@ -146,7 +151,7 @@ func deployTestStack(t *testing.T, ctx context.Context, env *k3dEnv, stackName s
 
 // firstNodePod returns the name of the first olric-node pod for stack, waiting
 // briefly for the Deployment to materialise pods.
-func (e *k3dEnv) firstNodePod(t *testing.T, ctx context.Context, stackName string) string {
+func (e *kindEnv) firstNodePod(t *testing.T, ctx context.Context, stackName string) string {
 	t.Helper()
 	deadline := time.Now().Add(time.Minute)
 	for time.Now().Before(deadline) {
@@ -163,7 +168,7 @@ func (e *k3dEnv) firstNodePod(t *testing.T, ctx context.Context, stackName strin
 	return ""
 }
 
-func (e *k3dEnv) ensureNamespace(t *testing.T, ctx context.Context) {
+func (e *kindEnv) ensureNamespace(t *testing.T, ctx context.Context) {
 	t.Helper()
 
 	cmd := e.kubectlCmd(ctx, "create", "namespace", e.namespace, "--dry-run=client", "-o", "yaml")
@@ -179,7 +184,7 @@ func (e *k3dEnv) ensureNamespace(t *testing.T, ctx context.Context) {
 	}
 }
 
-func (e *k3dEnv) ensureOperatorNamespace(t *testing.T, ctx context.Context) {
+func (e *kindEnv) ensureOperatorNamespace(t *testing.T, ctx context.Context) {
 	t.Helper()
 	cmd := e.kubectlCmd(ctx, "create", "namespace", "olric-system", "--dry-run=client", "-o", "yaml")
 	out, err := cmd.Output()
@@ -194,7 +199,7 @@ func (e *k3dEnv) ensureOperatorNamespace(t *testing.T, ctx context.Context) {
 	}
 }
 
-func (e *k3dEnv) deleteOperatorDeployment(t *testing.T, ctx context.Context) {
+func (e *kindEnv) deleteOperatorDeployment(t *testing.T, ctx context.Context) {
 	t.Helper()
 
 	cmd := e.kubectlCmd(ctx, "-n", "olric-system", "delete", "deployment", "olricstack-operator", "--ignore-not-found=true", "--wait=true")
@@ -204,7 +209,7 @@ func (e *k3dEnv) deleteOperatorDeployment(t *testing.T, ctx context.Context) {
 	}
 }
 
-func (e *k3dEnv) applyRepoManifest(t *testing.T, ctx context.Context, path, namespace string) {
+func (e *kindEnv) applyRepoManifest(t *testing.T, ctx context.Context, path, namespace string) {
 	t.Helper()
 
 	args := []string{"apply"}
@@ -219,7 +224,7 @@ func (e *k3dEnv) applyRepoManifest(t *testing.T, ctx context.Context, path, name
 	}
 }
 
-func (e *k3dEnv) cleanupStack(t *testing.T, stackName string) {
+func (e *kindEnv) cleanupStack(t *testing.T, stackName string) {
 	t.Helper()
 	if os.Getenv("E2E_KEEP_RESOURCES") == "1" {
 		return
@@ -244,7 +249,7 @@ func (e *k3dEnv) cleanupStack(t *testing.T, stackName string) {
 	}
 }
 
-func (e *k3dEnv) waitForAvailableDeployment(t *testing.T, ctx context.Context, namespace, name string) {
+func (e *kindEnv) waitForAvailableDeployment(t *testing.T, ctx context.Context, namespace, name string) {
 	t.Helper()
 
 	deadline := time.Now().Add(2 * time.Minute)
@@ -264,7 +269,7 @@ func (e *k3dEnv) waitForAvailableDeployment(t *testing.T, ctx context.Context, n
 	t.Fatalf("deployment %s/%s did not become available within timeout", namespace, name)
 }
 
-func (e *k3dEnv) waitForDeploymentReady(t *testing.T, ctx context.Context, namespace, name string) {
+func (e *kindEnv) waitForDeploymentReady(t *testing.T, ctx context.Context, namespace, name string) {
 	t.Helper()
 	cmd := e.kubectlCmd(ctx, "-n", namespace, "wait", "--for=condition=available", "deployment/"+name, "--timeout=120s")
 	out, err := cmd.CombinedOutput()
@@ -274,7 +279,7 @@ func (e *k3dEnv) waitForDeploymentReady(t *testing.T, ctx context.Context, names
 	}
 }
 
-func (e *k3dEnv) assertLeaseExists(t *testing.T, ctx context.Context, namespace, name string) {
+func (e *kindEnv) assertLeaseExists(t *testing.T, ctx context.Context, namespace, name string) {
 	t.Helper()
 	cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "lease", name, "-o", "name")
 	out, err := cmd.CombinedOutput()
@@ -283,7 +288,7 @@ func (e *k3dEnv) assertLeaseExists(t *testing.T, ctx context.Context, namespace,
 	}
 }
 
-func (e *k3dEnv) assertConfigMapHasGeneration(t *testing.T, ctx context.Context, namespace, name string) {
+func (e *kindEnv) assertConfigMapHasGeneration(t *testing.T, ctx context.Context, namespace, name string) {
 	t.Helper()
 	cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "configmap", name, "-o", "jsonpath={.data.watchdogGeneration}")
 	out, err := cmd.CombinedOutput()
@@ -295,7 +300,7 @@ func (e *k3dEnv) assertConfigMapHasGeneration(t *testing.T, ctx context.Context,
 	}
 }
 
-func (e *k3dEnv) assertServiceEndpoints(t *testing.T, ctx context.Context, namespace, name string) {
+func (e *kindEnv) assertServiceEndpoints(t *testing.T, ctx context.Context, namespace, name string) {
 	t.Helper()
 	deadline := time.Now().Add(time.Minute)
 	for time.Now().Before(deadline) {
@@ -310,7 +315,7 @@ func (e *k3dEnv) assertServiceEndpoints(t *testing.T, ctx context.Context, names
 	t.Fatalf("service %s/%s has no endpoints", namespace, name)
 }
 
-func (e *k3dEnv) readLeaseHolder(ctx context.Context, namespace, name string) (string, error) {
+func (e *kindEnv) readLeaseHolder(ctx context.Context, namespace, name string) (string, error) {
 	cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "lease", name, "-o", "jsonpath={.spec.holderIdentity}")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -319,7 +324,7 @@ func (e *k3dEnv) readLeaseHolder(ctx context.Context, namespace, name string) (s
 	return strings.TrimSpace(string(out)), nil
 }
 
-func (e *k3dEnv) waitForLeaseHolderChange(t *testing.T, ctx context.Context, namespace, name, previous string) string {
+func (e *kindEnv) waitForLeaseHolderChange(t *testing.T, ctx context.Context, namespace, name, previous string) string {
 	t.Helper()
 
 	deadline := time.Now().Add(90 * time.Second)
@@ -339,7 +344,7 @@ func (e *k3dEnv) waitForLeaseHolderChange(t *testing.T, ctx context.Context, nam
 	return ""
 }
 
-func (e *k3dEnv) readConfigMapGeneration(ctx context.Context, namespace, name string) (int64, error) {
+func (e *kindEnv) readConfigMapGeneration(ctx context.Context, namespace, name string) (int64, error) {
 	cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "configmap", name, "-o", "jsonpath={.data.watchdogGeneration}")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -356,7 +361,7 @@ func (e *k3dEnv) readConfigMapGeneration(ctx context.Context, namespace, name st
 	return generation, nil
 }
 
-func (e *k3dEnv) waitForConfigMapGenerationGreater(t *testing.T, ctx context.Context, namespace, name string, previous int64) int64 {
+func (e *kindEnv) waitForConfigMapGenerationGreater(t *testing.T, ctx context.Context, namespace, name string, previous int64) int64 {
 	t.Helper()
 
 	deadline := time.Now().Add(90 * time.Second)
@@ -376,7 +381,7 @@ func (e *k3dEnv) waitForConfigMapGenerationGreater(t *testing.T, ctx context.Con
 	return 0
 }
 
-func (e *k3dEnv) waitForPodReady(t *testing.T, ctx context.Context, namespace, name string) {
+func (e *kindEnv) waitForPodReady(t *testing.T, ctx context.Context, namespace, name string) {
 	t.Helper()
 
 	deadline := time.Now().Add(90 * time.Second)
@@ -392,7 +397,7 @@ func (e *k3dEnv) waitForPodReady(t *testing.T, ctx context.Context, namespace, n
 	t.Fatalf("pod %s/%s did not become ready within timeout", namespace, name)
 }
 
-func (e *k3dEnv) waitForNodeLogContains(t *testing.T, ctx context.Context, namespace, podName, needle string) {
+func (e *kindEnv) waitForNodeLogContains(t *testing.T, ctx context.Context, namespace, podName, needle string) {
 	t.Helper()
 
 	deadline := time.Now().Add(90 * time.Second)
@@ -413,7 +418,7 @@ func (e *k3dEnv) waitForNodeLogContains(t *testing.T, ctx context.Context, names
 	t.Fatalf("pod %s/%s logs did not contain %q; last logs:\n%s", namespace, podName, needle, strings.TrimSpace(lastLogs))
 }
 
-func (e *k3dEnv) waitForSidecarLogContains(t *testing.T, ctx context.Context, namespace, podName, needle string) {
+func (e *kindEnv) waitForSidecarLogContains(t *testing.T, ctx context.Context, namespace, podName, needle string) {
 	t.Helper()
 
 	deadline := time.Now().Add(90 * time.Second)
@@ -434,7 +439,7 @@ func (e *k3dEnv) waitForSidecarLogContains(t *testing.T, ctx context.Context, na
 	t.Fatalf("pod %s/%s sidecar logs did not contain %q; last logs:\n%s", namespace, podName, needle, strings.TrimSpace(lastLogs))
 }
 
-func (e *k3dEnv) writeDMapFromNode(t *testing.T, ctx context.Context, namespace, podName, dmap, key, value string) error {
+func (e *kindEnv) writeDMapFromNode(t *testing.T, ctx context.Context, namespace, podName, dmap, key, value string) error {
 	t.Helper()
 
 	podIP, err := e.readPodField(ctx, namespace, podName, "{.status.podIP}")
@@ -454,7 +459,7 @@ func (e *k3dEnv) writeDMapFromNode(t *testing.T, ctx context.Context, namespace,
 		return fmt.Errorf("build olric e2e client: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
 
-	nodeContainer := k3dNodeContainerName(nodeName)
+	nodeContainer := kindNodeContainerName(nodeName)
 	remoteBinary := "/tmp/olric-e2e-client"
 	copyCmd := exec.CommandContext(ctx, "docker", "cp", localBinary, nodeContainer+":"+remoteBinary)
 	if out, err := copyCmd.CombinedOutput(); err != nil {
@@ -477,7 +482,7 @@ func (e *k3dEnv) writeDMapFromNode(t *testing.T, ctx context.Context, namespace,
 	return nil
 }
 
-func (e *k3dEnv) readPodField(ctx context.Context, namespace, podName, jsonPath string) (string, error) {
+func (e *kindEnv) readPodField(ctx context.Context, namespace, podName, jsonPath string) (string, error) {
 	cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "pod", podName, "-o", "jsonpath="+jsonPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -490,29 +495,30 @@ func (e *k3dEnv) readPodField(ctx context.Context, namespace, podName, jsonPath 
 	return value, nil
 }
 
-func (e *k3dEnv) hostGateway(t *testing.T) string {
+func (e *kindEnv) hostGateway(t *testing.T) string {
 	t.Helper()
 
-	cmd := exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}", fmt.Sprintf("k3d-%s-server-0", e.clusterName))
+	cmd := exec.Command("docker", "inspect", "-f", "{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}", kindControlPlaneContainerName(e.clusterName))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("read k3d host gateway: %v (%s)", err, strings.TrimSpace(string(out)))
+		t.Fatalf("read kind host gateway: %v (%s)", err, strings.TrimSpace(string(out)))
 	}
 	gateway := strings.TrimSpace(string(out))
 	if gateway == "" {
-		t.Fatal("k3d host gateway is empty")
+		t.Fatal("kind host gateway is empty")
 	}
 	return gateway
 }
 
-func k3dNodeContainerName(nodeName string) string {
-	if strings.HasPrefix(nodeName, "k3d-") {
-		return nodeName
-	}
-	return "k3d-" + nodeName
+func kindNodeContainerName(nodeName string) string {
+	return nodeName
 }
 
-func (e *k3dEnv) dumpDiagnostics(t *testing.T, namespace string) {
+func kindControlPlaneContainerName(clusterName string) string {
+	return clusterName + "-control-plane"
+}
+
+func (e *kindEnv) dumpDiagnostics(t *testing.T, namespace string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

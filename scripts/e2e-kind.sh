@@ -2,13 +2,15 @@
 set -eu
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-CLUSTER="${E2E_K3D_CLUSTER:-dev}"
+KIND="${KIND:-kind}"
+CLUSTER="${E2E_KIND_CLUSTER:-olric-e2e}"
 TAG="${E2E_IMAGE_TAG:-e2e-$(date +%s)}"
 NODE_IMAGE="${E2E_NODE_IMAGE:-olricstack/olric-node:$TAG}"
 SIDECAR_IMAGE="${E2E_SIDECAR_IMAGE:-olricstack/olric-sidecar:$TAG}"
 WATCHDOG_IMAGE="${E2E_WATCHDOG_IMAGE:-olricstack/watchdog:$TAG}"
 OPERATOR_IMAGE="${E2E_OPERATOR_IMAGE:-olricstack/operator:$TAG}"
-BUILD_DIR="$ROOT_DIR/.build/e2e-k3d"
+TEST_RUN="${E2E_TEST_RUN:-TestKind}"
+BUILD_DIR="$ROOT_DIR/.build/e2e-kind"
 
 build_image() {
   image="$1"
@@ -24,6 +26,14 @@ ENTRYPOINT ["/$binary"]
 EOF
   docker build -t "$image" "$context"
 }
+
+if ! "$KIND" get clusters | grep -Fxq "$CLUSTER"; then
+  if [ "${E2E_KIND_CREATE_CLUSTER:-0}" != "1" ]; then
+    echo "kind cluster $CLUSTER not found; set E2E_KIND_CREATE_CLUSTER=1 to create it" >&2
+    exit 1
+  fi
+  "$KIND" create cluster --name "$CLUSTER"
+fi
 
 echo "building e2e binaries"
 mkdir -p "$BUILD_DIR/bin"
@@ -41,14 +51,27 @@ build_image "$SIDECAR_IMAGE" olric-sidecar
 build_image "$WATCHDOG_IMAGE" watchdog
 build_image "$OPERATOR_IMAGE" operator
 
-echo "importing images into k3d cluster $CLUSTER"
-k3d image import -c "$CLUSTER" "$NODE_IMAGE" "$SIDECAR_IMAGE" "$WATCHDOG_IMAGE" "$OPERATOR_IMAGE"
+echo "loading images into kind cluster $CLUSTER"
+"$KIND" load docker-image --name "$CLUSTER" "$NODE_IMAGE"
+"$KIND" load docker-image --name "$CLUSTER" "$SIDECAR_IMAGE"
+"$KIND" load docker-image --name "$CLUSTER" "$WATCHDOG_IMAGE"
+"$KIND" load docker-image --name "$CLUSTER" "$OPERATOR_IMAGE"
 
-echo "running k3d e2e tests"
+if [ -z "${E2E_MYSQL_DSN:-}" ] && [ -n "${E2E_MYSQL_PORT:-}" ]; then
+  gateway="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$CLUSTER-control-plane")"
+  if [ -z "$gateway" ]; then
+    echo "unable to detect Docker gateway for kind cluster $CLUSTER" >&2
+    exit 1
+  fi
+  E2E_MYSQL_DSN="${E2E_MYSQL_USER:-root}:${E2E_MYSQL_PASSWORD:-password}@tcp($gateway:$E2E_MYSQL_PORT)/${E2E_MYSQL_DATABASE:-olric_e2e}?parseTime=true"
+  export E2E_MYSQL_DSN
+fi
+
+echo "running kind e2e tests"
 cd "$ROOT_DIR"
-E2E_K3D_CLUSTER="$CLUSTER" \
+E2E_KIND_CLUSTER="$CLUSTER" \
 E2E_NODE_IMAGE="$NODE_IMAGE" \
 E2E_SIDECAR_IMAGE="$SIDECAR_IMAGE" \
 E2E_WATCHDOG_IMAGE="$WATCHDOG_IMAGE" \
 E2E_OPERATOR_IMAGE="$OPERATOR_IMAGE" \
-go test -tags=e2e ./internal/e2e -count=1 -v
+go test -tags=e2e ./internal/e2e -run "$TEST_RUN" -count=1 -v

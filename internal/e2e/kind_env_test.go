@@ -12,70 +12,75 @@ import (
 )
 
 const (
-	defaultNamespace = "olric-e2e"
-	defaultK3dCluster = "dev"
+	defaultNamespace   = "olric-e2e"
+	defaultKindCluster = "olric-e2e"
 )
 
-type k3dEnv struct {
+type kindEnv struct {
 	clusterName string
+	kubeContext string
 	namespace   string
 	kubectl     string
 }
 
-func requireK3dEnv(t *testing.T) *k3dEnv {
+func requireKindEnv(t *testing.T) *kindEnv {
 	t.Helper()
 
-	clusterName := envOrDefault("E2E_K3D_CLUSTER", defaultK3dCluster)
+	clusterName := envOrDefault("E2E_KIND_CLUSTER", defaultKindCluster)
 	namespace := envOrDefault("E2E_NAMESPACE", defaultNamespace)
 	kubectl := envOrDefault("KUBECTL", "kubectl")
+	kubeContext := envOrDefault("E2E_KUBE_CONTEXT", "kind-"+clusterName)
 
 	if _, err := exec.LookPath(kubectl); err != nil {
 		t.Skipf("kubectl not found: %v", err)
 	}
-	if _, err := exec.LookPath("k3d"); err != nil {
-		t.Skipf("k3d not found: %v", err)
+	if _, err := exec.LookPath("kind"); err != nil {
+		t.Skipf("kind not found: %v", err)
 	}
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skipf("docker not found: %v", err)
 	}
 
-	env := &k3dEnv{
+	env := &kindEnv{
 		clusterName: clusterName,
+		kubeContext: kubeContext,
 		namespace:   namespace,
 		kubectl:     kubectl,
 	}
 	if err := env.verifyCluster(); err != nil {
-		t.Skipf("k3d environment not ready: %v", err)
+		t.Skipf("kind environment not ready: %v", err)
 	}
 	return env
 }
 
-func (e *k3dEnv) verifyCluster() error {
+func (e *kindEnv) verifyCluster() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "k3d", "cluster", "list")
+	cmd := exec.CommandContext(ctx, "kind", "get", "clusters")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("list clusters: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
-	if !strings.Contains(string(out), e.clusterName) {
-		return fmt.Errorf("cluster %q not found in k3d output", e.clusterName)
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.TrimSpace(line) == e.clusterName {
+			return nil
+		}
 	}
-	return nil
+	return fmt.Errorf("cluster %q not found in kind output", e.clusterName)
 }
 
-func (e *k3dEnv) kubectlCmd(ctx context.Context, args ...string) *exec.Cmd {
-	argv := append([]string{"--context", fmt.Sprintf("k3d-%s", e.clusterName)}, args...)
+func (e *kindEnv) kubectlCmd(ctx context.Context, args ...string) *exec.Cmd {
+	argv := append([]string{"--context", e.kubeContext}, args...)
 	return exec.CommandContext(ctx, e.kubectl, argv...)
 }
 
-func (e *k3dEnv) applyYAML(t *testing.T, yaml string) {
+func (e *kindEnv) applyYAML(t *testing.T, yaml string) {
 	t.Helper()
 	e.applyYAMLInNamespace(t, e.namespace, yaml)
 }
 
-func (e *k3dEnv) applyYAMLInNamespace(t *testing.T, namespace, yaml string) {
+func (e *kindEnv) applyYAMLInNamespace(t *testing.T, namespace, yaml string) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -97,7 +102,7 @@ func (e *k3dEnv) applyYAMLInNamespace(t *testing.T, namespace, yaml string) {
 	}
 }
 
-func (e *k3dEnv) repoRoot(t *testing.T) string {
+func (e *kindEnv) repoRoot(t *testing.T) string {
 	t.Helper()
 
 	wd, err := os.Getwd()
@@ -111,7 +116,7 @@ func (e *k3dEnv) repoRoot(t *testing.T) string {
 	return root
 }
 
-func (e *k3dEnv) repoPath(t *testing.T, parts ...string) string {
+func (e *kindEnv) repoPath(t *testing.T, parts ...string) string {
 	t.Helper()
 	return filepath.Join(append([]string{e.repoRoot(t)}, parts...)...)
 }
