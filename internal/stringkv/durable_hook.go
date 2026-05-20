@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	olricconfig "github.com/olric-data/olric/config"
@@ -69,6 +70,7 @@ type DurableHook struct {
 	writerID     string
 	now          func() time.Time
 	appendBudget time.Duration
+	appendMu     sync.Mutex
 }
 
 // Config tunes hook behavior. Zero values use sensible defaults.
@@ -177,12 +179,15 @@ func (h *DurableHook) LoadOnMiss(ctx context.Context, op olricconfig.DurableOper
 	if err != nil {
 		return nil, fmt.Errorf("durable load miss: %w", err)
 	}
-	if !found {
+	if !found || record.Tombstone {
 		return nil, olricstorage.ErrKeyNotFound
 	}
 	entry := op.Entry
 	if entry == nil {
 		return nil, errors.New("durable load miss entry template is nil")
+	}
+	if len(record.EncodedEntry) == 0 {
+		return nil, olricstorage.ErrKeyNotFound
 	}
 	entry.Decode(record.EncodedEntry)
 	return entry, nil
@@ -254,7 +259,9 @@ func (h *DurableHook) appendWithBudget(ctx context.Context, payload []byte) erro
 	deadline := h.now().Add(h.appendBudget)
 	backoff := time.Millisecond
 	for {
+		h.appendMu.Lock()
 		err := h.ring.Append(payload)
+		h.appendMu.Unlock()
 		if err == nil {
 			return nil
 		}

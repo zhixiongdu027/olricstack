@@ -20,9 +20,12 @@ import (
 	"time"
 
 	topologypb "github.com/zhixiongdu/olricstack/api/topology/v1"
+	"github.com/zhixiongdu/olricstack/internal/stringkv"
 	"github.com/zhixiongdu/olricstack/internal/topology"
 	"google.golang.org/grpc"
 )
+
+const hostRESPDMap = stringkv.DefaultDMap
 
 func TestHostOnlyMySQLDurableWritePath(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -32,7 +35,11 @@ func TestHostOnlyMySQLDurableWritePath(t *testing.T) {
 	watchdogAddr, _, cleanupWatchdog := startHostWatchdog(t, ctx)
 	defer cleanupWatchdog()
 
-	node := startHostOlricNode(t, ctx, watchdogAddr, "host-only-node")
+	node := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr: watchdogAddr,
+		nodeID:       "host-only-node",
+		mysqlDSN:     mysql.hostDSN(),
+	})
 	defer node.stop(t)
 
 	key := "host-user:" + strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -40,9 +47,9 @@ func TestHostOnlyMySQLDurableWritePath(t *testing.T) {
 		t.Fatalf("write host dmap entry: %v (%s)\nnode logs:\n%s", err, strings.TrimSpace(out), strings.TrimSpace(node.logs.String()))
 	}
 
-	record := waitForMySQLRecord(t, ctx, mysql.hostDSN(), "users", key)
-	if record.WriterID != node.nodeID {
-		t.Fatalf("expected mysql writer_id %q, got %q", node.nodeID, record.WriterID)
+	record := waitForMySQLRecord(t, ctx, mysql.hostDSN(), hostRESPDMap, key)
+	if !strings.HasPrefix(record.WriterID, node.nodeID+"-") {
+		t.Fatalf("expected mysql writer_id to be derived from %q, got %q", node.nodeID, record.WriterID)
 	}
 	if record.Tombstone {
 		t.Fatalf("expected mysql record for users/%s to be live, got tombstone", key)
@@ -60,14 +67,18 @@ func TestHostOnlyWatchdogDemotionBlocksAndPromotionRestoresWrites(t *testing.T) 
 	watchdogAddr, service, cleanupWatchdog := startHostWatchdog(t, ctx)
 	defer cleanupWatchdog()
 
-	node := startHostOlricNode(t, ctx, watchdogAddr, "host-only-failover-node")
+	node := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr: watchdogAddr,
+		nodeID:       "host-only-failover-node",
+		mysqlDSN:     mysql.hostDSN(),
+	})
 	defer node.stop(t)
 
 	firstKey := "host-before-demotion:" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	if out, err := node.put(ctx, "users", firstKey, "before-demotion"); err != nil {
 		t.Fatalf("write before demotion: %v (%s)\nnode logs:\n%s", err, strings.TrimSpace(out), strings.TrimSpace(node.logs.String()))
 	}
-	waitForMySQLRecord(t, ctx, mysql.hostDSN(), "users", firstKey)
+	waitForMySQLRecord(t, ctx, mysql.hostDSN(), hostRESPDMap, firstKey)
 
 	service.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, 1)
 	waitForText(t, ctx, node.logs, "topology subscription ended")
@@ -81,9 +92,9 @@ func TestHostOnlyWatchdogDemotionBlocksAndPromotionRestoresWrites(t *testing.T) 
 	if out, err := node.put(ctx, "users", recoveredKey, "after-promotion"); err != nil {
 		t.Fatalf("write after promotion: %v (%s)\nnode logs:\n%s", err, strings.TrimSpace(out), strings.TrimSpace(node.logs.String()))
 	}
-	record := waitForMySQLRecord(t, ctx, mysql.hostDSN(), "users", recoveredKey)
-	if record.WriterID != node.nodeID {
-		t.Fatalf("expected mysql writer_id %q after promotion, got %q", node.nodeID, record.WriterID)
+	record := waitForMySQLRecord(t, ctx, mysql.hostDSN(), hostRESPDMap, recoveredKey)
+	if !strings.HasPrefix(record.WriterID, node.nodeID+"-") {
+		t.Fatalf("expected mysql writer_id to be derived from %q after promotion, got %q", node.nodeID, record.WriterID)
 	}
 }
 
@@ -96,15 +107,23 @@ func TestHostOnlyRestartReadsThroughMySQL(t *testing.T) {
 	defer cleanupWatchdog()
 
 	key := "host-read-through:" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	first := startHostOlricNode(t, ctx, watchdogAddr, "host-only-read-through-writer")
+	first := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr: watchdogAddr,
+		nodeID:       "host-only-read-through-writer",
+		mysqlDSN:     mysql.hostDSN(),
+	})
 	if out, err := first.put(ctx, "users", key, "value-from-mysql"); err != nil {
 		first.stop(t)
 		t.Fatalf("write before restart: %v (%s)\nnode logs:\n%s", err, strings.TrimSpace(out), strings.TrimSpace(first.logs.String()))
 	}
-	waitForMySQLRecord(t, ctx, mysql.hostDSN(), "users", key)
+	waitForMySQLRecord(t, ctx, mysql.hostDSN(), hostRESPDMap, key)
 	first.stop(t)
 
-	second := startHostOlricNode(t, ctx, watchdogAddr, "host-only-read-through-reader")
+	second := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr: watchdogAddr,
+		nodeID:       "host-only-read-through-reader",
+		mysqlDSN:     mysql.hostDSN(),
+	})
 	defer second.stop(t)
 
 	got, out, err := second.get(ctx, "users", key)
@@ -161,6 +180,349 @@ func TestHostOnlyTwoNodeClusterCrossNodeReadWrite(t *testing.T) {
 	if got != "value-from-node-a" {
 		t.Fatalf("expected cross-node value %q, got %q", "value-from-node-a", got)
 	}
+}
+
+func TestHostOnlyTwoNodeCRUDAndReadThroughCorrectness(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	mysql := provisionHostMySQL(t, "127.0.0.1")
+	watchdogAddr, _, cleanupWatchdog := startHostWatchdog(t, ctx)
+	defer cleanupWatchdog()
+
+	memberlistPort := mustFreeTCPPort(t)
+	first := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   watchdogAddr,
+		nodeID:         "host-only-crud-a",
+		podIP:          "127.0.0.2",
+		bindAddr:       "127.0.0.2",
+		memberlistPort: memberlistPort,
+		mysqlDSN:       mysql.hostDSN(),
+	})
+	second := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   watchdogAddr,
+		nodeID:         "host-only-crud-b",
+		podIP:          "127.0.0.3",
+		bindAddr:       "127.0.0.3",
+		memberlistPort: memberlistPort,
+		mysqlDSN:       mysql.hostDSN(),
+	})
+
+	nodesStopped := false
+	defer func() {
+		if !nodesStopped {
+			first.stop(t)
+			second.stop(t)
+		}
+	}()
+
+	waitForText(t, ctx, first.logs, `node_id:"host-only-crud-b"`)
+	waitForText(t, ctx, second.logs, `node_id:"host-only-crud-a"`)
+	waitForText(t, ctx, first.logs, "joined topology peers")
+	waitForText(t, ctx, second.logs, "joined topology peers")
+
+	key := "host-crud:" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if out, err := first.put(ctx, "users", key, "create-v1"); err != nil {
+		t.Fatalf("create through first node: %v (%s)\n%s", err, strings.TrimSpace(out), hostNodeLogs(first, second))
+	}
+	createRecord := waitForMySQLValue(t, ctx, mysql.hostDSN(), hostRESPDMap, key, "create-v1")
+	if createRecord.Tombstone {
+		t.Fatalf("expected create record to be live, got tombstone")
+	}
+	waitForGetValue(t, ctx, second, "users", key, "create-v1", first, second)
+
+	if out, err := second.put(ctx, "users", key, "update-v2"); err != nil {
+		t.Fatalf("update through second node: %v (%s)\n%s", err, strings.TrimSpace(out), hostNodeLogs(first, second))
+	}
+	updateRecord := waitForMySQLValue(t, ctx, mysql.hostDSN(), hostRESPDMap, key, "update-v2")
+	if updateRecord.Tombstone {
+		t.Fatalf("expected update record to be live, got tombstone")
+	}
+	waitForGetValue(t, ctx, first, "users", key, "update-v2", first, second)
+	waitForGetValue(t, ctx, second, "users", key, "update-v2", first, second)
+
+	if out, err := first.delete(ctx, "users", key); err != nil {
+		t.Fatalf("delete through first node: %v (%s)\n%s", err, strings.TrimSpace(out), hostNodeLogs(first, second))
+	} else if strings.TrimSpace(out) != "1" {
+		t.Fatalf("expected delete to remove one key, got %q\n%s", strings.TrimSpace(out), hostNodeLogs(first, second))
+	}
+	waitForGetMiss(t, ctx, first, "users", key, first, second)
+	waitForGetMiss(t, ctx, second, "users", key, first, second)
+
+	first.stop(t)
+	second.stop(t)
+	nodesStopped = true
+
+	restarted := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr: watchdogAddr,
+		nodeID:       "host-only-crud-after-delete",
+		podIP:        "127.0.0.5",
+		bindAddr:     "127.0.0.5",
+		mysqlDSN:     mysql.hostDSN(),
+	})
+	defer restarted.stop(t)
+	waitForGetMiss(t, ctx, restarted, "users", key, restarted)
+}
+
+func TestHostOnlyTwoNodeExpirePropagatesAndExpiresAcrossNodes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	mysql := provisionHostMySQL(t, "127.0.0.1")
+	watchdogAddr, _, cleanupWatchdog := startHostWatchdog(t, ctx)
+	defer cleanupWatchdog()
+
+	memberlistPort := mustFreeTCPPort(t)
+	first := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   watchdogAddr,
+		nodeID:         "host-only-expire-a",
+		podIP:          "127.0.0.2",
+		bindAddr:       "127.0.0.2",
+		memberlistPort: memberlistPort,
+		mysqlDSN:       mysql.hostDSN(),
+	})
+	second := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   watchdogAddr,
+		nodeID:         "host-only-expire-b",
+		podIP:          "127.0.0.3",
+		bindAddr:       "127.0.0.3",
+		memberlistPort: memberlistPort,
+		mysqlDSN:       mysql.hostDSN(),
+	})
+	defer first.stop(t)
+	defer second.stop(t)
+
+	waitForText(t, ctx, first.logs, `node_id:"host-only-expire-b"`)
+	waitForText(t, ctx, second.logs, `node_id:"host-only-expire-a"`)
+	waitForText(t, ctx, first.logs, "joined topology peers")
+	waitForText(t, ctx, second.logs, "joined topology peers")
+
+	key := "host-expire:" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if out, err := first.put(ctx, "users", key, "expire-me"); err != nil {
+		t.Fatalf("put before expire: %v (%s)\n%s", err, strings.TrimSpace(out), hostNodeLogs(first, second))
+	}
+	waitForMySQLValue(t, ctx, mysql.hostDSN(), hostRESPDMap, key, "expire-me")
+	waitForGetValue(t, ctx, second, "users", key, "expire-me", first, second)
+
+	if out, err := second.expire(ctx, "users", key, 1*time.Second); err != nil {
+		t.Fatalf("expire through second node: %v (%s)\n%s", err, strings.TrimSpace(out), hostNodeLogs(first, second))
+	} else if strings.TrimSpace(out) != "1" {
+		t.Fatalf("expected expire to update one key, got %q\n%s", strings.TrimSpace(out), hostNodeLogs(first, second))
+	}
+
+	waitForMySQLValue(t, ctx, mysql.hostDSN(), hostRESPDMap, key, "expire-me")
+	time.Sleep(1500 * time.Millisecond)
+	waitForGetMiss(t, ctx, first, "users", key, first, second)
+	waitForGetMiss(t, ctx, second, "users", key, first, second)
+
+	first.stop(t)
+	second.stop(t)
+
+	restarted := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr: watchdogAddr,
+		nodeID:       "host-only-expire-reader",
+		podIP:        "127.0.0.5",
+		bindAddr:     "127.0.0.5",
+		mysqlDSN:     mysql.hostDSN(),
+	})
+	defer restarted.stop(t)
+	waitForGetMiss(t, ctx, restarted, "users", key, restarted)
+}
+
+func TestHostOnlyTwoNodeSetWithTTLExpiresAndDoesNotReviveOnRestart(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	mysql := provisionHostMySQL(t, "127.0.0.1")
+	watchdogAddr, _, cleanupWatchdog := startHostWatchdog(t, ctx)
+	defer cleanupWatchdog()
+
+	memberlistPort := mustFreeTCPPort(t)
+	first := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   watchdogAddr,
+		nodeID:         "host-only-ttl-a",
+		podIP:          "127.0.0.2",
+		bindAddr:       "127.0.0.2",
+		memberlistPort: memberlistPort,
+		mysqlDSN:       mysql.hostDSN(),
+	})
+	second := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr:   watchdogAddr,
+		nodeID:         "host-only-ttl-b",
+		podIP:          "127.0.0.3",
+		bindAddr:       "127.0.0.3",
+		memberlistPort: memberlistPort,
+		mysqlDSN:       mysql.hostDSN(),
+	})
+	defer bestEffortStopHostNode(first)
+	defer bestEffortStopHostNode(second)
+
+	waitForText(t, ctx, first.logs, `node_id:"host-only-ttl-b"`)
+	waitForText(t, ctx, second.logs, `node_id:"host-only-ttl-a"`)
+	waitForText(t, ctx, first.logs, "joined topology peers")
+	waitForText(t, ctx, second.logs, "joined topology peers")
+
+	key := "host-set-ttl:" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if out, err := first.putWithTTL(ctx, "users", key, "ttl-value", 2*time.Second); err != nil {
+		t.Fatalf("put with ttl through first node: %v (%s)\n%s", err, strings.TrimSpace(out), hostNodeLogs(first, second))
+	}
+	waitForMySQLValue(t, ctx, mysql.hostDSN(), hostRESPDMap, key, "ttl-value")
+	waitForGetValue(t, ctx, second, "users", key, "ttl-value", first, second)
+
+	time.Sleep(2500 * time.Millisecond)
+	waitForGetMiss(t, ctx, first, "users", key, first, second)
+	waitForGetMiss(t, ctx, second, "users", key, first, second)
+
+	first.stop(t)
+	second.stop(t)
+
+	restarted := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+		watchdogAddr: watchdogAddr,
+		nodeID:       "host-only-ttl-reader",
+		podIP:        "127.0.0.5",
+		bindAddr:     "127.0.0.5",
+		mysqlDSN:     mysql.hostDSN(),
+	})
+	defer bestEffortStopHostNode(restarted)
+	waitForGetMiss(t, ctx, restarted, "users", key, restarted)
+}
+
+func TestHostOnlyRollingRestartPreservesLiveDataAndDropsExpiredData(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	suite := newHostDataScenario(t, ctx, hostDataScenarioConfig{
+		name:      "host-rolling",
+		nodeCount: 2,
+	})
+	defer suite.close()
+
+	samples := []hostDataSample{
+		{Key: suite.key("live-a"), Value: "live-a"},
+		{Key: suite.key("live-b"), Value: "live-b"},
+		{Key: suite.key("ttl-a"), Value: "ttl-a", TTL: 1500 * time.Millisecond, Expires: true},
+		{Key: suite.key("ttl-b"), Value: "ttl-b", TTL: 1500 * time.Millisecond, Expires: true},
+	}
+	suite.seed(samples)
+	suite.expectMySQLValues(samples)
+	suite.expectClusterValues(samples)
+
+	time.Sleep(2 * time.Second)
+	suite.expectExpiredMissing(samples)
+
+	restarted := suite.restartAsSingleReader("reader")
+	suite.expectReaderAfterRestart(restarted, samples)
+}
+
+func TestHostDataLifecycleMatrix(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	cases := []struct {
+		name    string
+		samples []hostDataSample
+	}{
+		{
+			name: "live-restart",
+			samples: []hostDataSample{
+				{Value: "live-a"},
+				{Value: "live-b"},
+			},
+		},
+		{
+			name: "ttl-restart",
+			samples: []hostDataSample{
+				{Value: "ttl-a", TTL: 1200 * time.Millisecond, Expires: true},
+				{Value: "ttl-b", TTL: 1200 * time.Millisecond, Expires: true},
+			},
+		},
+		{
+			name: "mixed-restart",
+			samples: []hostDataSample{
+				{Value: "live-c"},
+				{Value: "ttl-c", TTL: 1200 * time.Millisecond, Expires: true},
+				{Value: "live-d"},
+				{Value: "ttl-d", TTL: 1200 * time.Millisecond, Expires: true},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			suite := newHostDataScenario(t, ctx, hostDataScenarioConfig{
+				name:      tc.name,
+				nodeCount: 2,
+			})
+			defer suite.close()
+
+			for i := range tc.samples {
+				tc.samples[i].Key = suite.key(tc.name + "-" + tc.samples[i].Value)
+			}
+
+			suite.seed(tc.samples)
+			suite.expectMySQLValues(tc.samples)
+			suite.expectClusterValues(tc.samples)
+
+			hasExpiry := false
+			for _, sample := range tc.samples {
+				if sample.Expires {
+					hasExpiry = true
+					break
+				}
+			}
+			if hasExpiry {
+				time.Sleep(2 * time.Second)
+				suite.expectExpiredMissing(tc.samples)
+			}
+
+			reader := suite.restartAsSingleReader(tc.name + "-reader")
+			suite.expectReaderAfterRestart(reader, tc.samples)
+		})
+	}
+}
+
+func TestHostDataLifecycleUnderBackgroundTraffic(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	suite := newHostDataScenario(t, ctx, hostDataScenarioConfig{
+		name:      "host-traffic-lifecycle",
+		nodeCount: 3,
+	})
+	defer suite.close()
+
+	stopTraffic, trafficDone, activeMu, active := suite.startBackgroundTraffic(3, "host-lifecycle")
+	time.Sleep(750 * time.Millisecond)
+
+	samples := []hostDataSample{
+		{Key: suite.key("traffic-live-a"), Value: "traffic-live-a"},
+		{Key: suite.key("traffic-live-b"), Value: "traffic-live-b"},
+		{Key: suite.key("traffic-ttl-a"), Value: "traffic-ttl-a", TTL: 1500 * time.Millisecond, Expires: true},
+		{Key: suite.key("traffic-ttl-b"), Value: "traffic-ttl-b", TTL: 1500 * time.Millisecond, Expires: true},
+	}
+	suite.seed(samples)
+	suite.expectMySQLValues(samples)
+	suite.expectClusterValues(samples)
+
+	time.Sleep(2 * time.Second)
+	suite.expectExpiredMissing(samples)
+
+	stopTraffic()
+	result := <-trafficDone
+	if result.successes == 0 {
+		t.Fatalf("background traffic made no progress before lifecycle restart; failures=%d\n%s", result.failures, hostNodeLogs(suite.nodes...))
+	}
+	if result.failures > result.successes {
+		t.Fatalf("background traffic was mostly failing before planned shutdown: successes=%d failures=%d\n%s", result.successes, result.failures, hostNodeLogs(suite.nodes...))
+	}
+
+	activeMu.Lock()
+	*active = nil
+	activeMu.Unlock()
+
+	reader := suite.restartAsSingleReader("host-traffic-lifecycle-reader")
+	suite.expectReaderAfterRestart(reader, samples)
 }
 
 func TestHostOnlyTwoNodeClusterJoinsFromWatchdogTopologyOnly(t *testing.T) {
@@ -480,6 +842,10 @@ func TestHostOnlyFiveNodeJoinCrashReplacementJitterAndStorm(t *testing.T) {
 	victim.kill(t)
 	killedNodes[victim] = true
 	waitForTopologyWithoutMemberAfter(t, ctx, survivors[0].logs, pruneOffset, victim.nodeID)
+	postReplacementOffsets := make(map[*hostOlricNode]int, len(survivors))
+	for _, node := range survivors {
+		postReplacementOffsets[node] = node.logs.Len()
+	}
 
 	replacement := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
 		watchdogAddr:   proxy.addr(),
@@ -491,6 +857,11 @@ func TestHostOnlyFiveNodeJoinCrashReplacementJitterAndStorm(t *testing.T) {
 	})
 	nodes = append(nodes, replacement)
 	active := append(survivors, replacement)
+	for _, node := range survivors {
+		waitForTextAfter(t, ctx, node.logs, postReplacementOffsets[node], `node_id:"`+replacement.nodeID+`"`)
+		waitForTextAfter(t, ctx, node.logs, postReplacementOffsets[node], "joined topology peers")
+		waitForTopologyWithoutMemberAfter(t, ctx, node.logs, postReplacementOffsets[node], victim.nodeID)
+	}
 	waitForClusterAwareness(t, ctx, active)
 
 	runHostTrafficStorm(t, ctx, active, 10, 10, "five-after-replacement")
@@ -593,9 +964,18 @@ func TestHostOnlyFiveNodeConcurrentCrashJitterReplacementAndTraffic(t *testing.T
 	})
 	nodes = append(nodes, replacement)
 	recovered := append(survivors, replacement)
+	postReplacementOffsets := make(map[*hostOlricNode]int, len(survivors))
+	for _, node := range survivors {
+		postReplacementOffsets[node] = node.logs.Len()
+	}
 	activeMu.Lock()
 	active = append([]*hostOlricNode(nil), recovered...)
 	activeMu.Unlock()
+	for _, node := range survivors {
+		waitForTextAfter(t, ctx, node.logs, postReplacementOffsets[node], `node_id:"`+replacement.nodeID+`"`)
+		waitForTextAfter(t, ctx, node.logs, postReplacementOffsets[node], "joined topology peers")
+		waitForTopologyWithoutMemberAfter(t, ctx, node.logs, postReplacementOffsets[node], victim.nodeID)
+	}
 	waitForClusterAwareness(t, ctx, recovered)
 
 	runHostTrafficStorm(t, ctx, recovered, 10, 10, "concurrent-after-recovery")
@@ -607,6 +987,7 @@ type hostOlricNode struct {
 	clientBinary string
 	bindAddr     string
 	olricPort    int
+	respPort     int
 	cmd          *exec.Cmd
 	sidecarCmd   *exec.Cmd
 	errCh        chan error
@@ -675,6 +1056,7 @@ type hostNodeConfig struct {
 	podIP           string
 	bindAddr        string
 	memberlistPort  int
+	respPort        int
 	memberlistPeers string
 	binaries        hostNodeBinaries
 	extraEnv        []string
@@ -682,6 +1064,7 @@ type hostNodeConfig struct {
 	writeQuorum     int
 	readQuorum      int
 	memberQuorum    int
+	mysqlDSN        string
 }
 
 func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg hostNodeConfig) *hostOlricNode {
@@ -703,6 +1086,10 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 	}
 	olricPort := mustFreeTCPPort(t)
 	memberlistPort := mustFreeTCPPort(t)
+	respPort := cfg.respPort
+	if respPort <= 0 {
+		respPort = 3321
+	}
 	if cfg.memberlistPort > 0 {
 		memberlistPort = cfg.memberlistPort
 	}
@@ -734,7 +1121,7 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 	sidecarCmd.Stdout = logs
 	sidecarCmd.Stderr = logs
 	sidecarCmd.Env = append(os.Environ(),
-		"MYSQL_DSN="+os.Getenv("E2E_MYSQL_DSN"),
+		"MYSQL_DSN="+cfg.mysqlDSNOrFallback(),
 		"RING_PATH="+ringPath,
 		"CONTROL_SOCKET="+socketPath,
 		"RING_CAPACITY_BYTES=8388608",
@@ -764,6 +1151,8 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 		"OLRIC_ADVERTISE_ADDR="+cfg.bindAddr,
 		"OLRIC_ADVERTISE_PORT="+strconv.Itoa(memberlistPort),
 		"OLRIC_PEERS="+cfg.memberlistPeers,
+		"RESP_BIND_ADDR="+cfg.bindAddr,
+		"RESP_BIND_PORT="+strconv.Itoa(respPort),
 		"OLRIC_REPLICA_COUNT="+strconv.Itoa(replicaCount),
 		"OLRIC_WRITE_QUORUM="+strconv.Itoa(writeQuorum),
 		"OLRIC_READ_QUORUM="+strconv.Itoa(readQuorum),
@@ -783,6 +1172,7 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 		clientBinary: clientBinary,
 		bindAddr:     cfg.bindAddr,
 		olricPort:    olricPort,
+		respPort:     respPort,
 		cmd:          cmd,
 		sidecarCmd:   sidecarCmd,
 		errCh:        make(chan error, 1),
@@ -802,14 +1192,30 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 	return node
 }
 
+func (cfg hostNodeConfig) mysqlDSNOrFallback() string {
+	if cfg.mysqlDSN != "" {
+		return cfg.mysqlDSN
+	}
+	return envOrDefault("E2E_MYSQL_DSN", "root:password@tcp(127.0.0.1:13306)/mysql?parseTime=true")
+}
+
 func (n *hostOlricNode) put(ctx context.Context, dmap, key, value string) (string, error) {
+	return n.putWithTTL(ctx, dmap, key, value, 0)
+}
+
+func (n *hostOlricNode) putWithTTL(ctx context.Context, dmap, key, value string, ttl time.Duration) (string, error) {
 	cmd := exec.CommandContext(ctx,
 		n.clientBinary,
-		"-addr", fmt.Sprintf("%s:%d", n.bindAddr, n.olricPort),
+		"-addr", fmt.Sprintf("%s:%d", n.bindAddr, n.respPort),
 		"-op", "put",
 		"-dmap", dmap,
 		"-key", key,
 		"-value", value,
+	)
+	if ttl > 0 {
+		cmd.Args = append(cmd.Args, "-ttl", ttl.String())
+	}
+	cmd.Args = append(cmd.Args,
 		"-timeout", "10s",
 	)
 	cmd.Dir = n.repoRoot
@@ -820,7 +1226,7 @@ func (n *hostOlricNode) put(ctx context.Context, dmap, key, value string) (strin
 func (n *hostOlricNode) get(ctx context.Context, dmap, key string) (string, string, error) {
 	cmd := exec.CommandContext(ctx,
 		n.clientBinary,
-		"-addr", fmt.Sprintf("%s:%d", n.bindAddr, n.olricPort),
+		"-addr", fmt.Sprintf("%s:%d", n.bindAddr, n.respPort),
 		"-op", "get",
 		"-dmap", dmap,
 		"-key", key,
@@ -829,6 +1235,35 @@ func (n *hostOlricNode) get(ctx context.Context, dmap, key string) (string, stri
 	cmd.Dir = n.repoRoot
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), string(out), err
+}
+
+func (n *hostOlricNode) delete(ctx context.Context, dmap, key string) (string, error) {
+	cmd := exec.CommandContext(ctx,
+		n.clientBinary,
+		"-addr", fmt.Sprintf("%s:%d", n.bindAddr, n.respPort),
+		"-op", "delete",
+		"-dmap", dmap,
+		"-key", key,
+		"-timeout", "10s",
+	)
+	cmd.Dir = n.repoRoot
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+func (n *hostOlricNode) expire(ctx context.Context, dmap, key string, ttl time.Duration) (string, error) {
+	cmd := exec.CommandContext(ctx,
+		n.clientBinary,
+		"-addr", fmt.Sprintf("%s:%d", n.bindAddr, n.respPort),
+		"-op", "expire",
+		"-dmap", dmap,
+		"-key", key,
+		"-ttl", ttl.String(),
+		"-timeout", "10s",
+	)
+	cmd.Dir = n.repoRoot
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 func (n *hostOlricNode) stop(t *testing.T) {
@@ -857,6 +1292,35 @@ func (n *hostOlricNode) stop(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		_ = n.sidecarCmd.Process.Kill()
 		t.Fatalf("host olric-sidecar did not exit after SIGTERM\nlogs:\n%s", strings.TrimSpace(n.logs.String()))
+	}
+}
+
+func bestEffortStopHostNode(n *hostOlricNode) {
+	if n == nil {
+		return
+	}
+	if n.cmd != nil && n.cmd.Process != nil {
+		_ = n.cmd.Process.Signal(syscall.SIGTERM)
+	}
+	if n.sidecarCmd != nil && n.sidecarCmd.Process != nil {
+		_ = n.sidecarCmd.Process.Signal(syscall.SIGTERM)
+	}
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-n.errCh:
+	case <-timer.C:
+		if n.cmd != nil && n.cmd.Process != nil {
+			_ = n.cmd.Process.Kill()
+		}
+	}
+	timer.Reset(3 * time.Second)
+	select {
+	case <-n.sidecarErrCh:
+	case <-timer.C:
+		if n.sidecarCmd != nil && n.sidecarCmd.Process != nil {
+			_ = n.sidecarCmd.Process.Kill()
+		}
 	}
 }
 
@@ -927,6 +1391,194 @@ func waitForGetValue(t *testing.T, ctx context.Context, reader *hostOlricNode, d
 		dmap, key, want, reader.nodeID, lastGot, lastErr, strings.TrimSpace(lastOut), hostNodeLogs(logNodes...))
 }
 
+func waitForGetMiss(t *testing.T, ctx context.Context, reader *hostOlricNode, dmap, key string, logNodes ...*hostOlricNode) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	var lastGot, lastOut string
+	var lastErr error
+	for time.Now().Before(deadline) {
+		got, out, err := reader.get(ctx, dmap, key)
+		lastGot, lastOut, lastErr = got, out, err
+		if err != nil && strings.Contains(out, "redis: nil") {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context ended waiting for %s/%s miss through %s: %v\nlast got=%q err=%v out=%s\n%s",
+				dmap, key, reader.nodeID, ctx.Err(), lastGot, lastErr, strings.TrimSpace(lastOut), hostNodeLogs(logNodes...))
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	t.Fatalf("timed out waiting for %s/%s miss through %s\nlast got=%q err=%v out=%s\n%s",
+		dmap, key, reader.nodeID, lastGot, lastErr, strings.TrimSpace(lastOut), hostNodeLogs(logNodes...))
+}
+
+type hostDataSample struct {
+	Key     string
+	Value   string
+	TTL     time.Duration
+	Expires bool
+}
+
+type hostDataScenarioConfig struct {
+	name      string
+	nodeCount int
+}
+
+type hostDataScenario struct {
+	t          *testing.T
+	ctx        context.Context
+	mysql      *hostMySQL
+	watchdog   string
+	nodes      []*hostOlricNode
+	memberPort int
+}
+
+func newHostDataScenario(t *testing.T, ctx context.Context, cfg hostDataScenarioConfig) *hostDataScenario {
+	t.Helper()
+
+	if cfg.nodeCount < 1 {
+		t.Fatalf("host scenario %q needs at least one node", cfg.name)
+	}
+
+	mysql := provisionHostMySQL(t, "127.0.0.1")
+	watchdogAddr, _, cleanupWatchdog := startHostWatchdog(t, ctx)
+	t.Cleanup(cleanupWatchdog)
+
+	memberlistPort := mustFreeTCPPort(t)
+	nodes := make([]*hostOlricNode, 0, cfg.nodeCount)
+	for i := 0; i < cfg.nodeCount; i++ {
+		node := startHostOlricNodeWithConfig(t, ctx, hostNodeConfig{
+			watchdogAddr:   watchdogAddr,
+			nodeID:         fmt.Sprintf("%s-%c", cfg.name, 'a'+rune(i)),
+			podIP:          fmt.Sprintf("127.0.0.%d", i+2),
+			bindAddr:       fmt.Sprintf("127.0.0.%d", i+2),
+			memberlistPort: memberlistPort,
+			mysqlDSN:       mysql.hostDSN(),
+		})
+		nodes = append(nodes, node)
+	}
+
+	suite := &hostDataScenario{
+		t:          t,
+		ctx:        ctx,
+		mysql:      mysql,
+		watchdog:   watchdogAddr,
+		nodes:      nodes,
+		memberPort: memberlistPort,
+	}
+	suite.waitForTopology()
+	return suite
+}
+
+func (s *hostDataScenario) close() {
+	for i := len(s.nodes) - 1; i >= 0; i-- {
+		bestEffortStopHostNode(s.nodes[i])
+	}
+}
+
+func (s *hostDataScenario) waitForTopology() {
+	s.t.Helper()
+	for i, node := range s.nodes {
+		for j, other := range s.nodes {
+			if i == j {
+				continue
+			}
+			waitForText(s.t, s.ctx, node.logs, `node_id:"`+other.nodeID+`"`)
+		}
+		if len(s.nodes) > 1 {
+			waitForText(s.t, s.ctx, node.logs, "joined topology peers")
+		}
+	}
+}
+
+func (s *hostDataScenario) key(prefix string) string {
+	return prefix + ":" + strconv.FormatInt(time.Now().UnixNano(), 10)
+}
+
+func (s *hostDataScenario) seed(samples []hostDataSample) {
+	s.t.Helper()
+	if len(s.nodes) == 0 {
+		s.t.Fatal("host scenario has no nodes")
+	}
+	for i, sample := range samples {
+		node := s.nodes[i%len(s.nodes)]
+		if sample.TTL > 0 {
+			if out, err := node.putWithTTL(s.ctx, "users", sample.Key, sample.Value, sample.TTL); err != nil {
+				s.t.Fatalf("seed ttl sample %s via %s: %v (%s)\n%s", sample.Key, node.nodeID, err, strings.TrimSpace(out), hostNodeLogs(s.nodes...))
+			}
+			continue
+		}
+		if out, err := node.put(s.ctx, "users", sample.Key, sample.Value); err != nil {
+			s.t.Fatalf("seed sample %s via %s: %v (%s)\n%s", sample.Key, node.nodeID, err, strings.TrimSpace(out), hostNodeLogs(s.nodes...))
+		}
+	}
+}
+
+func (s *hostDataScenario) expectMySQLValues(samples []hostDataSample) {
+	s.t.Helper()
+	for _, sample := range samples {
+		waitForMySQLValue(s.t, s.ctx, s.mysql.hostDSN(), hostRESPDMap, sample.Key, sample.Value)
+	}
+}
+
+func (s *hostDataScenario) expectClusterValues(samples []hostDataSample) {
+	s.t.Helper()
+	for _, sample := range samples {
+		for _, node := range s.nodes {
+			waitForGetValue(s.t, s.ctx, node, "users", sample.Key, sample.Value, s.nodes...)
+		}
+	}
+}
+
+func (s *hostDataScenario) expectExpiredMissing(samples []hostDataSample) {
+	s.t.Helper()
+	for _, sample := range samples {
+		if !sample.Expires {
+			continue
+		}
+		for _, node := range s.nodes {
+			waitForGetMiss(s.t, s.ctx, node, "users", sample.Key, s.nodes...)
+		}
+	}
+}
+
+func (s *hostDataScenario) restartAsSingleReader(nodeID string) *hostOlricNode {
+	s.t.Helper()
+	for _, node := range s.nodes {
+		bestEffortStopHostNode(node)
+	}
+	return startHostOlricNodeWithConfig(s.t, s.ctx, hostNodeConfig{
+		watchdogAddr: s.watchdog,
+		nodeID:       nodeID,
+		podIP:        "127.0.0.5",
+		bindAddr:     "127.0.0.5",
+		mysqlDSN:     s.mysql.hostDSN(),
+	})
+}
+
+func (s *hostDataScenario) expectReaderAfterRestart(reader *hostOlricNode, samples []hostDataSample) {
+	s.t.Helper()
+	defer bestEffortStopHostNode(reader)
+	for _, sample := range samples {
+		if sample.Expires {
+			waitForGetMiss(s.t, s.ctx, reader, "users", sample.Key, reader)
+			continue
+		}
+		waitForGetValue(s.t, s.ctx, reader, "users", sample.Key, sample.Value)
+	}
+}
+
+func (s *hostDataScenario) startBackgroundTraffic(writers int, prefix string) (context.CancelFunc, <-chan backgroundTrafficResult, *sync.RWMutex, *[]*hostOlricNode) {
+	s.t.Helper()
+	active := append([]*hostOlricNode(nil), s.nodes...)
+	var activeMu sync.RWMutex
+	trafficCtx, cancel := context.WithCancel(s.ctx)
+	done := startBackgroundHostTraffic(s.t, trafficCtx, &activeMu, &active, writers, prefix)
+	return cancel, done, &activeMu, &active
+}
+
 func waitForClusterAwareness(t *testing.T, ctx context.Context, nodes []*hostOlricNode) {
 	t.Helper()
 
@@ -957,10 +1609,21 @@ func runHostTrafficStorm(t *testing.T, ctx context.Context, nodes []*hostOlricNo
 		go func() {
 			defer wg.Done()
 			for i := 0; i < writesPerWorker; i++ {
-				target := nodes[(worker+i)%len(nodes)]
-				reader := nodes[(worker+i+2)%len(nodes)]
+				live := make([]*hostOlricNode, 0, len(nodes))
+				for _, node := range nodes {
+					if node != nil && node.cmd != nil && node.cmd.Process != nil && node.cmd.ProcessState == nil {
+						live = append(live, node)
+					}
+				}
+				if len(live) < 2 {
+					failures.Add(1)
+					time.Sleep(25 * time.Millisecond)
+					continue
+				}
+				target := live[(worker+i)%len(live)]
+				reader := live[(worker+i+1)%len(live)]
 				if reader == target {
-					reader = nodes[(worker+i+1)%len(nodes)]
+					reader = live[(worker+i+2)%len(live)]
 				}
 				key := fmt.Sprintf("%s:%d:%d:%d", prefix, time.Now().UnixNano(), worker, i)
 				value := "value-" + key
@@ -969,8 +1632,7 @@ func runHostTrafficStorm(t *testing.T, ctx context.Context, nodes []*hostOlricNo
 					failures.Add(1)
 					continue
 				}
-				got, out, err := reader.get(ctx, "users", key)
-				if err != nil || got != value {
+				if got, out, err := waitForNodeGetValue(ctx, reader, "users", key, value); err != nil {
 					t.Logf("storm get failed prefix=%s reader=%s key=%s got=%q err=%v out=%s", prefix, reader.nodeID, key, got, err, strings.TrimSpace(out))
 					failures.Add(1)
 				}
@@ -1028,8 +1690,8 @@ func startBackgroundHostTraffic(t *testing.T, ctx context.Context, activeMu *syn
 					time.Sleep(25 * time.Millisecond)
 					continue
 				}
-				got, _, err := reader.get(ctx, "users", key)
-				if err != nil || got != value {
+				if got, _, err := waitForNodeGetValue(ctx, reader, "users", key, value); err != nil {
+					_ = got
 					failures.Add(1)
 					time.Sleep(25 * time.Millisecond)
 					continue
@@ -1046,6 +1708,22 @@ func startBackgroundHostTraffic(t *testing.T, ctx context.Context, activeMu *syn
 		}
 	}()
 	return done
+}
+
+func waitForNodeGetValue(ctx context.Context, reader *hostOlricNode, dmap, key, want string) (got string, out string, err error) {
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		got, out, err = reader.get(ctx, dmap, key)
+		if err == nil && got == want {
+			return got, out, nil
+		}
+		select {
+		case <-ctx.Done():
+			return got, out, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	return got, out, fmt.Errorf("expected %q", want)
 }
 
 func hostNodeLogs(nodes ...*hostOlricNode) string {

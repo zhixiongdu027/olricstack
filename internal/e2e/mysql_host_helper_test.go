@@ -12,6 +12,7 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/zhixiongdu/olricstack/internal/olricstore"
 )
 
 type hostMySQL struct {
@@ -75,9 +76,10 @@ func provisionHostMySQL(t *testing.T, clusterHost string) *hostMySQL {
 }
 
 type mysqlRecord struct {
-	WriterID  string
-	OwnerSeq  int64
-	Tombstone bool
+	WriterID     string
+	OwnerSeq     int64
+	Tombstone    bool
+	EncodedEntry []byte
 }
 
 func waitForMySQLRecord(t *testing.T, ctx context.Context, dsn, dmap, key string) mysqlRecord {
@@ -104,10 +106,10 @@ func waitForMySQLRecord(t *testing.T, ctx context.Context, dsn, dmap, key string
 		queryCtx, queryCancel := context.WithTimeout(ctx, 3*time.Second)
 		var record mysqlRecord
 		err = db.QueryRowContext(queryCtx,
-			"SELECT writer_id, owner_seq, tombstone FROM olric_cache_records WHERE dmap = ? AND `key` = ?",
+			"SELECT writer_id, owner_seq, tombstone, encoded_entry FROM olric_cache_records WHERE dmap = ? AND `key` = ?",
 			dmap,
 			key,
-		).Scan(&record.WriterID, &record.OwnerSeq, &record.Tombstone)
+		).Scan(&record.WriterID, &record.OwnerSeq, &record.Tombstone, &record.EncodedEntry)
 		queryCancel()
 		if err == nil {
 			return record
@@ -117,6 +119,93 @@ func waitForMySQLRecord(t *testing.T, ctx context.Context, dsn, dmap, key string
 	}
 
 	t.Fatalf("mysql durable record %s/%s not observed via %q: %v", dmap, key, dsn, lastErr)
+	return mysqlRecord{}
+}
+
+func waitForMySQLValue(t *testing.T, ctx context.Context, dsn, dmap, key, want string) mysqlRecord {
+	t.Helper()
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open mysql connection: %v", err)
+	}
+	defer db.Close()
+
+	deadline := time.Now().Add(45 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		pingCtx, pingCancel := context.WithTimeout(ctx, 3*time.Second)
+		err := db.PingContext(pingCtx)
+		pingCancel()
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Second)
+			continue
+		}
+
+		queryCtx, queryCancel := context.WithTimeout(ctx, 3*time.Second)
+		var record mysqlRecord
+		err = db.QueryRowContext(queryCtx,
+			"SELECT writer_id, owner_seq, tombstone, encoded_entry FROM olric_cache_records WHERE dmap = ? AND `key` = ?",
+			dmap,
+			key,
+		).Scan(&record.WriterID, &record.OwnerSeq, &record.Tombstone, &record.EncodedEntry)
+		queryCancel()
+		if err == nil {
+			entry := &olricstore.Entry{}
+			entry.Decode(record.EncodedEntry)
+			if string(entry.Value()) == want {
+				return record
+			}
+			lastErr = fmt.Errorf("unexpected mysql encoded entry value %q", string(entry.Value()))
+		} else {
+			lastErr = err
+		}
+		time.Sleep(time.Second)
+	}
+
+	t.Fatalf("mysql durable record %s/%s with value %q not observed via %q: %v", dmap, key, want, dsn, lastErr)
+	return mysqlRecord{}
+}
+
+func waitForMySQLRecordAfterSeq(t *testing.T, ctx context.Context, dsn, dmap, key string, minOwnerSeq int64) mysqlRecord {
+	t.Helper()
+
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open mysql connection: %v", err)
+	}
+	defer db.Close()
+
+	deadline := time.Now().Add(45 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		pingCtx, pingCancel := context.WithTimeout(ctx, 3*time.Second)
+		err := db.PingContext(pingCtx)
+		pingCancel()
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Second)
+			continue
+		}
+
+		queryCtx, queryCancel := context.WithTimeout(ctx, 3*time.Second)
+		var record mysqlRecord
+		err = db.QueryRowContext(queryCtx,
+			"SELECT writer_id, owner_seq, tombstone, encoded_entry FROM olric_cache_records WHERE dmap = ? AND `key` = ? AND owner_seq > ? ORDER BY owner_seq DESC LIMIT 1",
+			dmap,
+			key,
+			minOwnerSeq,
+		).Scan(&record.WriterID, &record.OwnerSeq, &record.Tombstone, &record.EncodedEntry)
+		queryCancel()
+		if err == nil {
+			return record
+		}
+		lastErr = err
+		time.Sleep(time.Second)
+	}
+
+	t.Fatalf("mysql durable record %s/%s with owner_seq > %d not observed via %q: %v", dmap, key, minOwnerSeq, dsn, lastErr)
 	return mysqlRecord{}
 }
 

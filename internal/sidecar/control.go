@@ -333,7 +333,7 @@ func (s *Server) LoadFromMySQL(ctx context.Context, req *LoadRequest) (*LoadResp
 	ref := store.EntryRef{DMap: req.DMap, Key: req.Key, HKey: req.HKey}
 	if e, ok := s.pending.get(ref); ok {
 		rec := recordFromEntry(e)
-		if rec.Tombstone {
+		if rec.Tombstone || recordExpired(rec) {
 			return &LoadResponse{Found: false}, nil
 		}
 		return &LoadResponse{Found: true, Record: rec}, nil
@@ -344,6 +344,9 @@ func (s *Server) LoadFromMySQL(ctx context.Context, req *LoadRequest) (*LoadResp
 			return &LoadResponse{Found: false}, nil
 		}
 		return nil, err
+	}
+	if rec.Tombstone || recordExpired(rec) {
+		return &LoadResponse{Found: false}, nil
 	}
 	return &LoadResponse{Found: true, Record: rec}, nil
 }

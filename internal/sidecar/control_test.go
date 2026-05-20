@@ -12,14 +12,16 @@ import (
 )
 
 type stubBackend struct {
-	mu           sync.Mutex
-	upserts      []store.EntryRecord
-	upsertErr    error
-	purgeCount   int
-	loadRec      store.EntryRecord
-	loadFound    bool
-	loadErr      error
-	upsertCalled chan struct{}
+	mu            sync.Mutex
+	upserts       []store.EntryRecord
+	upsertErr     error
+	purgeCount    int
+	loadRec       store.EntryRecord
+	loadFound     bool
+	loadErr       error
+	upsertCalled  chan struct{}
+	blockUpsert   chan struct{}
+	upsertEntered chan struct{}
 }
 
 func newStubBackend() *stubBackend {
@@ -27,6 +29,15 @@ func newStubBackend() *stubBackend {
 }
 
 func (s *stubBackend) UpsertEntries(_ context.Context, records []store.EntryRecord) error {
+	if s.upsertEntered != nil {
+		select {
+		case s.upsertEntered <- struct{}{}:
+		default:
+		}
+	}
+	if s.blockUpsert != nil {
+		<-s.blockUpsert
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.upsertErr != nil {
@@ -228,6 +239,42 @@ func TestLoadTombstoneInPendingReportsNotFound(t *testing.T) {
 	}
 }
 
+func TestLoadExpiredRecordReportsNotFound(t *testing.T) {
+	backend := newStubBackend()
+	backend.loadFound = true
+	backend.loadRec = store.EntryRecord{
+		DMap:         "users",
+		Key:          "alice",
+		HKey:         7,
+		TTL:          time.Now().Add(-time.Second).UnixMilli(),
+		EncodedEntry: []byte("expired"),
+	}
+
+	srv, _, cleanup := newServerOnRing(t, backend)
+	defer cleanup()
+
+	resp, err := srv.LoadFromMySQL(context.Background(), &LoadRequest{DMap: "users", Key: "alice", HKey: 7})
+	if err != nil {
+		t.Fatalf("load expired record: %v", err)
+	}
+	if resp.Found {
+		t.Fatalf("expired record should report not found")
+	}
+}
+
+func TestRecordExpiredAt(t *testing.T) {
+	now := time.UnixMilli(1000)
+	if recordExpiredAt(store.EntryRecord{TTL: 0}, now) {
+		t.Fatal("zero ttl must not expire")
+	}
+	if recordExpiredAt(store.EntryRecord{TTL: 1001}, now) {
+		t.Fatal("future ttl must not expire")
+	}
+	if !recordExpiredAt(store.EntryRecord{TTL: 999}, now) {
+		t.Fatal("past ttl must expire")
+	}
+}
+
 func TestDrainPartitionFlushesSubsetSynchronously(t *testing.T) {
 	backend := newStubBackend()
 	srv, prod, cleanup := newServerOnRing(t, backend)
@@ -283,5 +330,51 @@ func TestPurgeBelowGenerationCleansPending(t *testing.T) {
 	}
 	if resp.Purged < 5 {
 		t.Fatalf("expected backend purge>=5, got %d", resp.Purged)
+	}
+}
+
+func TestFlushDoesNotDropNewerPendingEntryForSameRef(t *testing.T) {
+	backend := newStubBackend()
+	backend.blockUpsert = make(chan struct{})
+	backend.upsertEntered = make(chan struct{}, 1)
+	srv, prod, cleanup := newServerOnRing(t, backend)
+	defer cleanup()
+
+	appendEntry(t, prod, oplog.Entry{
+		Op: oplog.OpSet, DMap: "users", Key: "alice", HKey: 42,
+		Generation: 1, Epoch: 1, OwnerSeq: 1, WriterID: "node-A",
+		EncodedEntry: []byte("old"),
+	})
+	if _, err := srv.drainRing(); err != nil {
+		t.Fatalf("drain old entry: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- srv.flushOnce(context.Background()) }()
+	select {
+	case <-backend.upsertEntered:
+	case <-time.After(time.Second):
+		t.Fatal("expected flush to enter backend")
+	}
+
+	appendEntry(t, prod, oplog.Entry{
+		Op: oplog.OpSet, DMap: "users", Key: "alice", HKey: 42,
+		Generation: 1, Epoch: 1, OwnerSeq: 2, WriterID: "node-A",
+		EncodedEntry: []byte("new"),
+	})
+	if _, err := srv.drainRing(); err != nil {
+		t.Fatalf("drain new entry while old flush is blocked: %v", err)
+	}
+	close(backend.blockUpsert)
+	if err := <-done; err != nil {
+		t.Fatalf("flush old snapshot: %v", err)
+	}
+
+	resp, err := srv.LoadFromMySQL(context.Background(), &LoadRequest{DMap: "users", Key: "alice", HKey: 42})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !resp.Found || string(resp.Record.EncodedEntry) != "new" || resp.Record.OwnerSeq != 2 {
+		t.Fatalf("expected newer pending entry to survive old snapshot drop, got %#v", resp)
 	}
 }

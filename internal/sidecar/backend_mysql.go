@@ -50,6 +50,9 @@ func (b *MySQLBackend) LoadFromMySQL(ctx context.Context, ref store.EntryRef) (s
 	if rec.Tombstone {
 		return store.EntryRecord{}, store.ErrNotFound
 	}
+	if recordExpired(rec) {
+		return store.EntryRecord{}, store.ErrNotFound
+	}
 	return rec, nil
 }
 

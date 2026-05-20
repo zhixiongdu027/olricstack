@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -164,5 +167,106 @@ func TestReopenPreservesCursors(t *testing.T) {
 	got, ok, err = cons2.Pop()
 	if err != nil || !ok || string(got) != "second" {
 		t.Fatalf("second pop after reopen: got=%q ok=%v err=%v", got, ok, err)
+	}
+}
+
+func TestSPSCConcurrentAppendAndPop(t *testing.T) {
+	path := newRing(t, minCapacity)
+	prod, err := OpenProducer(path)
+	if err != nil {
+		t.Fatalf("open producer: %v", err)
+	}
+	defer prod.Close()
+	cons, err := OpenConsumer(path)
+	if err != nil {
+		t.Fatalf("open consumer: %v", err)
+	}
+	defer cons.Close()
+
+	const total = 2000
+	payloads := make([][]byte, total)
+	for i := 0; i < total; i++ {
+		payloads[i] = []byte(fmt.Sprintf("entry-%04d", i))
+	}
+
+	var failed atomic.Bool
+	errCh := make(chan error, 1)
+	var received atomic.Int64
+	var produced atomic.Int64
+	var wg sync.WaitGroup
+	recordErr := func(err error) {
+		if err == nil {
+			return
+		}
+		failed.Store(true)
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i, payload := range payloads {
+			if failed.Load() {
+				return
+			}
+			for {
+				if failed.Load() {
+					return
+				}
+				if err := prod.Append(payload); err != nil {
+					if errors.Is(err, ErrRingFull) {
+						runtime.Gosched()
+						continue
+					}
+					recordErr(fmt.Errorf("append %d: %w", i, err))
+					return
+				}
+				produced.Add(1)
+				break
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			if failed.Load() {
+				return
+			}
+			if int(received.Load()) >= total {
+				return
+			}
+			got, ok, err := cons.Pop()
+			if err != nil {
+				recordErr(fmt.Errorf("pop: %w", err))
+				return
+			}
+			if !ok {
+				runtime.Gosched()
+				continue
+			}
+			idx := int(received.Add(1)) - 1
+			want := fmt.Sprintf("entry-%04d", idx)
+			if string(got) != want {
+				recordErr(fmt.Errorf("entry %d: got %q want %q", idx, got, want))
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
+	}
+
+	if n := int(produced.Load()); n != total {
+		t.Fatalf("expected %d appends, got %d", total, n)
+	}
+	if n := int(received.Load()); n != total {
+		t.Fatalf("expected %d pops, got %d", total, n)
 	}
 }
