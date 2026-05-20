@@ -10,6 +10,7 @@ type OlricStackSpec struct {
 	Replicas         *int32                      `json:"replicas,omitempty"`
 	WatchdogReplicas *int32                      `json:"watchdogReplicas,omitempty"`
 	Image            string                      `json:"image,omitempty"`
+	SidecarImage     string                      `json:"sidecarImage,omitempty"`
 	WatchdogImage    string                      `json:"watchdogImage,omitempty"`
 	MySQLDSNSecret   corev1.SecretKeySelector    `json:"mysqlDsnSecret"`
 	Resources        corev1.ResourceRequirements `json:"resources,omitempty"`

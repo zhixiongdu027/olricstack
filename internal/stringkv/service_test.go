@@ -218,98 +218,13 @@ type testService struct {
 	lease *fakeLease
 }
 
-func newTestService(t *testing.T, provider DMapProvider, backing store.CacheStore) *testService {
+func newTestService(t *testing.T, provider DMapProvider, backing *recordingStore) *testService {
 	t.Helper()
+	_ = backing
 	lease := &fakeLease{allowed: true}
 	service, err := NewService(provider, lease)
 	if err != nil {
 		t.Fatalf("new service: %v", err)
 	}
 	return &testService{Service: service, lease: lease}
-}
-
-var _ store.CacheStore = (*recordingStore)(nil)
-
-type recordingCommitStore struct {
-	*recordingStore
-	nextVersion           int64
-	committedCount        int
-	abortedCount          int
-	handoffCalls          [][]store.EntryRef
-	partitionHandoffCalls []partitionHandoffCall
-	handoffErr            error
-}
-
-type partitionHandoffCall struct {
-	dmap           string
-	partitionID    uint64
-	partitionCount uint64
-}
-
-func newRecordingCommitStore() *recordingCommitStore {
-	return &recordingCommitStore{
-		recordingStore: newRecordingStore(),
-		nextVersion:    1,
-	}
-}
-
-func (s *recordingCommitStore) PrepareEntry(ctx context.Context, record store.EntryRecord) (store.EntryRecord, error) {
-	record.WALState = store.WALStatePrepared
-	record.FlushMySQL = false
-	return s.storePrepared(record)
-}
-
-func (s *recordingCommitStore) CommitEntry(ctx context.Context, ref store.EntryRef, version int64) error {
-	record, ok := s.records[ref.HKey]
-	if !ok || record.WALSeq != version {
-		return store.ErrNotFound
-	}
-	record.WALState = store.WALStateCommitted
-	record.FlushMySQL = true
-	s.records[ref.HKey] = record.Clone()
-	s.committedCount++
-	return nil
-}
-
-func (s *recordingCommitStore) AbortEntry(ctx context.Context, ref store.EntryRef, version int64) error {
-	record, ok := s.records[ref.HKey]
-	if !ok {
-		return nil
-	}
-	if record.WALSeq != version {
-		return nil
-	}
-	if record.WALState == store.WALStateCommitted {
-		return errors.New("cannot abort committed record")
-	}
-	delete(s.records, ref.HKey)
-	s.abortedCount++
-	return nil
-}
-
-func (s *recordingCommitStore) storePrepared(record store.EntryRecord) (store.EntryRecord, error) {
-	if s.storeErr != nil {
-		return store.EntryRecord{}, s.storeErr
-	}
-	record.WALSeq = s.nextVersion
-	s.nextVersion++
-	s.records[record.HKey] = record.Clone()
-	return record.Clone(), nil
-}
-
-var _ store.CommitStore = (*recordingCommitStore)(nil)
-
-func (s *recordingCommitStore) FlushHandoff(ctx context.Context, refs []store.EntryRef) error {
-	cloned := append([]store.EntryRef(nil), refs...)
-	s.handoffCalls = append(s.handoffCalls, cloned)
-	return s.handoffErr
-}
-
-func (s *recordingCommitStore) FlushHandoffPartition(ctx context.Context, dmap string, partitionID, partitionCount uint64) error {
-	s.partitionHandoffCalls = append(s.partitionHandoffCalls, partitionHandoffCall{
-		dmap:           dmap,
-		partitionID:    partitionID,
-		partitionCount: partitionCount,
-	})
-	return s.handoffErr
 }

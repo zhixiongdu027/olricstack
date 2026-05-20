@@ -16,10 +16,12 @@ const (
 	LabelStackID   = "olric.io/stack-id"
 	LabelComponent = "app.kubernetes.io/component"
 
-	ComponentOlricNode = "olric-node"
-	ComponentWatchdog  = "watchdog"
+	ComponentOlricNode    = "olric-node"
+	ComponentOlricSidecar = "olric-sidecar"
+	ComponentWatchdog     = "watchdog"
 
 	DefaultNodeImage     = "olricstack/olric-node:latest"
+	DefaultSidecarImage  = "olricstack/olric-sidecar:latest"
 	DefaultWatchdogImage = "olricstack/watchdog:latest"
 
 	WatchdogPort   = int32(8081)
@@ -27,8 +29,13 @@ const (
 	RESPPort       = int32(3321)
 	MemberlistPort = int32(3322)
 
-	OlricDataVolumeName = "olric-data"
-	OlricDataMountPath  = "/var/lib/olricstack"
+	// SharedVolumeName backs the shm ring + control unix socket. It is a
+	// tmpfs (emptyDir{Memory}) so producer and consumer share the same
+	// pages without disk syscalls. Pod reschedule loses this volume; the
+	// "ack = shm append" semantic explicitly accepts that loss.
+	SharedVolumeName  = "olric-shared"
+	SharedMountPath   = "/var/lib/olricstack/shared"
+	SharedMemoryLimit = "256Mi"
 
 	WatchdogClusterRoleName = "olricstack-watchdog"
 
@@ -166,7 +173,7 @@ func WatchdogRoleBinding(stack *olricv1alpha1.OlricStack) *rbacv1.RoleBinding {
 	}
 }
 
-func OlricHeadlessService(stack *olricv1alpha1.OlricStack) *corev1.Service {
+func OlricService(stack *olricv1alpha1.OlricStack) *corev1.Service {
 	labels := StackLabels(stack, ComponentOlricNode)
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -176,8 +183,7 @@ func OlricHeadlessService(stack *olricv1alpha1.OlricStack) *corev1.Service {
 			Annotations: map[string]string{AnnotationServiceScope: ServiceScopeInternal},
 		},
 		Spec: corev1.ServiceSpec{
-			ClusterIP: "None",
-			Selector:  labels,
+			Selector: labels,
 			Ports: []corev1.ServicePort{{
 				Name:       "resp",
 				Port:       RESPPort,
@@ -187,85 +193,104 @@ func OlricHeadlessService(stack *olricv1alpha1.OlricStack) *corev1.Service {
 	}
 }
 
-func OlricStatefulSet(stack *olricv1alpha1.OlricStack) *appsv1.StatefulSet {
+// OlricDeployment returns the Deployment that runs olric-node + olric-sidecar
+// as two containers in the same Pod, sharing a tmpfs volume for the shm ring
+// and the unix-socket control plane.
+func OlricDeployment(stack *olricv1alpha1.OlricStack) *appsv1.Deployment {
 	labels := StackLabels(stack, ComponentOlricNode)
 	replicas := int32(3)
 	if stack.Spec.Replicas != nil {
 		replicas = *stack.Spec.Replicas
 	}
 
-	return &appsv1.StatefulSet{
+	sharedSize := resource.MustParse(SharedMemoryLimit)
+	memoryMedium := corev1.StorageMediumMemory
+
+	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      OlricName(stack),
 			Namespace: stack.Namespace,
 			Labels:    labels,
 		},
-		Spec: appsv1.StatefulSetSpec{
-			ServiceName: OlricName(stack),
-			Replicas:    &replicas,
-			Selector:    &metav1.LabelSelector{MatchLabels: labels},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Strategy: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
+					MaxUnavailable: intstrPtr(1),
+					MaxSurge:       intstrPtr(1),
+				},
+			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{
-						Name:      "olric-node",
-						Image:     valueOrDefault(stack.Spec.Image, DefaultNodeImage),
-						Resources: stack.Spec.Resources,
-						Ports: []corev1.ContainerPort{{
-							Name:          "olric-internal",
-							ContainerPort: OlricPort,
-						}, {
-							Name:          "resp",
-							ContainerPort: RESPPort,
-						}, {
-							Name:          "memberlist",
-							ContainerPort: MemberlistPort,
-						}},
-						VolumeMounts: []corev1.VolumeMount{{
-							Name:      OlricDataVolumeName,
-							MountPath: OlricDataMountPath,
-						}},
-						Env: []corev1.EnvVar{
-							{Name: "STACK_ID", Value: stack.Name},
-							{Name: "WATCHDOG_SVC_NAME", Value: fmt.Sprintf("%s.%s.svc.cluster.local:%d", WatchdogName(stack), stack.Namespace, WatchdogPort)},
-							{Name: "HEARTBEAT_INTERVAL", Value: "10s"},
-							{Name: "WATCHDOG_RECONNECT_INTERVAL", Value: "3s"},
-							{Name: "DIRTY_QUEUE_SIZE", Value: "1024"},
-							{Name: "FLUSH_INTERVAL", Value: "1s"},
-							{Name: "FLUSH_BACKOFF", Value: "1s"},
-							{Name: "FLUSH_BATCH_SIZE", Value: "256"},
-							{Name: "WAL_PATH", Value: "/var/lib/olricstack/cache.wal"},
-							{Name: "OLRIC_BIND_ADDR", Value: "0.0.0.0"},
-							{Name: "OLRIC_BIND_PORT", Value: fmt.Sprintf("%d", OlricPort)},
-							{Name: "RESP_BIND_ADDR", Value: "0.0.0.0"},
-							{Name: "RESP_BIND_PORT", Value: fmt.Sprintf("%d", RESPPort)},
-							{Name: "OLRIC_MEMBERLIST_BIND_ADDR", Value: "0.0.0.0"},
-							{Name: "OLRIC_MEMBERLIST_BIND_PORT", Value: fmt.Sprintf("%d", MemberlistPort)},
-							{Name: "OLRIC_MEMBERLIST_ENV", Value: "lan"},
-							{Name: "MYSQL_DSN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &stack.Spec.MySQLDSNSecret}},
-							{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
-							{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
+					Volumes: []corev1.Volume{{
+						Name: SharedVolumeName,
+						VolumeSource: corev1.VolumeSource{
+							EmptyDir: &corev1.EmptyDirVolumeSource{
+								Medium:    memoryMedium,
+								SizeLimit: &sharedSize,
+							},
 						},
 					}},
-				},
-			},
-			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
-				ObjectMeta: metav1.ObjectMeta{Name: OlricDataVolumeName},
-				Spec: corev1.PersistentVolumeClaimSpec{
-					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-					Resources: corev1.VolumeResourceRequirements{
-						Requests: corev1.ResourceList{
-							corev1.ResourceStorage: resourceQuantity("1Gi"),
+					Containers: []corev1.Container{
+						{
+							Name:      "olric-node",
+							Image:     valueOrDefault(stack.Spec.Image, DefaultNodeImage),
+							Resources: stack.Spec.Resources,
+							Ports: []corev1.ContainerPort{{
+								Name:          "olric-internal",
+								ContainerPort: OlricPort,
+							}, {
+								Name:          "resp",
+								ContainerPort: RESPPort,
+							}, {
+								Name:          "memberlist",
+								ContainerPort: MemberlistPort,
+							}},
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: SharedVolumeName, MountPath: SharedMountPath},
+							},
+							Env: []corev1.EnvVar{
+								{Name: "STACK_ID", Value: stack.Name},
+								{Name: "WATCHDOG_SVC_NAME", Value: fmt.Sprintf("%s.%s.svc.cluster.local:%d", WatchdogName(stack), stack.Namespace, WatchdogPort)},
+								{Name: "HEARTBEAT_INTERVAL", Value: "10s"},
+								{Name: "WATCHDOG_RECONNECT_INTERVAL", Value: "3s"},
+								{Name: "OLRIC_BIND_ADDR", Value: "0.0.0.0"},
+								{Name: "OLRIC_BIND_PORT", Value: fmt.Sprintf("%d", OlricPort)},
+								{Name: "RESP_BIND_ADDR", Value: "0.0.0.0"},
+								{Name: "RESP_BIND_PORT", Value: fmt.Sprintf("%d", RESPPort)},
+								{Name: "OLRIC_MEMBERLIST_BIND_ADDR", Value: "0.0.0.0"},
+								{Name: "OLRIC_MEMBERLIST_BIND_PORT", Value: fmt.Sprintf("%d", MemberlistPort)},
+								{Name: "OLRIC_MEMBERLIST_ENV", Value: "lan"},
+								{Name: "RING_PATH", Value: SharedMountPath + "/oplog.ring"},
+								{Name: "CONTROL_SOCKET", Value: SharedMountPath + "/oplog.sock"},
+								{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+								{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
+							},
+						},
+						{
+							Name:  "olric-sidecar",
+							Image: valueOrDefault(stack.Spec.SidecarImage, DefaultSidecarImage),
+							VolumeMounts: []corev1.VolumeMount{{
+								Name:      SharedVolumeName,
+								MountPath: SharedMountPath,
+							}},
+							Env: []corev1.EnvVar{
+								{Name: "STACK_ID", Value: stack.Name},
+								{Name: "MYSQL_DSN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &stack.Spec.MySQLDSNSecret}},
+								{Name: "RING_PATH", Value: SharedMountPath + "/oplog.ring"},
+								{Name: "CONTROL_SOCKET", Value: SharedMountPath + "/oplog.sock"},
+								{Name: "RING_CAPACITY_BYTES", Value: "16777216"},
+								{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+							},
 						},
 					},
 				},
-			}},
+			},
 		},
 	}
-}
-
-func resourceQuantity(value string) resource.Quantity {
-	return resource.MustParse(value)
 }
 
 func intstrPtr(value int) *intstr.IntOrString {

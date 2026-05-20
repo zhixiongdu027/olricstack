@@ -92,8 +92,8 @@ func (c *Controller) Reconcile(ctx context.Context) error {
 	}
 
 	resources := []client.Object{
-		workloads.OlricHeadlessService(&stack),
-		workloads.OlricStatefulSet(&stack),
+		workloads.OlricService(&stack),
+		workloads.OlricDeployment(&stack),
 	}
 	for _, obj := range resources {
 		if err := controllerutil.SetControllerReference(&stack, obj, c.Scheme); err != nil {
@@ -156,11 +156,9 @@ func (c *Controller) applyOwned(ctx context.Context, desired client.Object) erro
 		typed.Spec.ClusterIPs = currentSvc.Spec.ClusterIPs
 		typed.Spec.IPFamilies = currentSvc.Spec.IPFamilies
 		typed.Spec.IPFamilyPolicy = currentSvc.Spec.IPFamilyPolicy
-	case *appsv1.StatefulSet:
-		currentStatefulSet := current.(*appsv1.StatefulSet)
-		typed.Spec.ServiceName = currentStatefulSet.Spec.ServiceName
-		typed.Spec.Selector = currentStatefulSet.Spec.Selector
-		typed.Spec.VolumeClaimTemplates = currentStatefulSet.Spec.VolumeClaimTemplates
+	case *appsv1.Deployment:
+		currentDeploy := current.(*appsv1.Deployment)
+		typed.Spec.Selector = currentDeploy.Spec.Selector
 	}
 	return c.Update(ctx, desired)
 }

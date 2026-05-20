@@ -45,6 +45,8 @@ spec:
                   default: 2
                 image:
                   type: string
+                sidecarImage:
+                  type: string
                 watchdogImage:
                   type: string
                 mysqlDsnSecret:

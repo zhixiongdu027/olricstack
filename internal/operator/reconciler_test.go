@@ -29,13 +29,7 @@ func TestReconcileCreatesStackResources(t *testing.T) {
 			Name:      "demo",
 			Namespace: "default",
 		},
-		Spec: olricv1alpha1.OlricStackSpec{
-			Replicas: &replicas,
-			MySQLDSNSecret: corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: "mysql"},
-				Key:                  "dsn",
-			},
-		},
+		Spec: olricv1alpha1.OlricStackSpec{Replicas: &replicas},
 	}
 
 	client := fake.NewClientBuilder().
@@ -100,9 +94,9 @@ func TestReconcileCreatesStackResources(t *testing.T) {
 		t.Fatalf("unexpected watchdog role binding subjects: %#v", watchdogRoleBinding.Subjects)
 	}
 
-	var statefulSet appsv1.StatefulSet
-	if err := client.Get(context.Background(), types.NamespacedName{Name: "demo-olric", Namespace: "default"}, &statefulSet); err == nil {
-		t.Fatal("global operator should not create olric statefulset directly")
+	var olricDeployment appsv1.Deployment
+	if err := client.Get(context.Background(), types.NamespacedName{Name: "demo-olric", Namespace: "default"}, &olricDeployment); err == nil {
+		t.Fatal("global operator should not create olric deployment directly")
 	}
 }
 

@@ -32,7 +32,7 @@ func TestHostOnlyMySQLDurableWritePath(t *testing.T) {
 	watchdogAddr, _, cleanupWatchdog := startHostWatchdog(t, ctx)
 	defer cleanupWatchdog()
 
-	node := startHostOlricNode(t, ctx, watchdogAddr, mysql.hostDSN(), "host-only-node")
+	node := startHostOlricNode(t, ctx, watchdogAddr, "host-only-node")
 	defer node.stop(t)
 
 	key := "host-user:" + strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -60,7 +60,7 @@ func TestHostOnlyWatchdogDemotionBlocksAndPromotionRestoresWrites(t *testing.T) 
 	watchdogAddr, service, cleanupWatchdog := startHostWatchdog(t, ctx)
 	defer cleanupWatchdog()
 
-	node := startHostOlricNode(t, ctx, watchdogAddr, mysql.hostDSN(), "host-only-failover-node")
+	node := startHostOlricNode(t, ctx, watchdogAddr, "host-only-failover-node")
 	defer node.stop(t)
 
 	firstKey := "host-before-demotion:" + strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -96,7 +96,7 @@ func TestHostOnlyRestartReadsThroughMySQL(t *testing.T) {
 	defer cleanupWatchdog()
 
 	key := "host-read-through:" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	first := startHostOlricNode(t, ctx, watchdogAddr, mysql.hostDSN(), "host-only-read-through-writer")
+	first := startHostOlricNode(t, ctx, watchdogAddr, "host-only-read-through-writer")
 	if out, err := first.put(ctx, "users", key, "value-from-mysql"); err != nil {
 		first.stop(t)
 		t.Fatalf("write before restart: %v (%s)\nnode logs:\n%s", err, strings.TrimSpace(out), strings.TrimSpace(first.logs.String()))
@@ -104,7 +104,7 @@ func TestHostOnlyRestartReadsThroughMySQL(t *testing.T) {
 	waitForMySQLRecord(t, ctx, mysql.hostDSN(), "users", key)
 	first.stop(t)
 
-	second := startHostOlricNode(t, ctx, watchdogAddr, mysql.hostDSN(), "host-only-read-through-reader")
+	second := startHostOlricNode(t, ctx, watchdogAddr, "host-only-read-through-reader")
 	defer second.stop(t)
 
 	got, out, err := second.get(ctx, "users", key)
@@ -608,7 +608,9 @@ type hostOlricNode struct {
 	bindAddr     string
 	olricPort    int
 	cmd          *exec.Cmd
+	sidecarCmd   *exec.Cmd
 	errCh        chan error
+	sidecarErrCh chan error
 	logs         *lockedBuffer
 }
 
@@ -622,10 +624,18 @@ func (n *hostOlricNode) kill(t *testing.T) {
 	if n.cmd.Process != nil {
 		_ = n.cmd.Process.Kill()
 	}
+	if n.sidecarCmd != nil && n.sidecarCmd.Process != nil {
+		_ = n.sidecarCmd.Process.Kill()
+	}
 	select {
 	case <-n.errCh:
 	case <-time.After(10 * time.Second):
 		t.Fatalf("host olric-node did not exit after SIGKILL\nlogs:\n%s", strings.TrimSpace(n.logs.String()))
+	}
+	select {
+	case <-n.sidecarErrCh:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("host olric-sidecar did not exit after SIGKILL\nlogs:\n%s", strings.TrimSpace(n.logs.String()))
 	}
 }
 
@@ -649,11 +659,10 @@ func (n *hostOlricNode) resume(t *testing.T) {
 	}
 }
 
-func startHostOlricNode(t *testing.T, parent context.Context, watchdogAddr, mysqlDSN, nodeID string) *hostOlricNode {
+func startHostOlricNode(t *testing.T, parent context.Context, watchdogAddr, nodeID string) *hostOlricNode {
 	t.Helper()
 	return startHostOlricNodeWithConfig(t, parent, hostNodeConfig{
 		watchdogAddr: watchdogAddr,
-		mysqlDSN:     mysqlDSN,
 		nodeID:       nodeID,
 		podIP:        "127.0.0.1",
 		bindAddr:     "127.0.0.1",
@@ -662,7 +671,6 @@ func startHostOlricNode(t *testing.T, parent context.Context, watchdogAddr, mysq
 
 type hostNodeConfig struct {
 	watchdogAddr    string
-	mysqlDSN        string
 	nodeID          string
 	podIP           string
 	bindAddr        string
@@ -716,6 +724,25 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 	}
 	logs := &lockedBuffer{}
 
+	sharedDir := t.TempDir()
+	ringPath := filepath.Join(sharedDir, "oplog.ring")
+	socketPath := filepath.Join(sharedDir, "oplog.sock")
+
+	sidecarBinary := buildBinary(t, parent, repoRoot, filepath.Join(t.TempDir(), "olric-sidecar"), "./cmd/olric-sidecar", nil)
+	sidecarCmd := exec.Command(sidecarBinary)
+	sidecarCmd.Dir = repoRoot
+	sidecarCmd.Stdout = logs
+	sidecarCmd.Stderr = logs
+	sidecarCmd.Env = append(os.Environ(),
+		"MYSQL_DSN="+os.Getenv("E2E_MYSQL_DSN"),
+		"RING_PATH="+ringPath,
+		"CONTROL_SOCKET="+socketPath,
+		"RING_CAPACITY_BYTES=8388608",
+	)
+	if err := sidecarCmd.Start(); err != nil {
+		t.Fatalf("start host olric-sidecar: %v", err)
+	}
+
 	cmd := exec.Command(nodeBinary)
 	cmd.Dir = repoRoot
 	cmd.Stdout = logs
@@ -726,11 +753,8 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 		"POD_NAME="+cfg.nodeID,
 		"NODE_ID="+cfg.nodeID,
 		"POD_IP="+cfg.podIP,
-		"STORAGE_MODE="+hostStorageMode(cfg.mysqlDSN),
-		"MYSQL_DSN="+cfg.mysqlDSN,
-		"WAL_PATH="+filepath.Join(t.TempDir(), "cache.wal"),
-		"FLUSH_INTERVAL=100ms",
-		"FLUSH_BACKOFF=100ms",
+		"RING_PATH="+ringPath,
+		"CONTROL_SOCKET="+socketPath,
 		"HEARTBEAT_INTERVAL=100ms",
 		"WATCHDOG_RECONNECT_INTERVAL=100ms",
 		"OLRIC_BIND_ADDR="+cfg.bindAddr,
@@ -749,6 +773,7 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 	)
 	cmd.Env = append(cmd.Env, cfg.extraEnv...)
 	if err := cmd.Start(); err != nil {
+		_ = sidecarCmd.Process.Kill()
 		t.Fatalf("start host olric-node: %v", err)
 	}
 
@@ -759,31 +784,22 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 		bindAddr:     cfg.bindAddr,
 		olricPort:    olricPort,
 		cmd:          cmd,
+		sidecarCmd:   sidecarCmd,
 		errCh:        make(chan error, 1),
+		sidecarErrCh: make(chan error, 1),
 		logs:         logs,
 	}
 	go func() {
 		node.errCh <- cmd.Wait()
 	}()
+	go func() {
+		node.sidecarErrCh <- sidecarCmd.Wait()
+	}()
 
-	waitForText(t, parent, logs, hostStorageLog(cfg.mysqlDSN))
 	waitForText(t, parent, logs, "received topology push")
 	waitForText(t, parent, logs, "olric node bootstrap complete")
+	waitForText(t, parent, logs, "sidecar bootstrap complete")
 	return node
-}
-
-func hostStorageMode(mysqlDSN string) string {
-	if mysqlDSN == "" {
-		return "wal"
-	}
-	return "mysql"
-}
-
-func hostStorageLog(mysqlDSN string) string {
-	if mysqlDSN == "" {
-		return "storage mode: memory + local wal"
-	}
-	return "storage mode: memory + local wal + mysql"
 }
 
 func (n *hostOlricNode) put(ctx context.Context, dmap, key, value string) (string, error) {
@@ -821,6 +837,9 @@ func (n *hostOlricNode) stop(t *testing.T) {
 	if n.cmd.Process != nil {
 		_ = n.cmd.Process.Signal(syscall.SIGTERM)
 	}
+	if n.sidecarCmd != nil && n.sidecarCmd.Process != nil {
+		_ = n.sidecarCmd.Process.Signal(syscall.SIGTERM)
+	}
 	select {
 	case err := <-n.errCh:
 		if err != nil {
@@ -829,6 +848,15 @@ func (n *hostOlricNode) stop(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		_ = n.cmd.Process.Kill()
 		t.Fatalf("host olric-node did not exit after SIGTERM\nlogs:\n%s", strings.TrimSpace(n.logs.String()))
+	}
+	select {
+	case err := <-n.sidecarErrCh:
+		if err != nil {
+			t.Logf("host olric-sidecar exited after SIGTERM: %v\nlogs:\n%s", err, strings.TrimSpace(n.logs.String()))
+		}
+	case <-time.After(10 * time.Second):
+		_ = n.sidecarCmd.Process.Kill()
+		t.Fatalf("host olric-sidecar did not exit after SIGTERM\nlogs:\n%s", strings.TrimSpace(n.logs.String()))
 	}
 }
 

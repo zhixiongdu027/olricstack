@@ -3,283 +3,116 @@ package stringkv
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	olricconfig "github.com/olric-data/olric/config"
 	olricstorage "github.com/olric-data/olric/pkg/storage"
+	"github.com/zhixiongdu/olricstack/internal/oplog"
+	"github.com/zhixiongdu/olricstack/internal/ring"
 	"github.com/zhixiongdu/olricstack/internal/store"
 )
 
-func TestDurableHookBeforeSetStampsFenceAndPreparesRecord(t *testing.T) {
-	backing := newRecordingCommitStore()
-	hook := newTestDurableHook(t, backing, fenceAt(7, 3))
-	entry := newTestEntry("alice", "A", time.Now().Add(time.Minute).UnixMilli(), 42)
-
-	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
-		DMap:  "users",
-		Key:   "alice",
-		HKey:  HKey("users", "alice"),
-		Entry: entry,
-	})
-	if err != nil {
-		t.Fatalf("before set: %v", err)
-	}
-	if op.Version == 0 {
-		t.Fatal("expected non-zero op.Version (WALSeq) after prepare")
-	}
-	record := backing.records[HKey("users", "alice")]
-	if record.WALState != store.WALStatePrepared || record.FlushMySQL {
-		t.Fatalf("expected prepared unflushable record, got %#v", record)
-	}
-	if record.Generation != 7 || record.Epoch != 3 || record.OwnerSeq != 1 {
-		t.Fatalf("expected fence (7,3,1), got (%d,%d,%d)", record.Generation, record.Epoch, record.OwnerSeq)
-	}
-	if record.WriterID != "test-writer" {
-		t.Fatalf("expected writer_id=test-writer, got %q", record.WriterID)
-	}
-	if record.Origin != "client_set" || !recordHasFlushIntent(record) {
-		t.Fatalf("expected client_set flushable-intent record, got %#v", record)
-	}
+// recordingRing captures every payload Append received plus an optional
+// canned error sequence. It is goroutine-safe so tests can simulate ring-full
+// retries from multiple goroutines.
+type recordingRing struct {
+	mu        sync.Mutex
+	payloads  [][]byte
+	errs      []error
+	notifyCh  chan struct{}
+	failCount int
 }
 
-func TestDurableHookBeforeSetRejectsExpiredLease(t *testing.T) {
-	backing := newRecordingCommitStore()
-	lease := &fakeFenceLease{}
-	seq := newFakeFenceSequencer()
-	hook, err := NewDurableHook(backing, lease, seq, "test-writer")
-	if err != nil {
-		t.Fatalf("new hook: %v", err)
-	}
-
-	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
-		DMap:  "users",
-		Key:   "alice",
-		HKey:  HKey("users", "alice"),
-		Entry: newTestEntry("alice", "A", 0, 1),
-	})
-	if !errors.Is(err, ErrLeaseExpired) {
-		t.Fatalf("expected ErrLeaseExpired, got %v", err)
-	}
-	if op.Version != 0 {
-		t.Fatal("op.Version must remain 0 when prepare is denied")
-	}
-	if len(backing.records) != 0 {
-		t.Fatalf("no WAL record may exist when lease is invalid, got %v", backing.records)
-	}
-	if seq.calls != 0 {
-		t.Fatalf("expected no fence stamp on lease denial, got %d", seq.calls)
-	}
+func newRecordingRing() *recordingRing {
+	return &recordingRing{notifyCh: make(chan struct{}, 64)}
 }
 
-func TestDurableHookAfterSetCommitsOnSuccess(t *testing.T) {
-	backing := newRecordingCommitStore()
-	hook := newTestDurableHook(t, backing, fenceAt(7, 3))
-	entry := newTestEntry("alice", "A", 0, 42)
-
-	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
-		DMap: "users", Key: "alice", HKey: HKey("users", "alice"), Entry: entry,
-	})
-	if err != nil {
-		t.Fatalf("before set: %v", err)
-	}
-	if err := hook.AfterSet(context.Background(), op, nil); err != nil {
-		t.Fatalf("after set: %v", err)
-	}
-	record := backing.records[HKey("users", "alice")]
-	if record.WALState != store.WALStateCommitted || !record.FlushMySQL {
-		t.Fatalf("expected committed flushable record, got %#v", record)
-	}
-	if backing.committedCount != 1 || backing.abortedCount != 0 {
-		t.Fatalf("expected exactly one commit, no abort; got commits=%d aborts=%d",
-			backing.committedCount, backing.abortedCount)
-	}
-}
-
-func TestDurableHookAfterSetAbortsOnMutationError(t *testing.T) {
-	backing := newRecordingCommitStore()
-	hook := newTestDurableHook(t, backing, fenceAt(7, 3))
-	entry := newTestEntry("alice", "A", 0, 42)
-
-	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
-		DMap: "users", Key: "alice", HKey: HKey("users", "alice"), Entry: entry,
-	})
-	if err != nil {
-		t.Fatalf("before set: %v", err)
-	}
-	mutErr := errors.New("olric quorum failed")
-	if err := hook.AfterSet(context.Background(), op, mutErr); err != nil {
-		t.Fatalf("after set with mutation error: %v", err)
-	}
-	if _, exists := backing.records[HKey("users", "alice")]; exists {
-		t.Fatalf("aborted prepare must remove WAL record, still present")
-	}
-	if backing.abortedCount != 1 || backing.committedCount != 0 {
-		t.Fatalf("expected exactly one abort, no commit; got commits=%d aborts=%d",
-			backing.committedCount, backing.abortedCount)
-	}
-}
-
-func TestDurableHookBeforeDeleteWritesFencedTombstone(t *testing.T) {
-	backing := newRecordingCommitStore()
-	hook := newTestDurableHook(t, backing, fenceAt(11, 4))
-
-	op, err := hook.BeforeDelete(context.Background(), olricconfig.DurableOperation{
-		DMap: "users", Key: "alice", HKey: HKey("users", "alice"),
-	})
-	if err != nil {
-		t.Fatalf("before delete: %v", err)
-	}
-	if op.Version == 0 {
-		t.Fatal("expected non-zero op.Version after prepare-delete")
-	}
-	record := backing.records[HKey("users", "alice")]
-	if !record.Tombstone {
-		t.Fatalf("expected tombstone, got %#v", record)
-	}
-	if record.Generation != 11 || record.Epoch != 4 || record.OwnerSeq != 1 {
-		t.Fatalf("expected fence (11,4,1) on tombstone, got (%d,%d,%d)",
-			record.Generation, record.Epoch, record.OwnerSeq)
-	}
-	if record.WALState != store.WALStatePrepared {
-		t.Fatalf("expected prepared tombstone state, got %q", record.WALState)
-	}
-}
-
-func TestDurableHookAfterDeleteAbortsOnMutationError(t *testing.T) {
-	backing := newRecordingCommitStore()
-	hook := newTestDurableHook(t, backing, fenceAt(11, 4))
-
-	op, err := hook.BeforeDelete(context.Background(), olricconfig.DurableOperation{
-		DMap: "users", Key: "alice", HKey: HKey("users", "alice"),
-	})
-	if err != nil {
-		t.Fatalf("before delete: %v", err)
-	}
-	mutErr := errors.New("delete quorum failed")
-	if err := hook.AfterDelete(context.Background(), op, mutErr); err != nil {
-		t.Fatalf("after delete: %v", err)
-	}
-	if _, exists := backing.records[HKey("users", "alice")]; exists {
-		t.Fatal("aborted tombstone prepare must vanish")
-	}
-}
-
-func TestDurableHookBeforeExpireWritesFencedFlushableRecord(t *testing.T) {
-	backing := newRecordingCommitStore()
-	hook := newTestDurableHook(t, backing, fenceAt(2, 9))
-	entry := newTestEntry("alice", "A", time.Now().Add(time.Hour).UnixMilli(), 43)
-
-	op, err := hook.BeforeExpire(context.Background(), olricconfig.DurableOperation{
-		DMap: "users", Key: "alice", HKey: HKey("users", "alice"), Entry: entry,
-	})
-	if err != nil {
-		t.Fatalf("before expire: %v", err)
-	}
-	record := backing.records[HKey("users", "alice")]
-	if record.Origin != "client_expire" {
-		t.Fatalf("expected client_expire origin, got %q", record.Origin)
-	}
-	if record.Generation != 2 || record.Epoch != 9 || record.OwnerSeq != 1 {
-		t.Fatalf("expected fence (2,9,1) on expire, got (%d,%d,%d)",
-			record.Generation, record.Epoch, record.OwnerSeq)
-	}
-	if err := hook.AfterExpire(context.Background(), op, nil); err != nil {
-		t.Fatalf("after expire: %v", err)
-	}
-	record = backing.records[HKey("users", "alice")]
-	if record.WALState != store.WALStateCommitted || !record.FlushMySQL {
-		t.Fatalf("expected committed flushable expire record, got %#v", record)
-	}
-}
-
-func TestDurableHookFenceSequenceIsMonotonic(t *testing.T) {
-	backing := newRecordingCommitStore()
-	hook := newTestDurableHook(t, backing, fenceAt(1, 1))
-
-	for i := 0; i < 3; i++ {
-		entry := newTestEntry("k", "v", 0, int64(i))
-		op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
-			DMap: "users", Key: "alice", HKey: HKey("users", "alice"), Entry: entry,
-		})
+func (r *recordingRing) Append(p []byte) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.errs) > 0 {
+		err := r.errs[0]
+		r.errs = r.errs[1:]
 		if err != nil {
-			t.Fatalf("before set #%d: %v", i, err)
-		}
-		if err := hook.AfterSet(context.Background(), op, nil); err != nil {
-			t.Fatalf("after set #%d: %v", i, err)
+			r.failCount++
+			return err
 		}
 	}
-	record := backing.records[HKey("users", "alice")]
-	if record.Generation != 1 || record.Epoch != 1 || record.OwnerSeq != 3 {
-		t.Fatalf("expected fence (1,1,3) after 3 stamps, got (%d,%d,%d)",
-			record.Generation, record.Epoch, record.OwnerSeq)
+	cp := make([]byte, len(p))
+	copy(cp, p)
+	r.payloads = append(r.payloads, cp)
+	select {
+	case r.notifyCh <- struct{}{}:
+	default:
 	}
+	return nil
 }
 
-func TestDurableHookLoadOnMissDecodesBackingEntry(t *testing.T) {
-	backing := newRecordingCommitStore()
-	hook := newTestDurableHook(t, backing, fenceAt(1, 1))
-	recordEntry := newTestEntry("alice", "A", time.Now().Add(time.Minute).UnixMilli(), 44)
-	backing.records[HKey("users", "alice")] = store.EntryRecord{
-		DMap:         "users",
-		Key:          "alice",
-		HKey:         HKey("users", "alice"),
-		EncodedEntry: recordEntry.Encode(),
-		TTL:          recordEntry.TTL(),
-		Timestamp:    recordEntry.Timestamp(),
+func (r *recordingRing) snapshot() [][]byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([][]byte, len(r.payloads))
+	for i, p := range r.payloads {
+		cp := make([]byte, len(p))
+		copy(cp, p)
+		out[i] = cp
 	}
-
-	template := newTestEntry("", "", 0, 0)
-	loaded, err := hook.LoadOnMiss(context.Background(), olricconfig.DurableOperation{
-		DMap: "users", Key: "alice", HKey: HKey("users", "alice"), Entry: template,
-	})
-	if err != nil {
-		t.Fatalf("load on miss: %v", err)
-	}
-	if loaded.Key() != "alice" || string(loaded.Value()) != "A" {
-		t.Fatalf("unexpected loaded entry: key=%q value=%q", loaded.Key(), loaded.Value())
-	}
-	// LoadOnMiss must not produce WAL writes — refill safety is enforced by
-	// the fork's fragment-locked re-check, not by hook-side WAL stamping.
-	if backing.committedCount != 0 || backing.abortedCount != 0 {
-		t.Fatalf("LoadOnMiss must not commit/abort, got commits=%d aborts=%d",
-			backing.committedCount, backing.abortedCount)
-	}
+	return out
 }
 
-func TestDurableHookLoadOnMissPropagatesNotFound(t *testing.T) {
-	backing := newRecordingCommitStore()
-	hook := newTestDurableHook(t, backing, fenceAt(1, 1))
-
-	_, err := hook.LoadOnMiss(context.Background(), olricconfig.DurableOperation{
-		DMap: "users", Key: "missing", HKey: HKey("users", "missing"),
-		Entry: newTestEntry("", "", 0, 0),
-	})
-	if !errors.Is(err, olricstorage.ErrKeyNotFound) {
-		t.Fatalf("expected backing miss, got %v", err)
-	}
+// stubControl records sidecar RPC calls and serves canned responses.
+type stubControl struct {
+	mu             sync.Mutex
+	notifyCalls    int
+	loadCalls      int
+	loadResp       store.EntryRecord
+	loadFound      bool
+	loadErr        error
+	drainCalls     []drainCall
+	drainErr       error
+	drainPartCount uint64
 }
 
-func newTestDurableHook(t *testing.T, backing store.CommitStore, lease *fakeFenceLease) *DurableHook {
+type drainCall struct {
+	dmap           string
+	partitionID    uint64
+	partitionCount uint64
+}
+
+func (c *stubControl) Notify(_ context.Context, _ uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.notifyCalls++
+	return nil
+}
+
+func (c *stubControl) LoadFromMySQL(_ context.Context, _ string, _ string, _ uint64) (store.EntryRecord, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.loadCalls++
+	return c.loadResp, c.loadFound, c.loadErr
+}
+
+func (c *stubControl) DrainPartition(_ context.Context, dmap string, partitionID, partitionCount uint64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.drainCalls = append(c.drainCalls, drainCall{dmap, partitionID, partitionCount})
+	return c.drainErr
+}
+
+func newTestDurableHook(t *testing.T, r RingProducer, c SidecarControl, lease *fakeFenceLease) *DurableHook {
 	t.Helper()
-	hook, err := NewDurableHook(backing, lease, newFakeFenceSequencer(), "test-writer")
+	hook, err := NewDurableHook(r, c, lease, newFakeFenceSequencer(), "test-writer", Config{AppendBudget: time.Second})
 	if err != nil {
 		t.Fatalf("new durable hook: %v", err)
 	}
 	return hook
 }
 
-func newTestEntry(key, value string, ttl, timestamp int64) *testEntry {
-	return &testEntry{
-		key:       key,
-		value:     []byte(value),
-		ttl:       ttl,
-		timestamp: timestamp,
-	}
-}
-
-// fenceAt creates a fakeFenceLease that returns a valid (g, e) snapshot.
-// g=0 means the lease is invalid.
+// fenceAt mirrors the helper from previous test files. g=0 means the lease is
+// not currently servable.
 func fenceAt(g, e int64) *fakeFenceLease {
 	return &fakeFenceLease{g: g, e: e, ok: g > 0}
 }
@@ -293,10 +126,6 @@ func (l *fakeFenceLease) SnapshotForWrite(time.Time) (int64, int64, bool) {
 	return l.g, l.e, l.ok
 }
 
-// VerifyFence mirrors LeaseTracker.VerifyFence for tests. It refuses when
-// the lease is not currently servable, the snapshotted generation does not
-// match (leadership change), or the current epoch has fallen behind the
-// snapshotted one (impossible in production but trivial to detect here).
 func (l *fakeFenceLease) VerifyFence(g, e int64, _ time.Time) bool {
 	if !l.ok {
 		return false
@@ -329,183 +158,338 @@ func (s *fakeFenceSequencer) Stamp(g, e int64) (int64, int64, int64, error) {
 	return s.g, s.e, s.s, nil
 }
 
-func recordHasFlushIntent(r store.EntryRecord) bool {
-	// During prepare phase, FlushMySQL is intentionally false in the WAL
-	// representation; the original "intent" is encoded by Origin so we just
-	// confirm the record was created with a client-origin tag.
-	return r.Origin == "client_set" || r.Origin == "client_expire" || r.Origin == "client_delete"
+func newTestEntry(key, value string, ttl, timestamp int64) *testEntry {
+	return &testEntry{key: key, value: []byte(value), ttl: ttl, timestamp: timestamp}
 }
 
-// TestDurableHookVerifyAfterLockPassesWhenFenceUnchanged covers the steady-
-// state case: BeforeSet stamps a fence, the fork acquires the fragment lock,
-// VerifyAfterLock confirms the fence is still current, and the prepared
-// record is committed normally by AfterSet.
-func TestDurableHookVerifyAfterLockPassesWhenFenceUnchanged(t *testing.T) {
-	backing := newRecordingCommitStore()
-	hook := newTestDurableHook(t, backing, fenceAt(7, 3))
+func decodeRing(t *testing.T, payload []byte) oplog.Entry {
+	t.Helper()
+	e, err := oplog.Decode(payload)
+	if err != nil {
+		t.Fatalf("decode oplog: %v", err)
+	}
+	return e
+}
+
+func TestBeforeSetStampsFenceWithoutPublishing(t *testing.T) {
+	r := newRecordingRing()
+	c := &stubControl{}
+	hook := newTestDurableHook(t, r, c, fenceAt(7, 3))
 
 	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
-		DMap:  "users",
-		Key:   "alice",
-		HKey:  HKey("users", "alice"),
+		DMap: "users", Key: "alice", HKey: HKey("users", "alice"),
 		Entry: newTestEntry("alice", "A", 0, 1),
 	})
 	if err != nil {
 		t.Fatalf("before set: %v", err)
 	}
 	if op.FenceGeneration != 7 || op.FenceEpoch != 3 {
-		t.Fatalf("expected fence (7,3) on op, got (%d,%d)", op.FenceGeneration, op.FenceEpoch)
+		t.Fatalf("expected fence (7,3), got (%d,%d)", op.FenceGeneration, op.FenceEpoch)
 	}
+	if got := r.snapshot(); len(got) != 0 {
+		t.Fatalf("BeforeSet must not append to ring, got %d entries", len(got))
+	}
+}
 
-	if err := hook.VerifyAfterLock(context.Background(), op); err != nil {
-		t.Fatalf("verify: %v", err)
+func TestBeforeSetRejectsExpiredLease(t *testing.T) {
+	r := newRecordingRing()
+	hook := newTestDurableHook(t, r, &stubControl{}, &fakeFenceLease{})
+
+	_, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+		DMap: "users", Key: "alice", HKey: HKey("users", "alice"),
+		Entry: newTestEntry("alice", "A", 0, 1),
+	})
+	if !errors.Is(err, ErrLeaseExpired) {
+		t.Fatalf("expected ErrLeaseExpired, got %v", err)
+	}
+	if got := r.snapshot(); len(got) != 0 {
+		t.Fatalf("expected no ring writes on expired lease, got %d", len(got))
+	}
+}
+
+func TestAfterSetSuccessPublishesToRing(t *testing.T) {
+	r := newRecordingRing()
+	c := &stubControl{}
+	hook := newTestDurableHook(t, r, c, fenceAt(7, 3))
+
+	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+		DMap: "users", Key: "alice", HKey: 42,
+		Entry: newTestEntry("alice", "A", 0, 1),
+	})
+	if err != nil {
+		t.Fatalf("before set: %v", err)
 	}
 	if err := hook.AfterSet(context.Background(), op, nil); err != nil {
 		t.Fatalf("after set: %v", err)
 	}
+	got := r.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("expected one ring entry, got %d", len(got))
+	}
+	entry := decodeRing(t, got[0])
+	if entry.Op != oplog.OpSet || entry.Key != "alice" || entry.HKey != 42 {
+		t.Fatalf("unexpected entry: %+v", entry)
+	}
+	if entry.Generation != 7 || entry.Epoch != 3 || entry.OwnerSeq != 1 {
+		t.Fatalf("expected fence (7,3,1), got (%d,%d,%d)", entry.Generation, entry.Epoch, entry.OwnerSeq)
+	}
+	if entry.WriterID != "test-writer" {
+		t.Fatalf("expected writer test-writer, got %q", entry.WriterID)
+	}
+	if c.notifyCalls == 0 {
+		t.Fatalf("expected sidecar Notify to be called after Append")
+	}
 }
 
-// TestDurableHookVerifyAfterLockRejectsLeaseRevocation covers the failover
-// race: BeforeSet stamps a fence, then the lease is revoked (or leadership
-// moves) before the fork acquires the fragment lock. VerifyAfterLock must
-// refuse so the fork can abort the prepared record without acknowledging
-// the write.
-func TestDurableHookVerifyAfterLockRejectsLeaseRevocation(t *testing.T) {
-	backing := newRecordingCommitStore()
-	lease := fenceAt(7, 3)
-	hook := newTestDurableHook(t, backing, lease)
+func TestAfterSetWithMutationErrorPublishesNothing(t *testing.T) {
+	r := newRecordingRing()
+	c := &stubControl{}
+	hook := newTestDurableHook(t, r, c, fenceAt(7, 3))
 
 	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
-		DMap:  "users",
-		Key:   "alice",
-		HKey:  HKey("users", "alice"),
+		DMap: "users", Key: "alice", HKey: 42,
 		Entry: newTestEntry("alice", "A", 0, 1),
 	})
 	if err != nil {
 		t.Fatalf("before set: %v", err)
 	}
+	mutErr := errors.New("quorum loss")
+	if err := hook.AfterSet(context.Background(), op, mutErr); err != nil {
+		t.Fatalf("after set returned error on mutation failure: %v", err)
+	}
+	if got := r.snapshot(); len(got) != 0 {
+		t.Fatalf("expected no ring entries on failed mutation, got %d", len(got))
+	}
+	if c.notifyCalls != 0 {
+		t.Fatalf("expected no Notify on failed mutation, got %d", c.notifyCalls)
+	}
+}
 
-	// Simulate a demote between prepare and lock acquisition.
+func TestAfterDeletePublishesTombstone(t *testing.T) {
+	r := newRecordingRing()
+	hook := newTestDurableHook(t, r, &stubControl{}, fenceAt(11, 4))
+
+	op, err := hook.BeforeDelete(context.Background(), olricconfig.DurableOperation{
+		DMap: "users", Key: "alice", HKey: 42,
+	})
+	if err != nil {
+		t.Fatalf("before delete: %v", err)
+	}
+	if err := hook.AfterDelete(context.Background(), op, nil); err != nil {
+		t.Fatalf("after delete: %v", err)
+	}
+	got := r.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("expected one tombstone in ring, got %d", len(got))
+	}
+	entry := decodeRing(t, got[0])
+	if entry.Op != oplog.OpDelete {
+		t.Fatalf("expected OpDelete, got %q", entry.Op)
+	}
+}
+
+func TestAfterExpirePublishesExpire(t *testing.T) {
+	r := newRecordingRing()
+	hook := newTestDurableHook(t, r, &stubControl{}, fenceAt(2, 9))
+
+	op, err := hook.BeforeExpire(context.Background(), olricconfig.DurableOperation{
+		DMap: "users", Key: "alice", HKey: 99,
+		Entry: newTestEntry("alice", "A", time.Now().Add(time.Hour).UnixMilli(), 1),
+	})
+	if err != nil {
+		t.Fatalf("before expire: %v", err)
+	}
+	if err := hook.AfterExpire(context.Background(), op, nil); err != nil {
+		t.Fatalf("after expire: %v", err)
+	}
+	got := r.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("expected one expire in ring, got %d", len(got))
+	}
+	entry := decodeRing(t, got[0])
+	if entry.Op != oplog.OpExpire {
+		t.Fatalf("expected OpExpire, got %q", entry.Op)
+	}
+}
+
+func TestVerifyAfterLockPassesOnUnchangedFence(t *testing.T) {
+	hook := newTestDurableHook(t, newRecordingRing(), &stubControl{}, fenceAt(7, 3))
+	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+		DMap: "users", Key: "alice", HKey: 1, Entry: newTestEntry("alice", "A", 0, 1),
+	})
+	if err != nil {
+		t.Fatalf("before set: %v", err)
+	}
+	if err := hook.VerifyAfterLock(context.Background(), op); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+}
+
+func TestVerifyAfterLockRejectsLeaseRevocation(t *testing.T) {
+	lease := fenceAt(7, 3)
+	hook := newTestDurableHook(t, newRecordingRing(), &stubControl{}, lease)
+	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+		DMap: "users", Key: "alice", HKey: 1, Entry: newTestEntry("alice", "A", 0, 1),
+	})
+	if err != nil {
+		t.Fatalf("before set: %v", err)
+	}
 	lease.ok = false
-
 	if err := hook.VerifyAfterLock(context.Background(), op); !errors.Is(err, ErrLeaseExpired) {
-		t.Fatalf("expected ErrLeaseExpired from verify, got %v", err)
-	}
-
-	// The fork would now call AfterSet(op, vErr) which routes to AbortEntry.
-	if err := hook.AfterSet(context.Background(), op, ErrLeaseExpired); err != nil {
-		t.Fatalf("after set with verify error: %v", err)
-	}
-	for ref := range backing.records {
-		t.Fatalf("aborted prepare must not leave a WAL record, found %v", ref)
+		t.Fatalf("expected ErrLeaseExpired, got %v", err)
 	}
 }
 
-// TestDurableHookVerifyAfterLockRejectsGenerationChange catches the more
-// subtle failover: lease still says "valid", but the new envelope advanced
-// the generation (i.e. a new PRIMARY took over). The prepared record's fence
-// is from the OLD primary and must not be acknowledged.
-func TestDurableHookVerifyAfterLockRejectsGenerationChange(t *testing.T) {
-	backing := newRecordingCommitStore()
+func TestVerifyAfterLockRejectsGenerationChange(t *testing.T) {
 	lease := fenceAt(7, 3)
-	hook := newTestDurableHook(t, backing, lease)
-
+	hook := newTestDurableHook(t, newRecordingRing(), &stubControl{}, lease)
 	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
-		DMap:  "users",
-		Key:   "alice",
-		HKey:  HKey("users", "alice"),
-		Entry: newTestEntry("alice", "A", 0, 1),
+		DMap: "users", Key: "alice", HKey: 1, Entry: newTestEntry("alice", "A", 0, 1),
 	})
 	if err != nil {
 		t.Fatalf("before set: %v", err)
 	}
-
-	// New primary advanced the generation. lease.ok is still true.
 	lease.g = 8
 	lease.e = 0
-
 	if err := hook.VerifyAfterLock(context.Background(), op); !errors.Is(err, ErrLeaseExpired) {
 		t.Fatalf("expected ErrLeaseExpired on generation change, got %v", err)
 	}
 }
 
-// TestDurableHookDrainForHandoffForwardsToCommitStore guards §8.6 Phase 4:
-// the hook must translate (DMap, []HKey) into EntryRefs and call the
-// underlying store's FlushHandoff, surfacing any failure to the fork so
-// migration aborts instead of proceeding with stale dirty WAL.
-func TestDurableHookDrainForHandoffForwardsToCommitStore(t *testing.T) {
-	backing := newRecordingCommitStore()
-	hook := newTestDurableHook(t, backing, fenceAt(1, 1))
-
-	err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{
-		DMap:        "users",
-		PartitionID: 7,
-		HKeys:       []uint64{101, 202, 303},
+func TestLoadOnMissDelegatesToSidecar(t *testing.T) {
+	c := &stubControl{
+		loadFound: true,
+		loadResp: store.EntryRecord{
+			DMap: "users", Key: "alice", HKey: 1,
+			EncodedEntry: newTestEntry("alice", "A", 0, 1).Encode(),
+		},
+	}
+	hook := newTestDurableHook(t, newRecordingRing(), c, fenceAt(1, 1))
+	template := newTestEntry("", "", 0, 0)
+	got, err := hook.LoadOnMiss(context.Background(), olricconfig.DurableOperation{
+		DMap: "users", Key: "alice", HKey: 1, Entry: template,
 	})
 	if err != nil {
+		t.Fatalf("load on miss: %v", err)
+	}
+	if got.Key() != "alice" || string(got.Value()) != "A" {
+		t.Fatalf("unexpected loaded entry: key=%q value=%q", got.Key(), got.Value())
+	}
+}
+
+func TestLoadOnMissPropagatesNotFoundFromSidecar(t *testing.T) {
+	hook := newTestDurableHook(t, newRecordingRing(), &stubControl{}, fenceAt(1, 1))
+	_, err := hook.LoadOnMiss(context.Background(), olricconfig.DurableOperation{
+		DMap: "users", Key: "missing", HKey: 1, Entry: newTestEntry("", "", 0, 0),
+	})
+	if !errors.Is(err, olricstorage.ErrKeyNotFound) {
+		t.Fatalf("expected ErrKeyNotFound, got %v", err)
+	}
+}
+
+func TestDrainForHandoffCallsDrainPartition(t *testing.T) {
+	c := &stubControl{}
+	hook := newTestDurableHook(t, newRecordingRing(), c, fenceAt(1, 1))
+	if err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{
+		DMap: "users", PartitionID: 7, PartitionCount: 271,
+	}); err != nil {
 		t.Fatalf("drain: %v", err)
 	}
-	if len(backing.handoffCalls) != 1 {
-		t.Fatalf("expected exactly one FlushHandoff call, got %d", len(backing.handoffCalls))
+	if len(c.drainCalls) != 1 {
+		t.Fatalf("expected one drain call, got %d", len(c.drainCalls))
 	}
-	got := backing.handoffCalls[0]
-	if len(got) != 3 {
-		t.Fatalf("expected 3 refs forwarded, got %d", len(got))
+	got := c.drainCalls[0]
+	if got.dmap != "users" || got.partitionID != 7 || got.partitionCount != 271 {
+		t.Fatalf("unexpected drain call: %+v", got)
 	}
-	for i, expected := range []uint64{101, 202, 303} {
-		if got[i].DMap != "users" || got[i].HKey != expected {
-			t.Fatalf("ref[%d] = %+v, expected dmap=users hkey=%d", i, got[i], expected)
+}
+
+func TestDrainForHandoffSurfacesError(t *testing.T) {
+	c := &stubControl{drainErr: errors.New("mysql is down")}
+	hook := newTestDurableHook(t, newRecordingRing(), c, fenceAt(1, 1))
+	err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{
+		DMap: "users", PartitionID: 0, PartitionCount: 1,
+	})
+	if err == nil || !errors.Is(err, c.drainErr) {
+		t.Fatalf("expected wrapped drain error, got %v", err)
+	}
+}
+
+func TestDrainForHandoffNoOpOnZeroPartitionCount(t *testing.T) {
+	c := &stubControl{}
+	hook := newTestDurableHook(t, newRecordingRing(), c, fenceAt(1, 1))
+	if err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{DMap: "users"}); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if len(c.drainCalls) != 0 {
+		t.Fatalf("expected no drain calls when PartitionCount=0, got %d", len(c.drainCalls))
+	}
+}
+
+func TestAppendRetriesOnTransientFull(t *testing.T) {
+	r := newRecordingRing()
+	r.errs = []error{ring.ErrRingFull, ring.ErrRingFull, nil}
+	hook := newTestDurableHook(t, r, &stubControl{}, fenceAt(1, 1))
+	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+		DMap: "users", Key: "k", HKey: 1, Entry: newTestEntry("k", "v", 0, 1),
+	})
+	if err != nil {
+		t.Fatalf("before set: %v", err)
+	}
+	if err := hook.AfterSet(context.Background(), op, nil); err != nil {
+		t.Fatalf("after set: %v", err)
+	}
+	if r.failCount != 2 {
+		t.Fatalf("expected 2 transient retries, got %d", r.failCount)
+	}
+	if len(r.snapshot()) != 1 {
+		t.Fatalf("expected eventual append success")
+	}
+}
+
+func TestAppendBudgetExceededReturnsError(t *testing.T) {
+	r := newRecordingRing()
+	for i := 0; i < 100; i++ {
+		r.errs = append(r.errs, ring.ErrRingFull)
+	}
+	hook, err := NewDurableHook(r, &stubControl{}, fenceAt(1, 1), newFakeFenceSequencer(), "test-writer", Config{AppendBudget: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("new hook: %v", err)
+	}
+	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+		DMap: "users", Key: "k", HKey: 1, Entry: newTestEntry("k", "v", 0, 1),
+	})
+	if err != nil {
+		t.Fatalf("before set: %v", err)
+	}
+	err = hook.AfterSet(context.Background(), op, nil)
+	if err == nil || !errors.Is(err, ring.ErrRingFull) {
+		t.Fatalf("expected ring full error after budget exceeded, got %v", err)
+	}
+}
+
+func TestFenceSequenceIsMonotonic(t *testing.T) {
+	r := newRecordingRing()
+	hook := newTestDurableHook(t, r, &stubControl{}, fenceAt(1, 1))
+	for i := 0; i < 3; i++ {
+		op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+			DMap: "users", Key: "alice", HKey: 1, Entry: newTestEntry("alice", "A", 0, int64(i)),
+		})
+		if err != nil {
+			t.Fatalf("before set %d: %v", i, err)
+		}
+		if err := hook.AfterSet(context.Background(), op, nil); err != nil {
+			t.Fatalf("after set %d: %v", i, err)
 		}
 	}
-}
-
-func TestDurableHookDrainForHandoffPrefersPartitionDrain(t *testing.T) {
-	backing := newRecordingCommitStore()
-	hook := newTestDurableHook(t, backing, fenceAt(1, 1))
-
-	err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{
-		DMap:           "users",
-		PartitionID:    7,
-		PartitionCount: 271,
-		HKeys:          []uint64{101},
-	})
-	if err != nil {
-		t.Fatalf("drain: %v", err)
+	got := r.snapshot()
+	if len(got) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(got))
 	}
-	if len(backing.partitionHandoffCalls) != 1 {
-		t.Fatalf("expected one partition drain call, got %d", len(backing.partitionHandoffCalls))
-	}
-	got := backing.partitionHandoffCalls[0]
-	if got.dmap != "users" || got.partitionID != 7 || got.partitionCount != 271 {
-		t.Fatalf("unexpected partition drain call: %+v", got)
-	}
-	if len(backing.handoffCalls) != 0 {
-		t.Fatalf("hkey fallback should not run when partition drain is available")
-	}
-}
-
-func TestDurableHookDrainForHandoffSurfacesFailure(t *testing.T) {
-	backing := newRecordingCommitStore()
-	backing.handoffErr = errors.New("mysql is down")
-	hook := newTestDurableHook(t, backing, fenceAt(1, 1))
-
-	err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{
-		DMap:  "users",
-		HKeys: []uint64{1},
-	})
-	if err == nil || !errors.Is(err, backing.handoffErr) {
-		t.Fatalf("expected wrapped handoff error, got %v", err)
-	}
-}
-
-func TestDurableHookDrainForHandoffNoOpOnEmpty(t *testing.T) {
-	backing := newRecordingCommitStore()
-	hook := newTestDurableHook(t, backing, fenceAt(1, 1))
-
-	if err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{DMap: "users"}); err != nil {
-		t.Fatalf("drain empty: %v", err)
-	}
-	if len(backing.handoffCalls) != 0 {
-		t.Fatalf("expected no FlushHandoff call for empty hkey set, got %d", len(backing.handoffCalls))
+	for i, payload := range got {
+		entry := decodeRing(t, payload)
+		if entry.OwnerSeq != int64(i+1) {
+			t.Fatalf("entry %d: expected OwnerSeq=%d, got %d", i, i+1, entry.OwnerSeq)
+		}
 	}
 }

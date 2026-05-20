@@ -9,6 +9,8 @@ import (
 	olricconfig "github.com/olric-data/olric/config"
 	olricstorage "github.com/olric-data/olric/pkg/storage"
 	"github.com/zhixiongdu/olricstack/internal/node"
+	"github.com/zhixiongdu/olricstack/internal/oplog"
+	"github.com/zhixiongdu/olricstack/internal/ring"
 	"github.com/zhixiongdu/olricstack/internal/store"
 )
 
@@ -17,51 +19,80 @@ import (
 // without spinning up a full topology subscription.
 type FenceLease interface {
 	SnapshotForWrite(now time.Time) (generation, epoch int64, ok bool)
-	// VerifyFence re-validates a previously snapshotted fence under the
-	// current lease. It is the in-lock barrier used by the fork after it
-	// acquires the per-fragment write lock and before it performs the
-	// in-memory mutation. See LeaseTracker.VerifyFence.
 	VerifyFence(generation, epoch int64, now time.Time) bool
 }
 
-// FenceSequencer issues monotonic owner sequences within a fence
-// (generation, epoch). It must persist its state so owner sequences cannot
-// regress across process restarts.
+// FenceSequencer issues monotonic owner sequences within a fence window.
 type FenceSequencer interface {
 	Stamp(generation, epoch int64) (g, e, s int64, err error)
 }
 
-// DurableHook is the owner-side implementation of olricconfig.DurableHook.
-//
-// Invariants enforced here:
-//
-//  1. Before* operations stamp a fence triple (G, E, S) into the prepared WAL
-//     record. The fence is read from the lease tracker and advanced by the
-//     persistent OwnerSequence. The lease check inside Before* is the LAST
-//     barrier between a still-valid serving lease and a durable record — it
-//     runs inside the Olric fragment lock, after the higher-level service
-//     gate, to close any window where the lease lapsed mid-call.
-//
-//  2. After*(op, mutErr) runs unconditionally:
-//     mutErr == nil ⇒ CommitEntry(WALSeq)
-//     mutErr != nil ⇒ AbortEntry(WALSeq)
-//     This makes prepared records that never reached cluster-wide success
-//     unflushable to MySQL, satisfying FT-1 and FT-2.
-//
-//  3. LoadOnMiss reads MySQL through the gated store. Fork-side fragment
-//     re-locking (see internal/dmap/get.go) discards a stale refill if a
-//     concurrent owner Set has already populated storage, satisfying FT-4.
-type DurableHook struct {
-	committer store.CommitStore
-	lease     FenceLease
-	sequence  FenceSequencer
-	writerID  string
-	now       func() time.Time
+// RingProducer is the subset of ring.Producer the hook needs. It is a tiny
+// interface so tests can substitute a recording double.
+type RingProducer interface {
+	Append(payload []byte) error
 }
 
-func NewDurableHook(committer store.CommitStore, lease FenceLease, sequence FenceSequencer, writerID string) (*DurableHook, error) {
-	if committer == nil {
-		return nil, errors.New("commit store is nil")
+// SidecarControl is the subset of the sidecar gRPC client the hook depends on
+// for the read-miss and handoff paths.
+type SidecarControl interface {
+	Notify(ctx context.Context, pending uint64) error
+	LoadFromMySQL(ctx context.Context, dmap, key string, hkey uint64) (record store.EntryRecord, found bool, err error)
+	DrainPartition(ctx context.Context, dmap string, partitionID, partitionCount uint64) error
+}
+
+// DurableHook is the node-side owner hook in the shm-oplog architecture.
+//
+// Invariants:
+//
+//  1. BeforeX stamps the fence (G, E) into op so VerifyAfterLock can verify
+//     it is still current after the fork acquires the fragment lock. No IPC,
+//     no WAL.
+//
+//  2. AfterX(op, mutErr): if mutErr != nil, do nothing — there is no prepared
+//     state to roll back. If mutErr == nil, stamp the owner sequence S,
+//     encode the oplog entry, and Append to the shm ring. Append returning
+//     success IS the durable acknowledgement returned to the RESP client. The
+//     ring being full triggers bounded retry (see appendWithBudget); a final
+//     failure surfaces to the caller.
+//
+//  3. LoadOnMiss is delegated to the sidecar over the control RPC. The hook
+//     does not produce any ring or WAL traffic for read-miss refills.
+//
+//  4. DrainForHandoff calls sidecar.DrainPartition synchronously. The fork
+//     holds the per-fragment write lock for the duration.
+type DurableHook struct {
+	ring         RingProducer
+	control      SidecarControl
+	lease        FenceLease
+	sequence     FenceSequencer
+	writerID     string
+	now          func() time.Time
+	appendBudget time.Duration
+}
+
+// Config tunes hook behavior. Zero values use sensible defaults.
+type Config struct {
+	// AppendBudget caps the total time AfterX will spend retrying ring
+	// Append when the ring is full. Returning before AppendBudget elapsed
+	// means either success or a non-retryable error. Default: 5s.
+	AppendBudget time.Duration
+	Now          func() time.Time
+}
+
+func (c Config) withDefaults() Config {
+	if c.AppendBudget <= 0 {
+		c.AppendBudget = 5 * time.Second
+	}
+	if c.Now == nil {
+		c.Now = time.Now
+	}
+	return c
+}
+
+func NewDurableHook(ring RingProducer, control SidecarControl, lease FenceLease, sequence FenceSequencer, writerID string, cfg Config) (*DurableHook, error) {
+	if ring == nil {
+		return nil, errors.New("ring producer is nil")
 	}
 	if lease == nil {
 		return nil, errors.New("fence lease is nil")
@@ -72,105 +103,62 @@ func NewDurableHook(committer store.CommitStore, lease FenceLease, sequence Fenc
 	if writerID == "" {
 		return nil, errors.New("writer id is required")
 	}
+	cfg = cfg.withDefaults()
 	return &DurableHook{
-		committer: committer,
-		lease:     lease,
-		sequence:  sequence,
-		writerID:  writerID,
-		now:       time.Now,
+		ring:         ring,
+		control:      control,
+		lease:        lease,
+		sequence:     sequence,
+		writerID:     writerID,
+		now:          cfg.Now,
+		appendBudget: cfg.AppendBudget,
 	}, nil
 }
 
-func (h *DurableHook) BeforeSet(ctx context.Context, op olricconfig.DurableOperation) (olricconfig.DurableOperation, error) {
+func (h *DurableHook) BeforeSet(_ context.Context, op olricconfig.DurableOperation) (olricconfig.DurableOperation, error) {
 	if op.Entry == nil {
 		return op, errors.New("durable set entry is nil")
 	}
-	record, err := h.fencedRecord(op, op.Entry, "client_set", true)
-	if err != nil {
-		return op, err
-	}
-	prepared, err := h.committer.PrepareEntry(ctx, record)
-	if err != nil {
-		return op, err
-	}
-	op.Version = prepared.WALSeq
-	op.FenceGeneration = record.Generation
-	op.FenceEpoch = record.Epoch
-	op.FenceOwnerSeq = record.OwnerSeq
-	return op, nil
+	return h.stamp(op)
 }
 
 func (h *DurableHook) AfterSet(ctx context.Context, op olricconfig.DurableOperation, mutationErr error) error {
-	return h.finalize(ctx, op, mutationErr)
+	if mutationErr != nil {
+		return nil
+	}
+	return h.publish(ctx, op, oplog.OpSet)
 }
 
-func (h *DurableHook) BeforeDelete(ctx context.Context, op olricconfig.DurableOperation) (olricconfig.DurableOperation, error) {
-	g, e, s, err := h.stampFence()
-	if err != nil {
-		return op, err
-	}
-	record := store.EntryRecord{
-		DMap:       op.DMap,
-		Key:        op.Key,
-		HKey:       op.HKey,
-		Tombstone:  true,
-		Origin:     "client_delete",
-		FlushMySQL: true,
-		Generation: g,
-		Epoch:      e,
-		OwnerSeq:   s,
-		WriterID:   h.writerID,
-		UpdatedAt:  h.now().UTC(),
-	}
-	prepared, err := h.committer.PrepareEntry(ctx, record)
-	if err != nil {
-		return op, err
-	}
-	op.Version = prepared.WALSeq
-	op.FenceGeneration = g
-	op.FenceEpoch = e
-	op.FenceOwnerSeq = s
-	return op, nil
+func (h *DurableHook) BeforeDelete(_ context.Context, op olricconfig.DurableOperation) (olricconfig.DurableOperation, error) {
+	return h.stamp(op)
 }
 
 func (h *DurableHook) AfterDelete(ctx context.Context, op olricconfig.DurableOperation, mutationErr error) error {
-	return h.finalize(ctx, op, mutationErr)
+	if mutationErr != nil {
+		return nil
+	}
+	return h.publish(ctx, op, oplog.OpDelete)
 }
 
-func (h *DurableHook) BeforeExpire(ctx context.Context, op olricconfig.DurableOperation) (olricconfig.DurableOperation, error) {
+func (h *DurableHook) BeforeExpire(_ context.Context, op olricconfig.DurableOperation) (olricconfig.DurableOperation, error) {
 	if op.Entry == nil {
 		return op, errors.New("durable expire entry is nil")
 	}
-	record, err := h.fencedRecord(op, op.Entry, "client_expire", true)
-	if err != nil {
-		return op, err
-	}
-	prepared, err := h.committer.PrepareEntry(ctx, record)
-	if err != nil {
-		return op, err
-	}
-	op.Version = prepared.WALSeq
-	op.FenceGeneration = record.Generation
-	op.FenceEpoch = record.Epoch
-	op.FenceOwnerSeq = record.OwnerSeq
-	return op, nil
+	return h.stamp(op)
 }
 
 func (h *DurableHook) AfterExpire(ctx context.Context, op olricconfig.DurableOperation, mutationErr error) error {
-	return h.finalize(ctx, op, mutationErr)
+	if mutationErr != nil {
+		return nil
+	}
+	return h.publish(ctx, op, oplog.OpExpire)
 }
 
-// VerifyAfterLock re-validates the fence previously stamped by BeforeSet /
-// BeforeDelete / BeforeExpire. It is called by the fork inside the per-
-// fragment lock immediately before the in-memory mutation. The check is the
-// last barrier preserving S5: if leadership moved or the lease expired
-// between the prepared WAL append and the lock acquisition, the prepared
-// record must be aborted (the fork follows a non-nil return with an
-// AfterX(op, err) call which routes through finalize -> AbortEntry).
-//
-// Hooks that did not stamp a fence (op.FenceGeneration == 0) get a no-op:
-// VerifyAfterLock only matters when there is a prepared record to abort.
-func (h *DurableHook) VerifyAfterLock(ctx context.Context, op olricconfig.DurableOperation) error {
+// VerifyAfterLock re-checks that the fence stamped by BeforeX is still valid
+// under the current lease. A failure here forces the fork to skip the
+// mutation; AfterX will then run with mutationErr != nil and we will not
+// publish to the ring.
+func (h *DurableHook) VerifyAfterLock(_ context.Context, op olricconfig.DurableOperation) error {
 	if op.FenceGeneration == 0 {
 		return nil
 	}
@@ -180,17 +168,17 @@ func (h *DurableHook) VerifyAfterLock(ctx context.Context, op olricconfig.Durabl
 	return nil
 }
 
+// LoadOnMiss serves the fork's miss-path read by asking the sidecar.
 func (h *DurableHook) LoadOnMiss(ctx context.Context, op olricconfig.DurableOperation) (olricstorage.Entry, error) {
-	// LoadOnMiss runs unlocked from the fork's perspective. Fork-side
-	// re-locking + storage re-check (internal/dmap/get.go) discards this
-	// entry if a concurrent Set has already populated the fragment, so we
-	// do not need to re-read the lease here.
-	record, err := h.committer.(store.CacheStore).LoadEntry(ctx, store.EntryRef{DMap: op.DMap, Key: op.Key, HKey: op.HKey})
+	if h.control == nil {
+		return nil, olricstorage.ErrKeyNotFound
+	}
+	record, found, err := h.control.LoadFromMySQL(ctx, op.DMap, op.Key, op.HKey)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return nil, olricstorage.ErrKeyNotFound
-		}
 		return nil, fmt.Errorf("durable load miss: %w", err)
+	}
+	if !found {
+		return nil, olricstorage.ErrKeyNotFound
 	}
 	entry := op.Entry
 	if entry == nil {
@@ -200,112 +188,99 @@ func (h *DurableHook) LoadOnMiss(ctx context.Context, op olricconfig.DurableOper
 	return entry, nil
 }
 
-// DrainForHandoff flushes every committed WAL record for the migrating
-// fragment to MySQL synchronously, so the new owner can take over without
-// the old WAL holding writes that have already been acknowledged. The fork
-// calls this from inside the per-fragment write lock during partition
-// rebalance, so no concurrent BeforeX/AfterX runs against this partition.
-//
-// A non-nil return aborts the migration. The fork then leaves the fragment
-// in place; the cluster balancer is expected to retry. Aborting on drain
-// failure is preferable to handing off with stale dirty WAL because:
-//
-//   - The new owner has no view of these records, so a client GET on the
-//     new owner would miss until the old owner's flusher catches up.
-//   - If the old owner is then evicted or its WAL volume is wiped, the
-//     unflushed write is lost.
-//
-// We prefer partition-scoped draining because the in-memory resident hkey set
-// does not include tombstones or evicted-but-dirty records. The older hkey-list
-// path remains as a compatibility fallback for test doubles and non-partition
-// stores.
+// DrainForHandoff blocks until the sidecar has flushed every pending entry
+// for the migrating fragment to MySQL.
 func (h *DurableHook) DrainForHandoff(ctx context.Context, handoff olricconfig.DurableHandoff) error {
-	type partitionDrainer interface {
-		FlushHandoffPartition(context.Context, string, uint64, uint64) error
-	}
-	if flusher, ok := h.committer.(partitionDrainer); ok && handoff.PartitionCount > 0 {
-		if err := flusher.FlushHandoffPartition(ctx, handoff.DMap, handoff.PartitionID, handoff.PartitionCount); err != nil {
-			return fmt.Errorf("drain partition %d for %s: %w", handoff.PartitionID, handoff.DMap, err)
-		}
+	if h.control == nil {
 		return nil
 	}
-	if len(handoff.HKeys) == 0 {
+	if handoff.PartitionCount == 0 {
 		return nil
 	}
-	type refDrainer interface {
-		FlushHandoff(context.Context, []store.EntryRef) error
-	}
-	flusher, ok := h.committer.(refDrainer)
-	if !ok {
-		return nil
-	}
-	refs := make([]store.EntryRef, 0, len(handoff.HKeys))
-	for _, hkey := range handoff.HKeys {
-		refs = append(refs, store.EntryRef{DMap: handoff.DMap, HKey: hkey})
-	}
-	if err := flusher.FlushHandoff(ctx, refs); err != nil {
+	if err := h.control.DrainPartition(ctx, handoff.DMap, handoff.PartitionID, handoff.PartitionCount); err != nil {
 		return fmt.Errorf("drain partition %d for %s: %w", handoff.PartitionID, handoff.DMap, err)
 	}
 	return nil
 }
 
-func (h *DurableHook) fencedRecord(op olricconfig.DurableOperation, entry olricstorage.Entry, origin string, flush bool) (store.EntryRecord, error) {
-	g, e, s, err := h.stampFence()
-	if err != nil {
-		return store.EntryRecord{}, err
-	}
-	now := h.now()
-	return store.EntryRecord{
-		DMap:         op.DMap,
-		Key:          op.Key,
-		HKey:         op.HKey,
-		EncodedEntry: entry.Encode(),
-		TTL:          entry.TTL(),
-		Timestamp:    entry.Timestamp(),
-		Origin:       origin,
-		FlushMySQL:   flush,
-		Generation:   g,
-		Epoch:        e,
-		OwnerSeq:     s,
-		WriterID:     h.writerID,
-		UpdatedAt:    now.UTC(),
-	}, nil
-}
-
-func (h *DurableHook) stampFence() (int64, int64, int64, error) {
+func (h *DurableHook) stamp(op olricconfig.DurableOperation) (olricconfig.DurableOperation, error) {
 	g, e, ok := h.lease.SnapshotForWrite(h.now())
 	if !ok {
-		return 0, 0, 0, ErrLeaseExpired
+		return op, ErrLeaseExpired
 	}
-	gen, ep, seq, err := h.sequence.Stamp(g, e)
+	op.FenceGeneration = g
+	op.FenceEpoch = e
+	return op, nil
+}
+
+func (h *DurableHook) publish(ctx context.Context, op olricconfig.DurableOperation, kind oplog.Op) error {
+	g, e, s, err := h.sequence.Stamp(op.FenceGeneration, op.FenceEpoch)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("fence stamp: %w", err)
+		return fmt.Errorf("stamp owner seq: %w", err)
 	}
-	return gen, ep, seq, nil
+	entry := oplog.Entry{
+		Op:                kind,
+		DMap:              op.DMap,
+		Key:               op.Key,
+		HKey:              op.HKey,
+		Generation:        g,
+		Epoch:             e,
+		OwnerSeq:          s,
+		WriterID:          h.writerID,
+		UpdatedAtUnixNano: h.now().UTC().UnixNano(),
+	}
+	if op.Entry != nil {
+		entry.EncodedEntry = op.Entry.Encode()
+		entry.TTL = op.Entry.TTL()
+		entry.Timestamp = op.Entry.Timestamp()
+	}
+	payload, err := oplog.Encode(entry)
+	if err != nil {
+		return fmt.Errorf("encode oplog: %w", err)
+	}
+	if err := h.appendWithBudget(ctx, payload); err != nil {
+		return err
+	}
+	if h.control != nil {
+		_ = h.control.Notify(ctx, uint64(len(payload)))
+	}
+	return nil
 }
 
-func (h *DurableHook) finalize(ctx context.Context, op olricconfig.DurableOperation, mutationErr error) error {
-	if op.Version == 0 {
-		// BeforeX never returned a WALSeq (e.g. the prepare itself errored
-		// before the WAL append). Nothing to commit or abort.
-		return mutationErr
-	}
-	ref := store.EntryRef{DMap: op.DMap, Key: op.Key, HKey: op.HKey}
-	if mutationErr != nil {
-		// Use background context: the request context may already be
-		// cancelled, but the WAL must be cleaned up regardless.
-		if err := h.committer.AbortEntry(context.Background(), ref, op.Version); err != nil {
-			return fmt.Errorf("abort prepared record after mutation failure (%v): %w", mutationErr, err)
+// appendWithBudget retries ring.Append while the ring reports full, up to
+// h.appendBudget total wall time. The retry budget is bounded because the
+// caller's request context (RESP timeout, e.g.) is also bounded.
+func (h *DurableHook) appendWithBudget(ctx context.Context, payload []byte) error {
+	deadline := h.now().Add(h.appendBudget)
+	backoff := time.Millisecond
+	for {
+		err := h.ring.Append(payload)
+		if err == nil {
+			return nil
 		}
-		return nil
+		if !errors.Is(err, ErrRingFull) {
+			return fmt.Errorf("ring append: %w", err)
+		}
+		if h.now().After(deadline) {
+			return fmt.Errorf("ring append: %w (budget exceeded)", err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 20*time.Millisecond {
+			backoff *= 2
+		}
 	}
-	return h.committer.CommitEntry(ctx, ref, op.Version)
 }
 
-// Compile-time guards: the hook satisfies the fork's contract, and node-side
-// types satisfy the fence dependencies.
+// ErrRingFull is re-exported from internal/ring so callers don't need to
+// import the ring package just to test for the back-pressure condition.
+var ErrRingFull = ring.ErrRingFull
+
+// Compile-time guards.
 var (
 	_ olricconfig.DurableHook = (*DurableHook)(nil)
 	_ FenceLease              = (*node.LeaseTracker)(nil)
-	_ FenceSequencer          = (*node.OwnerSequence)(nil)
 )

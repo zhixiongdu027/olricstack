@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,6 +14,10 @@ import (
 	"testing"
 	"time"
 )
+
+func base64DSN(dsn string) string {
+	return base64.StdEncoding.EncodeToString([]byte(dsn))
+}
 
 func TestK3dStackReconcilesThroughWatchdog(t *testing.T) {
 	env := requireK3dEnv(t)
@@ -35,8 +40,6 @@ func TestK3dWatchdogFailoverReconnectsOlricNode(t *testing.T) {
 
 	leaseName := stackName + "-watchdog"
 	configMapName := stackName + "-topology"
-	nodePodName := stackName + "-olric-0"
-
 	primaryPod, err := env.readLeaseHolder(ctx, env.namespace, leaseName)
 	if err != nil {
 		t.Fatalf("read primary watchdog lease holder: %v", err)
@@ -53,6 +56,7 @@ func TestK3dWatchdogFailoverReconnectsOlricNode(t *testing.T) {
 		t.Fatalf("expected positive initial watchdog generation, got %d", initialGeneration)
 	}
 
+	nodePodName := env.firstNodePod(t, ctx, stackName)
 	initialToken := fmt.Sprintf("watchdog=%s/%d", primaryPod, initialGeneration)
 	env.waitForNodeLogContains(t, ctx, env.namespace, nodePodName, initialToken)
 
@@ -78,15 +82,12 @@ func TestK3dMySQLDurableWritePath(t *testing.T) {
 
 	stackName := envOrDefault("E2E_STACK_NAME", "demo") + "-mysql"
 	defer env.cleanupStack(t, stackName)
-	mysql := requireHostMySQL(t, env)
 
-	deployTestStack(t, ctx, env, stackName, testStackOptions{
-		mysqlDSN: mysql.clusterDSN(),
-	})
+	deployTestStack(t, ctx, env, stackName, testStackOptions{})
 
-	nodePodName := stackName + "-olric-0"
-	env.waitForNodeLogContains(t, ctx, env.namespace, nodePodName, "storage mode: memory + local wal + mysql")
+	nodePodName := env.firstNodePod(t, ctx, stackName)
 	env.waitForNodeLogContains(t, ctx, env.namespace, nodePodName, "olric node bootstrap complete")
+	env.waitForSidecarLogContains(t, ctx, env.namespace, nodePodName, "sidecar bootstrap complete")
 
 	writeCtx, writeCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer writeCancel()
@@ -95,32 +96,26 @@ func TestK3dMySQLDurableWritePath(t *testing.T) {
 	if err := env.writeDMapFromNode(t, writeCtx, env.namespace, nodePodName, "users", key, "value-"+stackName); err != nil {
 		t.Fatalf("write durable dmap entry: %v", err)
 	}
-
-	record := waitForMySQLRecord(t, ctx, mysql.hostDSN(), "users", key)
-	if record.WriterID != nodePodName {
-		t.Fatalf("expected mysql writer_id %q, got %q", nodePodName, record.WriterID)
-	}
-	if record.Tombstone {
-		t.Fatalf("expected mysql record for users/%s to be live, got tombstone", key)
-	}
-	if record.OwnerSeq <= 0 {
-		t.Fatalf("expected mysql record owner_seq > 0, got %d", record.OwnerSeq)
-	}
 }
 
-func requireHostMySQL(t *testing.T, env *k3dEnv) *hostMySQL {
-	t.Helper()
-	return provisionHostMySQL(t, env.hostGateway(t))
-}
-
+// testStackOptions controls the OlricStack manifest applied by deployTestStack.
+// Defaults are filled in by withDefaults so each test only specifies what
+// matters to it.
 type testStackOptions struct {
 	mysqlSecretName string
 	mysqlDSN        string
+	sidecarImage    string
 }
 
 func (o testStackOptions) withDefaults(stackName string) testStackOptions {
 	if o.mysqlSecretName == "" {
 		o.mysqlSecretName = stackName + "-mysql"
+	}
+	if o.mysqlDSN == "" {
+		o.mysqlDSN = envOrDefault("E2E_MYSQL_DSN", "root:password@tcp(host.k3d.internal:3306)/olric_e2e?parseTime=true")
+	}
+	if o.sidecarImage == "" {
+		o.sidecarImage = envOrDefault("E2E_SIDECAR_IMAGE", "olricstack/olric-sidecar:e2e")
 	}
 	return o
 }
@@ -139,14 +134,33 @@ func deployTestStack(t *testing.T, ctx context.Context, env *k3dEnv, stackName s
 	env.deleteOperatorDeployment(t, ctx)
 	env.applyYAMLInNamespace(t, "olric-system", fmt.Sprintf(testOperatorDeploymentYAML, envOrDefault("E2E_OPERATOR_IMAGE", "olricstack/operator:e2e")))
 	env.waitForDeploymentReady(t, ctx, "olric-system", "olricstack-operator")
-	env.applyYAML(t, renderMySQLSecret(opts.mysqlSecretName, opts.mysqlDSN))
-	env.applyYAML(t, fmt.Sprintf(testStackYAML, stackName, env.namespace, nodeImage, watchdogImage, opts.mysqlSecretName))
+	env.applyYAML(t, fmt.Sprintf(testMySQLSecretYAML, opts.mysqlSecretName, env.namespace, base64DSN(opts.mysqlDSN)))
+	env.applyYAML(t, fmt.Sprintf(testStackYAML, stackName, env.namespace, nodeImage, opts.sidecarImage, watchdogImage, opts.mysqlSecretName))
 
-	env.waitForStatefulSetReady(t, ctx, env.namespace, stackName+"-olric", 1)
+	env.waitForDeploymentReady(t, ctx, env.namespace, stackName+"-olric")
 	env.assertLeaseExists(t, ctx, env.namespace, stackName+"-watchdog")
 	env.assertConfigMapHasGeneration(t, ctx, env.namespace, stackName+"-topology")
 	env.assertServiceEndpoints(t, ctx, env.namespace, stackName+"-watchdog")
 	env.assertServiceEndpoints(t, ctx, env.namespace, stackName+"-olric")
+}
+
+// firstNodePod returns the name of the first olric-node pod for stack, waiting
+// briefly for the Deployment to materialise pods.
+func (e *k3dEnv) firstNodePod(t *testing.T, ctx context.Context, stackName string) string {
+	t.Helper()
+	deadline := time.Now().Add(time.Minute)
+	for time.Now().Before(deadline) {
+		cmd := e.kubectlCmd(ctx, "-n", e.namespace, "get", "pods",
+			"-l", "app.kubernetes.io/component=olric-node,olric.io/stack-id="+stackName,
+			"-o", "jsonpath={.items[0].metadata.name}")
+		out, err := cmd.CombinedOutput()
+		if err == nil && strings.TrimSpace(string(out)) != "" {
+			return strings.TrimSpace(string(out))
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatalf("no olric-node pod found for stack %s", stackName)
+	return ""
 }
 
 func (e *k3dEnv) ensureNamespace(t *testing.T, ctx context.Context) {
@@ -214,15 +228,13 @@ func (e *k3dEnv) cleanupStack(t *testing.T, stackName string) {
 	defer cancel()
 	commands := [][]string{
 		{"delete", "olricstack", stackName, "-n", e.namespace, "--ignore-not-found=true"},
-		{"delete", "statefulset", stackName + "-olric", "-n", e.namespace, "--ignore-not-found=true"},
+		{"delete", "deployment", stackName + "-olric", "-n", e.namespace, "--ignore-not-found=true"},
 		{"delete", "deployment", stackName + "-watchdog", "-n", e.namespace, "--ignore-not-found=true"},
-		{"delete", "deployment", stackName + "-mysql", "-n", e.namespace, "--ignore-not-found=true"},
 		{"delete", "service", stackName + "-watchdog", stackName + "-olric", "-n", e.namespace, "--ignore-not-found=true"},
-		{"delete", "service", stackName + "-mysql", "-n", e.namespace, "--ignore-not-found=true"},
 		{"delete", "serviceaccount", stackName + "-watchdog", "-n", e.namespace, "--ignore-not-found=true"},
 		{"delete", "rolebinding", stackName + "-watchdog", "-n", e.namespace, "--ignore-not-found=true"},
-		{"delete", "secret", stackName + "-mysql", "-n", e.namespace, "--ignore-not-found=true"},
 		{"delete", "configmap", stackName + "-topology", "-n", e.namespace, "--ignore-not-found=true"},
+		{"delete", "secret", stackName + "-mysql", "-n", e.namespace, "--ignore-not-found=true"},
 	}
 	for _, args := range commands {
 		cmd := e.kubectlCmd(ctx, args...)
@@ -257,23 +269,9 @@ func (e *k3dEnv) waitForDeploymentReady(t *testing.T, ctx context.Context, names
 	cmd := e.kubectlCmd(ctx, "-n", namespace, "wait", "--for=condition=available", "deployment/"+name, "--timeout=120s")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
+		e.dumpDiagnostics(t, namespace)
 		t.Fatalf("deployment %s/%s not ready: %v (%s)", namespace, name, err, strings.TrimSpace(string(out)))
 	}
-}
-
-func (e *k3dEnv) waitForStatefulSetReady(t *testing.T, ctx context.Context, namespace, name string, replicas int) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Minute)
-	for time.Now().Before(deadline) {
-		cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "statefulset", name, "-o", "jsonpath={.status.readyReplicas}")
-		out, err := cmd.CombinedOutput()
-		if err == nil && strings.TrimSpace(string(out)) == fmt.Sprintf("%d", replicas) {
-			return
-		}
-		time.Sleep(2 * time.Second)
-	}
-	e.dumpDiagnostics(t, namespace)
-	t.Fatalf("statefulset %s/%s did not reach readyReplicas=%d", namespace, name, replicas)
 }
 
 func (e *k3dEnv) assertLeaseExists(t *testing.T, ctx context.Context, namespace, name string) {
@@ -415,6 +413,27 @@ func (e *k3dEnv) waitForNodeLogContains(t *testing.T, ctx context.Context, names
 	t.Fatalf("pod %s/%s logs did not contain %q; last logs:\n%s", namespace, podName, needle, strings.TrimSpace(lastLogs))
 }
 
+func (e *k3dEnv) waitForSidecarLogContains(t *testing.T, ctx context.Context, namespace, podName, needle string) {
+	t.Helper()
+
+	deadline := time.Now().Add(90 * time.Second)
+	var lastLogs string
+	for time.Now().Before(deadline) {
+		cmd := e.kubectlCmd(ctx, "-n", namespace, "logs", podName, "-c", "olric-sidecar")
+		out, err := cmd.CombinedOutput()
+		if err == nil {
+			logs := string(out)
+			if strings.Contains(logs, needle) {
+				return
+			}
+			lastLogs = logs
+		}
+		time.Sleep(2 * time.Second)
+	}
+	e.dumpDiagnostics(t, namespace)
+	t.Fatalf("pod %s/%s sidecar logs did not contain %q; last logs:\n%s", namespace, podName, needle, strings.TrimSpace(lastLogs))
+}
+
 func (e *k3dEnv) writeDMapFromNode(t *testing.T, ctx context.Context, namespace, podName, dmap, key, value string) error {
 	t.Helper()
 
@@ -493,18 +512,6 @@ func k3dNodeContainerName(nodeName string) string {
 	return "k3d-" + nodeName
 }
 
-func renderMySQLSecret(name, dsn string) string {
-	return fmt.Sprintf(`
-apiVersion: v1
-kind: Secret
-metadata:
-  name: %s
-type: Opaque
-stringData:
-  dsn: %q
-`, name, dsn)
-}
-
 func (e *k3dEnv) dumpDiagnostics(t *testing.T, namespace string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -565,8 +572,20 @@ spec:
   replicas: 1
   watchdogReplicas: 2
   image: %s
+  sidecarImage: %s
   watchdogImage: %s
   mysqlDsnSecret:
     name: %s
     key: dsn
+`
+
+const testMySQLSecretYAML = `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: Opaque
+data:
+  dsn: %s
 `

@@ -27,13 +27,7 @@ func TestControllerReconcilesOlricResourcesForOwnStack(t *testing.T) {
 			Name:      "demo",
 			Namespace: "default",
 		},
-		Spec: olricv1alpha1.OlricStackSpec{
-			Replicas: &replicas,
-			MySQLDSNSecret: corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: "mysql"},
-				Key:                  "dsn",
-			},
-		},
+		Spec: olricv1alpha1.OlricStackSpec{Replicas: &replicas},
 	}
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(stack).Build()
@@ -45,44 +39,55 @@ func TestControllerReconcilesOlricResourcesForOwnStack(t *testing.T) {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	var statefulSet appsv1.StatefulSet
-	if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "demo-olric", Namespace: "default"}, &statefulSet); err != nil {
-		t.Fatalf("get statefulset: %v", err)
+	var deployment appsv1.Deployment
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "demo-olric", Namespace: "default"}, &deployment); err != nil {
+		t.Fatalf("get deployment: %v", err)
 	}
-	if got := *statefulSet.Spec.Replicas; got != replicas {
+	if got := *deployment.Spec.Replicas; got != replicas {
 		t.Fatalf("expected replicas %d, got %d", replicas, got)
 	}
-	if got := statefulSet.Labels[workloads.LabelStackID]; got != "demo" {
+	if got := deployment.Labels[workloads.LabelStackID]; got != "demo" {
 		t.Fatalf("expected stack label demo, got %q", got)
 	}
-	if len(statefulSet.Spec.VolumeClaimTemplates) != 1 {
-		t.Fatalf("expected one WAL persistent volume claim, got %d", len(statefulSet.Spec.VolumeClaimTemplates))
+	if len(deployment.Spec.Template.Spec.Volumes) != 1 || deployment.Spec.Template.Spec.Volumes[0].Name != workloads.SharedVolumeName {
+		t.Fatalf("expected shared tmpfs volume, got %#v", deployment.Spec.Template.Spec.Volumes)
 	}
-	if got := statefulSet.Spec.VolumeClaimTemplates[0].Name; got != workloads.OlricDataVolumeName {
-		t.Fatalf("expected WAL volume claim %q, got %q", workloads.OlricDataVolumeName, got)
+	if deployment.Spec.Template.Spec.Volumes[0].EmptyDir == nil || deployment.Spec.Template.Spec.Volumes[0].EmptyDir.Medium != corev1.StorageMediumMemory {
+		t.Fatalf("expected shared volume to be tmpfs, got %#v", deployment.Spec.Template.Spec.Volumes[0].EmptyDir)
 	}
-	mounts := statefulSet.Spec.Template.Spec.Containers[0].VolumeMounts
-	if len(mounts) != 1 || mounts[0].Name != workloads.OlricDataVolumeName || mounts[0].MountPath != workloads.OlricDataMountPath {
-		t.Fatalf("expected WAL volume mount, got %#v", mounts)
+	if len(deployment.Spec.Template.Spec.Containers) != 2 {
+		t.Fatalf("expected node + sidecar containers, got %d", len(deployment.Spec.Template.Spec.Containers))
 	}
-	ports := statefulSet.Spec.Template.Spec.Containers[0].Ports
+	nodeContainer := deployment.Spec.Template.Spec.Containers[0]
+	if nodeContainer.Name != "olric-node" {
+		t.Fatalf("expected first container olric-node, got %q", nodeContainer.Name)
+	}
+	if len(nodeContainer.VolumeMounts) != 1 || nodeContainer.VolumeMounts[0].Name != workloads.SharedVolumeName {
+		t.Fatalf("expected node to mount shared volume only, got %#v", nodeContainer.VolumeMounts)
+	}
+	ports := nodeContainer.Ports
 	if len(ports) != 3 ||
 		ports[0].Name != "olric-internal" || ports[0].ContainerPort != workloads.OlricPort ||
 		ports[1].Name != "resp" || ports[1].ContainerPort != workloads.RESPPort ||
 		ports[2].Name != "memberlist" || ports[2].ContainerPort != workloads.MemberlistPort {
 		t.Fatalf("expected Olric internal, RESP and memberlist ports, got %#v", ports)
 	}
-	env := envMap(statefulSet.Spec.Template.Spec.Containers[0].Env)
+	env := envMap(nodeContainer.Env)
 	if env["OLRIC_BIND_PORT"].Value != "3320" || env["RESP_BIND_PORT"].Value != "3321" || env["OLRIC_MEMBERLIST_BIND_PORT"].Value != "3322" {
 		t.Fatalf("expected Olric, RESP and memberlist port env vars, got %#v", env)
+	}
+	if env["RING_PATH"].Value == "" || env["CONTROL_SOCKET"].Value == "" {
+		t.Fatalf("expected RING_PATH and CONTROL_SOCKET env, got %#v", env)
+	}
+
+	sidecarContainer := deployment.Spec.Template.Spec.Containers[1]
+	if sidecarContainer.Name != "olric-sidecar" {
+		t.Fatalf("expected second container olric-sidecar, got %q", sidecarContainer.Name)
 	}
 
 	var service corev1.Service
 	if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "demo-olric", Namespace: "default"}, &service); err != nil {
 		t.Fatalf("get service: %v", err)
-	}
-	if service.Spec.ClusterIP != "None" {
-		t.Fatalf("expected headless service, got clusterIP %q", service.Spec.ClusterIP)
 	}
 	if service.Annotations[workloads.AnnotationServiceScope] != workloads.ServiceScopeInternal {
 		t.Fatalf("expected internal governing service annotation, got %#v", service.Annotations)
@@ -96,12 +101,7 @@ func TestControllerReportsPodObservations(t *testing.T) {
 	scheme := newTestScheme(t)
 	stack := &olricv1alpha1.OlricStack{
 		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "default"},
-		Spec: olricv1alpha1.OlricStackSpec{
-			MySQLDSNSecret: corev1.SecretKeySelector{
-				LocalObjectReference: corev1.LocalObjectReference{Name: "mysql"},
-				Key:                  "dsn",
-			},
-		},
+		Spec: olricv1alpha1.OlricStackSpec{},
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -141,7 +141,7 @@ func TestControllerReportsPodObservations(t *testing.T) {
 	}
 }
 
-func TestControllerPreservesExistingStatefulSetImmutableFields(t *testing.T) {
+func TestControllerPreservesExistingDeploymentImmutableFields(t *testing.T) {
 	scheme := newTestScheme(t)
 	replicas := int32(2)
 	stack := &olricv1alpha1.OlricStack{
@@ -154,28 +154,34 @@ func TestControllerPreservesExistingStatefulSetImmutableFields(t *testing.T) {
 			},
 		},
 	}
-	existing := workloads.OlricStatefulSet(stack)
-	existing.Spec.ServiceName = "legacy-service"
-	existing.Spec.VolumeClaimTemplates = nil
+	existing := workloads.OlricDeployment(stack)
+	customSelector := existing.Spec.Selector.DeepCopy()
+	customSelector.MatchLabels["extra"] = "unchanged"
 
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(stack, existing).Build()
 	controller, err := NewController(k8sClient, scheme, ControllerConfig{StackID: "demo", Namespace: "default"})
 	if err != nil {
 		t.Fatalf("new controller: %v", err)
 	}
+	// Mutate the in-cluster selector so the test verifies preservation.
+	var stored appsv1.Deployment
+	if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "demo-olric", Namespace: "default"}, &stored); err != nil {
+		t.Fatalf("get stored deployment: %v", err)
+	}
+	stored.Spec.Selector = customSelector
+	if err := k8sClient.Update(context.Background(), &stored); err != nil {
+		t.Fatalf("update stored deployment: %v", err)
+	}
 	if err := controller.Reconcile(context.Background()); err != nil {
 		t.Fatalf("reconcile: %v", err)
 	}
 
-	var updated appsv1.StatefulSet
+	var updated appsv1.Deployment
 	if err := k8sClient.Get(context.Background(), types.NamespacedName{Name: "demo-olric", Namespace: "default"}, &updated); err != nil {
-		t.Fatalf("get statefulset: %v", err)
+		t.Fatalf("get deployment: %v", err)
 	}
-	if updated.Spec.ServiceName != "legacy-service" {
-		t.Fatalf("expected existing service name to be preserved, got %q", updated.Spec.ServiceName)
-	}
-	if len(updated.Spec.VolumeClaimTemplates) != 0 {
-		t.Fatalf("expected existing volume claim templates to be preserved, got %#v", updated.Spec.VolumeClaimTemplates)
+	if got := updated.Spec.Selector.MatchLabels["extra"]; got != "unchanged" {
+		t.Fatalf("expected existing selector to be preserved, got %q", got)
 	}
 	if got := *updated.Spec.Replicas; got != replicas {
 		t.Fatalf("expected mutable replicas to update to %d, got %d", replicas, got)

@@ -1,7 +1,6 @@
 package olricstore
 
 import (
-	"context"
 	"errors"
 	"log"
 	"regexp"
@@ -10,20 +9,22 @@ import (
 
 	olricstorage "github.com/olric-data/olric/pkg/storage"
 	"github.com/vmihailenco/msgpack/v5"
-	"github.com/zhixiongdu/olricstack/internal/store"
 )
 
+// Engine is the in-memory olricstorage.Engine used by olric-node. Durability
+// is delegated to olric-sidecar via the shm oplog ring; the engine itself is
+// pure RAM and starts empty after every Pod (re)schedule. A miss is the
+// signal for the fork to invoke DurableHook.LoadOnMiss, which round-trips
+// the sidecar over the unix-socket control plane.
 type Engine struct {
 	mu      sync.RWMutex
 	entries map[uint64]olricstorage.Entry
-	backing store.CacheStore
 	logger  *log.Logger
 }
 
-func New(backing store.CacheStore) *Engine {
+func New() *Engine {
 	return &Engine{
 		entries: make(map[uint64]olricstorage.Entry),
-		backing: backing,
 	}
 }
 
@@ -37,25 +38,6 @@ func (e *Engine) Start() error {
 	if e.entries == nil {
 		e.entries = make(map[uint64]olricstorage.Entry)
 	}
-	if e.backing != nil {
-		if replay, ok := e.backing.(store.ReplayStore); ok {
-			if err := replay.Replay(context.Background(), func(record store.EntryRecord) error {
-				entry := e.NewEntry()
-				entry.Decode(record.EncodedEntry)
-				e.mu.Lock()
-				e.entries[record.HKey] = cloneEntry(entry)
-				e.mu.Unlock()
-				return nil
-			}); err != nil {
-				return err
-			}
-		}
-		if starter, ok := e.backing.(store.Starter); ok {
-			if err := starter.Start(context.Background()); err != nil {
-				return err
-			}
-		}
-	}
 	return nil
 }
 
@@ -64,13 +46,12 @@ func (e *Engine) NewEntry() olricstorage.Entry {
 }
 
 func (e *Engine) Name() string {
-	return "olricstack-mysql-wal"
+	return "olricstack-shm-engine"
 }
 
 func (e *Engine) Fork(*olricstorage.Config) (olricstorage.Engine, error) {
 	return &Engine{
 		entries: make(map[uint64]olricstorage.Entry),
-		backing: e.backing,
 		logger:  e.logger,
 	}, nil
 }

@@ -2,4 +2,4 @@
 set -eu
 
 go test ./...
-go build ./cmd/olric-node ./cmd/watchdog ./cmd/operator
+go build ./cmd/olric-node ./cmd/olric-sidecar ./cmd/watchdog ./cmd/operator

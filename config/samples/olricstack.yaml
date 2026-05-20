@@ -6,6 +6,7 @@ metadata:
 spec:
   replicas: 3
   image: olricstack/olric-node:latest
+  sidecarImage: olricstack/olric-sidecar:latest
   watchdogImage: olricstack/watchdog:latest
   mysqlDsnSecret:
     name: demo-mysql

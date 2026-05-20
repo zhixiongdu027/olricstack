@@ -13,6 +13,6 @@ e2e-k3d:
 	sh scripts/e2e-k3d.sh
 
 build:
-	go build ./cmd/olric-node ./cmd/watchdog ./cmd/operator ./cmd/olric-e2e-client
+	go build ./cmd/olric-node ./cmd/olric-sidecar ./cmd/watchdog ./cmd/operator ./cmd/olric-e2e-client
 
 verify: test build
