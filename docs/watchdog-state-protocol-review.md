@@ -1,5 +1,12 @@
 # Watchdog State And Protocol Review
 
+> **Pre-cutover document.** Sections that describe the data plane as a
+> StatefulSet with PVCs reflect the older architecture. The control plane
+> (Watchdog ↔ node heartbeats, lease/epoch/generation, bookworm) is
+> unchanged. The data-plane workload is now a Deployment whose Pods carry
+> `olric-node` + `olric-sidecar` containers with no PVCs — see
+> [Sidecar Oplog Cutover](sidecar-oplog-cutover.md).
+
 This document reviews the current Watchdog, Olric node, and Kubernetes interaction model before production hardening.
 
 ## Current Model

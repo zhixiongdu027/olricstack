@@ -1,5 +1,17 @@
 # Formal Interaction Model — OlricStack Four-Way Timing Audit
 
+> **Historical document — pre-cutover.**
+> This audit describes the node-owned WAL + 2PC `DurableHook`
+> architecture (commit `2d55fec`). After the shm-oplog cutover the
+> durable path moved entirely into `olric-sidecar`; node-side prepare /
+> commit / abort and the per-node Pebble WAL no longer exist. The fence
+> contract `(generation, epoch, owner_seq, writer_id)` and the
+> serving-lease guarantee are still load-bearing — the rest is kept here
+> for historical reference.
+>
+> See [Sidecar Oplog Cutover](sidecar-oplog-cutover.md) for the current
+> architecture.
+
 **Audited revision:** `2d55fec` (2026-05-18)
 **Components in scope:** Watchdog control plane · `stringkv` ingress proxy · Olric fork (`third_party/olric/internal/dmap`) · Durable store (`internal/store` WAL + MySQL).
 
