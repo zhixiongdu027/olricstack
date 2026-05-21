@@ -44,6 +44,7 @@ mkdir -p "$BUILD_DIR/bin"
   CGO_ENABLED=0 GOOS=linux go build -o "$BUILD_DIR/bin/olric-sidecar" ./cmd/olric-sidecar
   CGO_ENABLED=0 GOOS=linux go build -o "$BUILD_DIR/bin/watchdog" ./cmd/watchdog
   CGO_ENABLED=0 GOOS=linux go build -o "$BUILD_DIR/bin/operator" ./cmd/operator
+  CGO_ENABLED=0 GOOS=linux go build -o "$BUILD_DIR/bin/olric-e2e-client" ./cmd/olric-e2e-client
 )
 
 echo "building e2e images"

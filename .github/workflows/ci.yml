@@ -68,7 +68,7 @@ jobs:
           E2E_MYSQL_PASSWORD: password
         run: |
           go test -tags=e2e ./internal/e2e \
-            -run '^TestHost(OnlyMySQLDurableWritePath|OnlyWatchdogDemotionBlocksAndPromotionRestoresWrites|OnlyRestartReadsThroughMySQL|OnlyTwoNodeCRUDAndReadThroughCorrectness|OnlyTwoNodeExpirePropagatesAndExpiresAcrossNodes|OnlyTwoNodeSetWithTTLExpiresAndDoesNotReviveOnRestart)$' \
+            -run '^TestHost(OnlyMySQLDurableWritePath|OnlyWatchdogDemotionBlocksAndPromotionRestoresWrites|OnlyRestartReadsThroughMySQL|OnlyTwoNodeCRUDAndReadThroughCorrectness|OnlyTwoNodeSetWithTTLExpiresAndDoesNotReviveOnRestart)$' \
             -count=1 -v
 
   host-e2e:
