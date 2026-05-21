@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -93,7 +92,7 @@ func TestKindMySQLDurableWritePath(t *testing.T) {
 	defer writeCancel()
 
 	key := "user:" + strconv.FormatInt(time.Now().UnixNano(), 10)
-	if err := env.writeDMapFromNode(t, writeCtx, env.namespace, nodePodName, "users", key, "value-"+stackName); err != nil {
+	if err := env.writeDMapFromClusterJob(t, writeCtx, stackName, "users", key, "value-"+stackName); err != nil {
 		t.Fatalf("write durable dmap entry: %v", err)
 	}
 }
@@ -492,47 +491,46 @@ func (e *kindEnv) waitForSidecarLogContains(t *testing.T, ctx context.Context, n
 	t.Fatalf("pod %s/%s sidecar logs did not contain %q; last logs:\n%s", namespace, podName, needle, strings.TrimSpace(lastLogs))
 }
 
-func (e *kindEnv) writeDMapFromNode(t *testing.T, ctx context.Context, namespace, podName, dmap, key, value string) error {
+func (e *kindEnv) writeDMapFromClusterJob(t *testing.T, ctx context.Context, stackName, dmap, key, value string) error {
 	t.Helper()
 
-	podIP, err := e.readPodField(ctx, namespace, podName, "{.status.podIP}")
-	if err != nil {
-		return err
-	}
-	nodeName, err := e.readPodField(ctx, namespace, podName, "{.spec.nodeName}")
-	if err != nil {
-		return err
-	}
+	clientImage := envOrDefault("E2E_CLIENT_IMAGE", "olricstack/olric-e2e-client:e2e")
+	jobName := stackName + "-client-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	olricSvc := stackName + "-olric"
+	jobYAML := fmt.Sprintf(testClientJobYAML, jobName, e.namespace, jobName, clientImage, olricSvc, e.namespace, dmap, key, value)
+	e.applyYAML(t, jobYAML)
+	defer e.cleanupJob(t, jobName)
+	return e.waitForJobSuccess(t, ctx, e.namespace, jobName)
+}
 
-	localBinary := filepath.Join(t.TempDir(), "olric-e2e-client")
-	buildCmd := exec.CommandContext(ctx, "go", "build", "-o", localBinary, "./cmd/olric-e2e-client")
-	buildCmd.Dir = e.repoRoot(t)
-	buildCmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux")
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("build olric e2e client: %w (%s)", err, strings.TrimSpace(string(out)))
-	}
+func (e *kindEnv) waitForJobSuccess(t *testing.T, ctx context.Context, namespace, name string) error {
+	t.Helper()
 
-	nodeContainer := kindNodeContainerName(nodeName)
-	remoteBinary := "/tmp/olric-e2e-client"
-	copyCmd := exec.CommandContext(ctx, "docker", "cp", localBinary, nodeContainer+":"+remoteBinary)
-	if out, err := copyCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("copy olric e2e client to %s: %w (%s)", nodeContainer, err, strings.TrimSpace(string(out)))
+	deadline := time.Now().Add(90 * time.Second)
+	var lastStatus string
+	for time.Now().Before(deadline) {
+		cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "job", name, "-o", "jsonpath={.status.succeeded}")
+		out, err := cmd.CombinedOutput()
+		if err == nil && strings.TrimSpace(string(out)) == "1" {
+			return nil
+		}
+		if err == nil {
+			lastStatus = strings.TrimSpace(string(out))
+		}
+		time.Sleep(time.Second)
 	}
+	e.dumpDiagnostics(t, namespace)
+	return fmt.Errorf("job %s/%s did not succeed within timeout (last status %q)", namespace, name, lastStatus)
+}
 
-	cmd := exec.CommandContext(ctx,
-		"docker", "exec", nodeContainer,
-		remoteBinary,
-		"-addr", podIP+":3321",
-		"-dmap", dmap,
-		"-key", key,
-		"-value", value,
-		"-timeout", "5s",
-	)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("write dmap from node %s to %s: %w (%s)", nodeName, podIP, err, strings.TrimSpace(string(out)))
+func (e *kindEnv) cleanupJob(t *testing.T, name string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := e.kubectlCmd(ctx, "-n", e.namespace, "delete", "job", name, "--ignore-not-found=true")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Logf("cleanup job %s failed: %v (%s)", name, err, strings.TrimSpace(string(out)))
 	}
-	return nil
 }
 
 func (e *kindEnv) readPodField(ctx context.Context, namespace, podName, jsonPath string) (string, error) {
@@ -647,4 +645,35 @@ metadata:
 type: Opaque
 data:
   dsn: %s
+`
+
+const testClientJobYAML = `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        job-name: %s
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: client
+          image: %s
+          imagePullPolicy: IfNotPresent
+          args:
+            - -addr
+            - %s.%s.svc.cluster.local:3321
+            - -dmap
+            - %s
+            - -key
+            - %s
+            - -value
+            - %s
+            - -timeout
+            - 5s
 `

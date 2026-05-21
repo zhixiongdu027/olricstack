@@ -2,6 +2,7 @@ package sidecar
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,8 @@ type stubBackend struct {
 	upserts       []store.EntryRecord
 	upsertErr     error
 	purgeCount    int
+	purgeErr      error
+	loadCalls     int
 	loadRec       store.EntryRecord
 	loadFound     bool
 	loadErr       error
@@ -54,6 +57,7 @@ func (s *stubBackend) UpsertEntries(_ context.Context, records []store.EntryReco
 func (s *stubBackend) LoadFromMySQL(_ context.Context, _ store.EntryRef) (store.EntryRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.loadCalls++
 	if s.loadErr != nil {
 		return store.EntryRecord{}, s.loadErr
 	}
@@ -66,6 +70,9 @@ func (s *stubBackend) LoadFromMySQL(_ context.Context, _ store.EntryRef) (store.
 func (s *stubBackend) PurgeBelowGeneration(_ context.Context, _ int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.purgeErr != nil {
+		return 0, s.purgeErr
+	}
 	return s.purgeCount, nil
 }
 
@@ -259,6 +266,63 @@ func TestLoadExpiredRecordReportsNotFound(t *testing.T) {
 	}
 	if resp.Found {
 		t.Fatalf("expired record should report not found")
+	}
+}
+
+func TestLoadFromMySQLRejectsNilRequest(t *testing.T) {
+	backend := newStubBackend()
+	srv, _, cleanup := newServerOnRing(t, backend)
+	defer cleanup()
+
+	if _, err := srv.LoadFromMySQL(context.Background(), nil); err == nil {
+		t.Fatal("expected nil load request to fail")
+	}
+	if backend.loadCalls != 0 {
+		t.Fatalf("expected nil load request to avoid backend activity, got loadCalls=%d", backend.loadCalls)
+	}
+}
+
+func TestDrainPartitionRejectsInvalidRequest(t *testing.T) {
+	backend := newStubBackend()
+	srv, _, cleanup := newServerOnRing(t, backend)
+	defer cleanup()
+
+	cases := []*DrainPartitionRequest{
+		nil,
+		{DMap: "users", PartitionCount: 0},
+		{DMap: "users", PartitionID: 2, PartitionCount: 2},
+	}
+	for _, req := range cases {
+		if _, err := srv.DrainPartition(context.Background(), req); err == nil {
+			t.Fatalf("expected invalid drain request %#v to fail", req)
+		}
+	}
+}
+
+func TestLoadFromMySQLPropagatesBackendError(t *testing.T) {
+	backend := newStubBackend()
+	backend.loadErr = errors.New("mysql unavailable")
+	srv, _, cleanup := newServerOnRing(t, backend)
+	defer cleanup()
+
+	_, err := srv.LoadFromMySQL(context.Background(), &LoadRequest{DMap: "users", Key: "alice", HKey: 7})
+	if err == nil || !errors.Is(err, backend.loadErr) {
+		t.Fatalf("expected backend error, got %v", err)
+	}
+}
+
+func TestDrainPartitionPropagatesBackendError(t *testing.T) {
+	backend := newStubBackend()
+	backend.upsertErr = errors.New("mysql unavailable")
+	srv, prod, cleanup := newServerOnRing(t, backend)
+	defer cleanup()
+
+	appendEntry(t, prod, oplog.Entry{Op: oplog.OpSet, DMap: "users", Key: "alice", HKey: 0,
+		Generation: 1, Epoch: 1, OwnerSeq: 1, WriterID: "node-A"})
+
+	_, err := srv.DrainPartition(context.Background(), &DrainPartitionRequest{DMap: "users", PartitionID: 0, PartitionCount: 1})
+	if err == nil || !errors.Is(err, backend.upsertErr) {
+		t.Fatalf("expected backend error, got %v", err)
 	}
 }
 

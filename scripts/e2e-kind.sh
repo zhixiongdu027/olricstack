@@ -9,6 +9,7 @@ NODE_IMAGE="${E2E_NODE_IMAGE:-olricstack/olric-node:$TAG}"
 SIDECAR_IMAGE="${E2E_SIDECAR_IMAGE:-olricstack/olric-sidecar:$TAG}"
 WATCHDOG_IMAGE="${E2E_WATCHDOG_IMAGE:-olricstack/watchdog:$TAG}"
 OPERATOR_IMAGE="${E2E_OPERATOR_IMAGE:-olricstack/operator:$TAG}"
+CLIENT_IMAGE="${E2E_CLIENT_IMAGE:-olricstack/olric-e2e-client:$TAG}"
 TEST_RUN="${E2E_TEST_RUN:-TestKind}"
 BUILD_DIR="$ROOT_DIR/.build/e2e-kind"
 
@@ -51,11 +52,24 @@ build_image "$SIDECAR_IMAGE" olric-sidecar
 build_image "$WATCHDOG_IMAGE" watchdog
 build_image "$OPERATOR_IMAGE" operator
 
+echo "building e2e client image"
+CLIENT_CONTEXT="$BUILD_DIR/olric-e2e-client-image"
+rm -rf "$CLIENT_CONTEXT"
+mkdir -p "$CLIENT_CONTEXT"
+cp "$BUILD_DIR/bin/olric-e2e-client" "$CLIENT_CONTEXT/olric-e2e-client"
+cat > "$CLIENT_CONTEXT/Dockerfile" <<EOF
+FROM scratch
+COPY olric-e2e-client /olric-e2e-client
+ENTRYPOINT ["/olric-e2e-client"]
+EOF
+docker build -t "$CLIENT_IMAGE" "$CLIENT_CONTEXT"
+
 echo "loading images into kind cluster $CLUSTER"
 "$KIND" load docker-image --name "$CLUSTER" "$NODE_IMAGE"
 "$KIND" load docker-image --name "$CLUSTER" "$SIDECAR_IMAGE"
 "$KIND" load docker-image --name "$CLUSTER" "$WATCHDOG_IMAGE"
 "$KIND" load docker-image --name "$CLUSTER" "$OPERATOR_IMAGE"
+"$KIND" load docker-image --name "$CLUSTER" "$CLIENT_IMAGE"
 
 if [ -z "${E2E_MYSQL_DSN:-}" ] && [ -n "${E2E_MYSQL_PORT:-}" ]; then
   gateway="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$CLUSTER-control-plane")"
@@ -74,4 +88,5 @@ E2E_NODE_IMAGE="$NODE_IMAGE" \
 E2E_SIDECAR_IMAGE="$SIDECAR_IMAGE" \
 E2E_WATCHDOG_IMAGE="$WATCHDOG_IMAGE" \
 E2E_OPERATOR_IMAGE="$OPERATOR_IMAGE" \
+E2E_CLIENT_IMAGE="$CLIENT_IMAGE" \
 go test -tags=e2e ./internal/e2e -run "$TEST_RUN" -count=1 -v
