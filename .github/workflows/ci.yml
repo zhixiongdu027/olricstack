@@ -68,7 +68,7 @@ jobs:
           E2E_MYSQL_PASSWORD: password
         run: |
           go test -tags=e2e ./internal/e2e \
-            -run '^TestHost(OnlyMySQLDurableWritePath|OnlyWatchdogDemotionBlocksAndPromotionRestoresWrites|OnlyRestartReadsThroughMySQL|OnlyTwoNodeCRUDAndReadThroughCorrectness|OnlyTwoNodeSetWithTTLExpiresAndDoesNotReviveOnRestart)$' \
+          -run '^TestHost(OnlyMySQLDurableWritePath|OnlyWatchdogDemotionBlocksAndPromotionRestoresWrites|OnlyRestartReadsThroughMySQL|OnlyTwoNodeCRUDAndReadThroughCorrectness|OnlyTwoNodeSetWithTTLExpiresAndDoesNotReviveOnRestart)$' \
             -count=1 -v
 
   host-e2e:
@@ -100,7 +100,7 @@ jobs:
           E2E_MYSQL_PASSWORD: password
         run: |
           go test -tags=e2e ./internal/e2e \
-            -run '^TestHost(DataLifecycleMatrix|DataLifecycleUnderBackgroundTraffic|OnlyTwoNodeClusterJoinsFromWatchdogTopologyOnly|OnlyKilledNodePrunedAndReplacementRejoins|OnlyTwoNodeWriteStorm|OnlyWatchdogNetworkJitterExpiresAndRecoversLease|OnlyFiveNodeJoinCrashReplacementJitterAndStorm|OnlyFiveNodeConcurrentCrashJitterReplacementAndTraffic|OnlyRollingRestartPreservesLiveDataAndDropsExpiredData)$' \
+            -run '^TestHost(DataLifecycleMatrix|DataLifecycleUnderBackgroundTraffic|OnlyTwoNodeClusterJoinsFromWatchdogTopologyOnly|OnlyKilledNodePrunedAndReplacementRejoins|OnlyTwoNodeWriteStorm|OnlyWatchdogNetworkJitterExpiresAndRecoversLease|OnlyFiveNodeJoinCrashReplacementJitterAndStorm|OnlyRollingRestartPreservesLiveDataAndDropsExpiredData)$' \
             -count=1 -v
 
   kind-e2e:

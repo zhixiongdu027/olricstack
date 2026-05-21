@@ -509,17 +509,22 @@ func (e *kindEnv) waitForJobSuccess(t *testing.T, ctx context.Context, namespace
 	deadline := time.Now().Add(90 * time.Second)
 	var lastStatus string
 	for time.Now().Before(deadline) {
-		cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "job", name, "-o", "jsonpath={.status.succeeded}")
+		cmd := e.kubectlCmd(ctx, "-n", namespace, "get", "job", name, "-o", "jsonpath={.status.succeeded}{' '}{.status.failed}")
 		out, err := cmd.CombinedOutput()
-		if err == nil && strings.TrimSpace(string(out)) == "1" {
+		status := strings.TrimSpace(string(out))
+		if err == nil && strings.HasPrefix(status, "1") {
 			return nil
 		}
 		if err == nil {
-			lastStatus = strings.TrimSpace(string(out))
+			lastStatus = status
 		}
 		time.Sleep(time.Second)
 	}
 	e.dumpDiagnostics(t, namespace)
+	cmd := e.kubectlCmd(ctx, "-n", namespace, "describe", "job", name)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Logf("job describe %s/%s\n%s", namespace, name, strings.TrimSpace(string(out)))
+	}
 	return fmt.Errorf("job %s/%s did not succeed within timeout (last status %q)", namespace, name, lastStatus)
 }
 
