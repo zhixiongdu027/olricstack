@@ -7,6 +7,7 @@ import (
 )
 
 func TestEnginePutGetRoundTrip(t *testing.T) {
+	t.Parallel()
 	engine := New()
 	entry := engine.NewEntry()
 	entry.SetKey("key-a")
@@ -27,6 +28,7 @@ func TestEnginePutGetRoundTrip(t *testing.T) {
 }
 
 func TestEngineGetReportsMissForUnknownKey(t *testing.T) {
+	t.Parallel()
 	engine := New()
 	if _, err := engine.Get(99); err != olricstorage.ErrKeyNotFound {
 		t.Fatalf("expected ErrKeyNotFound, got %v", err)
@@ -37,6 +39,7 @@ func TestEngineGetReportsMissForUnknownKey(t *testing.T) {
 }
 
 func TestEnginePutRawRoundTrip(t *testing.T) {
+	t.Parallel()
 	engine := New()
 	entry := engine.NewEntry()
 	entry.SetKey("raw-key")
@@ -58,6 +61,7 @@ func TestEnginePutRawRoundTrip(t *testing.T) {
 }
 
 func TestEngineDeleteRemovesEntry(t *testing.T) {
+	t.Parallel()
 	engine := New()
 	entry := engine.NewEntry()
 	entry.SetKey("delete-key")
@@ -74,6 +78,7 @@ func TestEngineDeleteRemovesEntry(t *testing.T) {
 }
 
 func TestEngineUpdateTTLUpdatesExistingEntry(t *testing.T) {
+	t.Parallel()
 	engine := New()
 	entry := engine.NewEntry()
 	entry.SetKey("ttl-key")
@@ -98,6 +103,7 @@ func TestEngineUpdateTTLUpdatesExistingEntry(t *testing.T) {
 }
 
 func TestEngineUpdateTTLMissReturnsNotFound(t *testing.T) {
+	t.Parallel()
 	engine := New()
 	update := engine.NewEntry()
 	update.SetTTL(500)
@@ -107,6 +113,7 @@ func TestEngineUpdateTTLMissReturnsNotFound(t *testing.T) {
 }
 
 func TestEngineTransferIteratorExportImportDrop(t *testing.T) {
+	t.Parallel()
 	source := New()
 	entry := source.NewEntry()
 	entry.SetKey("move-key")

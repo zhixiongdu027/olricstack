@@ -15,6 +15,7 @@ import (
 )
 
 func TestConfigMapEpochStorePersistsMonotonicEpoch(t *testing.T) {
+	t.Parallel()
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add core scheme: %v", err)
@@ -38,6 +39,7 @@ func TestConfigMapEpochStorePersistsMonotonicEpoch(t *testing.T) {
 }
 
 func TestConfigMapEpochStoreTreatsMissingEpochAsZero(t *testing.T) {
+	t.Parallel()
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add core scheme: %v", err)
@@ -56,6 +58,7 @@ func TestConfigMapEpochStoreTreatsMissingEpochAsZero(t *testing.T) {
 }
 
 func TestConfigMapEpochStoreRejectsCorruptEpochOnSave(t *testing.T) {
+	t.Parallel()
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add core scheme: %v", err)
@@ -73,6 +76,7 @@ func TestConfigMapEpochStoreRejectsCorruptEpochOnSave(t *testing.T) {
 }
 
 func TestConfigMapEpochStoreAllocatesMonotonicGeneration(t *testing.T) {
+	t.Parallel()
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add core scheme: %v", err)
@@ -94,6 +98,7 @@ func TestConfigMapEpochStoreAllocatesMonotonicGeneration(t *testing.T) {
 }
 
 func TestConfigMapEpochStoreRetriesConflictsOnSave(t *testing.T) {
+	t.Parallel()
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add core scheme: %v", err)
@@ -117,6 +122,7 @@ func TestConfigMapEpochStoreRetriesConflictsOnSave(t *testing.T) {
 }
 
 func TestConfigMapEpochStoreRejectsCorruptGeneration(t *testing.T) {
+	t.Parallel()
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add core scheme: %v", err)

@@ -13,6 +13,7 @@ import (
 )
 
 func TestLeadershipHealthFollowsRole(t *testing.T) {
+	t.Parallel()
 	health := NewLeadershipHealth()
 	server := grpc.NewServer()
 	health.Register(server)

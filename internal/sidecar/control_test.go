@@ -131,6 +131,7 @@ func runServer(t *testing.T, srv *Server) (context.CancelFunc, <-chan error) {
 }
 
 func TestConsumerDrainsRingToBackend(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	srv, prod, cleanup := newServerOnRing(t, backend)
 	defer cleanup()
@@ -159,6 +160,7 @@ func TestConsumerDrainsRingToBackend(t *testing.T) {
 }
 
 func TestLoadFromPendingTakesPriorityOverBackend(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	backend.loadFound = true
 	backend.loadRec = store.EntryRecord{Key: "stale", EncodedEntry: []byte("stale")}
@@ -186,6 +188,7 @@ func TestLoadFromPendingTakesPriorityOverBackend(t *testing.T) {
 }
 
 func TestLoadFallsBackToBackendAfterFlush(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	backend.loadFound = true
 	backend.loadRec = store.EntryRecord{Key: "from-mysql", EncodedEntry: []byte("from-mysql")}
@@ -220,6 +223,7 @@ func TestLoadFallsBackToBackendAfterFlush(t *testing.T) {
 }
 
 func TestLoadTombstoneInPendingReportsNotFound(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	srv, prod, cleanup := newServerOnRing(t, backend)
 	defer cleanup()
@@ -247,6 +251,7 @@ func TestLoadTombstoneInPendingReportsNotFound(t *testing.T) {
 }
 
 func TestLoadExpiredRecordReportsNotFound(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	backend.loadFound = true
 	backend.loadRec = store.EntryRecord{
@@ -270,6 +275,7 @@ func TestLoadExpiredRecordReportsNotFound(t *testing.T) {
 }
 
 func TestLoadFromMySQLRejectsNilRequest(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	srv, _, cleanup := newServerOnRing(t, backend)
 	defer cleanup()
@@ -283,6 +289,7 @@ func TestLoadFromMySQLRejectsNilRequest(t *testing.T) {
 }
 
 func TestDrainPartitionRejectsInvalidRequest(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	srv, _, cleanup := newServerOnRing(t, backend)
 	defer cleanup()
@@ -300,6 +307,7 @@ func TestDrainPartitionRejectsInvalidRequest(t *testing.T) {
 }
 
 func TestLoadFromMySQLPropagatesBackendError(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	backend.loadErr = errors.New("mysql unavailable")
 	srv, _, cleanup := newServerOnRing(t, backend)
@@ -312,6 +320,7 @@ func TestLoadFromMySQLPropagatesBackendError(t *testing.T) {
 }
 
 func TestDrainPartitionPropagatesBackendError(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	backend.upsertErr = errors.New("mysql unavailable")
 	srv, prod, cleanup := newServerOnRing(t, backend)
@@ -327,6 +336,7 @@ func TestDrainPartitionPropagatesBackendError(t *testing.T) {
 }
 
 func TestRecordExpiredAt(t *testing.T) {
+	t.Parallel()
 	now := time.UnixMilli(1000)
 	if recordExpiredAt(store.EntryRecord{TTL: 0}, now) {
 		t.Fatal("zero ttl must not expire")
@@ -340,6 +350,7 @@ func TestRecordExpiredAt(t *testing.T) {
 }
 
 func TestDrainPartitionFlushesSubsetSynchronously(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	srv, prod, cleanup := newServerOnRing(t, backend)
 	defer cleanup()
@@ -361,6 +372,7 @@ func TestDrainPartitionFlushesSubsetSynchronously(t *testing.T) {
 }
 
 func TestPurgeBelowGenerationCleansPending(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	backend.purgeCount = 5
 	srv, prod, cleanup := newServerOnRing(t, backend)
@@ -414,6 +426,7 @@ func pendingSize(srv *Server) int {
 // producer to stop. When that fix lands, this test must be updated to
 // assert the new bounded behavior.
 func TestPendingGrowsUnboundedWhenMySQLFails(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	backend.upsertErr = errors.New("mysql down")
 
@@ -491,6 +504,7 @@ func TestPendingGrowsUnboundedWhenMySQLFails(t *testing.T) {
 // test to assert continued operation across N errors followed by
 // recovery.
 func TestRunExitsOnFlushError(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	backend.upsertErr = errors.New("transient mysql error")
 
@@ -574,6 +588,7 @@ func itoa(n int) string {
 }
 
 func TestFlushDoesNotDropNewerPendingEntryForSameRef(t *testing.T) {
+	t.Parallel()
 	backend := newStubBackend()
 	backend.blockUpsert = make(chan struct{})
 	backend.upsertEntered = make(chan struct{}, 1)

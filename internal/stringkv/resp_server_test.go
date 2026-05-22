@@ -13,6 +13,7 @@ import (
 )
 
 func TestRESPServerStringCommandsUseDefaultDMap(t *testing.T) {
+	t.Parallel()
 	dmap := newFakeDMap()
 	server, addr := startTestRESPServer(t, dmap)
 	defer server.Shutdown()
@@ -37,6 +38,7 @@ func TestRESPServerStringCommandsUseDefaultDMap(t *testing.T) {
 }
 
 func TestRESPServerSetPXAndExpire(t *testing.T) {
+	t.Parallel()
 	dmap := newFakeDMap()
 	server, addr := startTestRESPServer(t, dmap)
 	defer server.Shutdown()
@@ -61,6 +63,7 @@ func TestRESPServerSetPXAndExpire(t *testing.T) {
 }
 
 func TestRESPServerMissingGetReturnsNil(t *testing.T) {
+	t.Parallel()
 	dmap := newFakeDMap()
 	server, addr := startTestRESPServer(t, dmap)
 	defer server.Shutdown()
@@ -75,6 +78,7 @@ func TestRESPServerMissingGetReturnsNil(t *testing.T) {
 }
 
 func TestRESPServerRejectsDMCommands(t *testing.T) {
+	t.Parallel()
 	dmap := newFakeDMap()
 	server, addr := startTestRESPServer(t, dmap)
 	defer server.Shutdown()
@@ -150,6 +154,7 @@ func waitForTCP(t *testing.T, addr string) {
 // an in-flight command to finish (within ShutdownGrace) instead of force-
 // closing the client mid-write.
 func TestRESPServerShutdownDrainsInflightCommand(t *testing.T) {
+	t.Parallel()
 	dmap := newFakeDMap()
 	release := make(chan struct{})
 	entered := make(chan struct{})
@@ -217,8 +222,11 @@ func TestRESPServerShutdownDrainsInflightCommand(t *testing.T) {
 // grace window and force-close the underlying connection so the surrounding
 // shutdown sequence can proceed.
 func TestRESPServerShutdownForceClosesAfterGrace(t *testing.T) {
+	t.Parallel()
 	dmap := newFakeDMap()
 	stuck := make(chan struct{})
+	entered := make(chan struct{})
+	var once sync.Once
 	t.Cleanup(func() {
 		select {
 		case <-stuck:
@@ -227,6 +235,7 @@ func TestRESPServerShutdownForceClosesAfterGrace(t *testing.T) {
 		}
 	})
 	dmap.setHook = func(ctx context.Context, _, _ string, _ time.Duration) error {
+		once.Do(func() { close(entered) })
 		select {
 		case <-stuck:
 			return nil
@@ -251,8 +260,13 @@ func TestRESPServerShutdownForceClosesAfterGrace(t *testing.T) {
 		setDone <- client.Set(context.Background(), "alice", "A", 0).Err()
 	}()
 
-	// Give the command time to enter the hook before triggering shutdown.
-	time.Sleep(50 * time.Millisecond)
+	// Wait deterministically until the command has entered the hook, mirroring
+	// the sibling TestRESPServerShutdownDrainsInflightCommand pattern.
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("set never reached the dmap hook")
+	}
 
 	start := time.Now()
 	if err := server.Shutdown(); err != nil {
@@ -280,6 +294,7 @@ func TestRESPServerShutdownForceClosesAfterGrace(t *testing.T) {
 // TestRESPServerShutdownIsIdempotent guards against the previous "not serving"
 // string-match path: calling Shutdown twice must not return an error.
 func TestRESPServerShutdownIsIdempotent(t *testing.T) {
+	t.Parallel()
 	dmap := newFakeDMap()
 	server, _ := startTestRESPServer(t, dmap)
 	if err := server.Shutdown(); err != nil {
@@ -310,6 +325,7 @@ func (p *recordingProvider) DMap(string) (DMap, error) {
 // "-TRYAGAIN serving lease is expired\r\n" error and the backing DMap
 // provider must never be invoked.
 func TestRESPReturnsTRYAGAINWhenLeaseExpired(t *testing.T) {
+	t.Parallel()
 	provider := &recordingProvider{t: t}
 	service, err := NewService(provider, &fakeLease{allowed: false})
 	if err != nil {
@@ -356,6 +372,7 @@ func TestRESPReturnsTRYAGAINWhenLeaseExpired(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			conn, err := net.Dial("tcp", addr)
 			if err != nil {
 				t.Fatalf("dial: %v", err)

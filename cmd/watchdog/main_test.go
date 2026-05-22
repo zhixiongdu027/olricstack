@@ -16,6 +16,7 @@ import (
 )
 
 func TestWatchEpochHealthTerminatesAfterConsecutiveFailures(t *testing.T) {
+	t.Parallel()
 	service := topology.NewServiceWithConfig(topology.Config{
 		EpochStore: persistentlyFailingEpochStore{},
 	})
@@ -47,6 +48,7 @@ func TestWatchEpochHealthTerminatesAfterConsecutiveFailures(t *testing.T) {
 }
 
 func TestWatchEpochHealthIgnoresTransientFailure(t *testing.T) {
+	t.Parallel()
 	store := newFlakyEpochStore()
 	service := topology.NewServiceWithConfig(topology.Config{EpochStore: store})
 
@@ -68,13 +70,23 @@ func TestWatchEpochHealthIgnoresTransientFailure(t *testing.T) {
 	defer cancel()
 	go watchEpochHealth(ctx, service, terminate, 5*time.Millisecond, 5)
 
-	time.Sleep(60 * time.Millisecond)
+	// Poll deterministically: the test passes iff terminate is never invoked
+	// within the watch window. Bail out immediately on the first termination
+	// rather than rely on a fixed sleep that could miss a fast failure.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := terminated.Load(); got != 0 {
+			t.Fatalf("terminate must not be called after transient recovery, got %d", got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if got := terminated.Load(); got != 0 {
 		t.Fatalf("terminate must not be called after transient recovery, got %d", got)
 	}
 }
 
 func TestValidateWatchdogTimingRejectsEpochWindowBeyondLease(t *testing.T) {
+	t.Parallel()
 	err := validateWatchdogTiming(topology.Config{
 		LeaseTTL:    30 * time.Second,
 		ExpireAfter: 20 * time.Second,
@@ -85,6 +97,7 @@ func TestValidateWatchdogTimingRejectsEpochWindowBeyondLease(t *testing.T) {
 }
 
 func TestValidateWatchdogTimingAcceptsWindowBelowLease(t *testing.T) {
+	t.Parallel()
 	err := validateWatchdogTiming(topology.Config{
 		LeaseTTL:    30 * time.Second,
 		ExpireAfter: 30 * time.Second,
@@ -95,6 +108,7 @@ func TestValidateWatchdogTimingAcceptsWindowBelowLease(t *testing.T) {
 }
 
 func TestAppConfigDemoteTopologySendsStandbyEnvelope(t *testing.T) {
+	t.Parallel()
 	service := topology.NewServiceWithConfig(topology.Config{
 		Role:             topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY,
 		Generation:       7,

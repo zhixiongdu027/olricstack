@@ -18,6 +18,7 @@ import (
 )
 
 func TestReconcileCreatesStackResources(t *testing.T) {
+	t.Parallel()
 	scheme := newTestScheme(t)
 	replicas := int32(2)
 	stack := &olricv1alpha1.OlricStack{

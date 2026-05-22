@@ -8,6 +8,7 @@ import (
 )
 
 func TestClusterStateHeartbeatIsPrimarySource(t *testing.T) {
+	t.Parallel()
 	state := NewClusterState()
 	now := time.Now()
 
@@ -43,6 +44,7 @@ func TestClusterStateHeartbeatIsPrimarySource(t *testing.T) {
 }
 
 func TestClusterStateIgnoresStaleIncarnation(t *testing.T) {
+	t.Parallel()
 	state := NewClusterState()
 	now := time.Now()
 	state.ApplyHeartbeat(HeartbeatObservation{NodeID: "node-a", PodName: "pod-a", PodIP: "10.0.0.2", Incarnation: 2, SeenAt: now})
@@ -64,6 +66,7 @@ func TestClusterStateIgnoresStaleIncarnation(t *testing.T) {
 }
 
 func TestClusterStatePodObservationCanExcludeTerminalNode(t *testing.T) {
+	t.Parallel()
 	state := NewClusterState()
 	now := time.Now()
 	state.ApplyHeartbeat(HeartbeatObservation{NodeID: "node-a", PodName: "pod-a", PodIP: "10.0.0.2", Incarnation: 1, SeenAt: now})
@@ -86,6 +89,7 @@ func TestClusterStatePodObservationCanExcludeTerminalNode(t *testing.T) {
 }
 
 func TestClusterStatePrunesHeartbeatExpiredNode(t *testing.T) {
+	t.Parallel()
 	state := NewClusterState()
 	now := time.Now()
 	state.ApplyHeartbeat(HeartbeatObservation{NodeID: "node-a", PodName: "pod-a", PodIP: "10.0.0.2", Incarnation: 1, SeenAt: now})
@@ -104,6 +108,7 @@ func TestClusterStatePrunesHeartbeatExpiredNode(t *testing.T) {
 }
 
 func TestClusterStateMarksSuspectBeforePrune(t *testing.T) {
+	t.Parallel()
 	state := NewClusterState()
 	now := time.Now()
 	state.ApplyHeartbeat(HeartbeatObservation{NodeID: "node-a", PodName: "pod-a", PodIP: "10.0.0.2", Incarnation: 1, SeenAt: now})
@@ -119,6 +124,7 @@ func TestClusterStateMarksSuspectBeforePrune(t *testing.T) {
 }
 
 func TestClusterStateHeartbeatRecoversSuspectNode(t *testing.T) {
+	t.Parallel()
 	state := NewClusterState()
 	now := time.Now()
 	state.ApplyHeartbeat(HeartbeatObservation{NodeID: "node-a", PodName: "pod-a", PodIP: "10.0.0.2", Incarnation: 1, SeenAt: now})
@@ -138,6 +144,7 @@ func TestClusterStateHeartbeatRecoversSuspectNode(t *testing.T) {
 }
 
 func TestClusterStateDrainingHeartbeatDoesNotReturnToReady(t *testing.T) {
+	t.Parallel()
 	state := NewClusterState()
 	now := time.Now()
 	state.ApplyHeartbeat(HeartbeatObservation{NodeID: "node-a", PodName: "pod-a", PodIP: "10.0.0.2", Incarnation: 1, ReportedState: topologypb.NodeState_NODE_STATE_DRAINING, SeenAt: now})
@@ -156,6 +163,7 @@ func TestClusterStateDrainingHeartbeatDoesNotReturnToReady(t *testing.T) {
 }
 
 func TestClusterStateTerminalPodCannotBeRevivedBySameIncarnation(t *testing.T) {
+	t.Parallel()
 	state := NewClusterState()
 	now := time.Now()
 	state.ApplyHeartbeat(HeartbeatObservation{NodeID: "node-a", PodName: "pod-a", PodIP: "10.0.0.2", Incarnation: 1, SeenAt: now})
@@ -181,6 +189,7 @@ func TestClusterStateTerminalPodCannotBeRevivedBySameIncarnation(t *testing.T) {
 }
 
 func TestClusterStateNewIncarnationReplacesTerminalPod(t *testing.T) {
+	t.Parallel()
 	state := NewClusterState()
 	now := time.Now()
 	state.ApplyHeartbeat(HeartbeatObservation{NodeID: "node-a", PodName: "pod-a", PodIP: "10.0.0.2", Incarnation: 1, SeenAt: now})
@@ -206,6 +215,7 @@ func TestClusterStateNewIncarnationReplacesTerminalPod(t *testing.T) {
 }
 
 func TestClusterStatePodObservationPrefersPodNameOverReusedIP(t *testing.T) {
+	t.Parallel()
 	state := NewClusterState()
 	now := time.Now()
 	state.ApplyHeartbeat(HeartbeatObservation{NodeID: "node-a", PodName: "pod-a", PodIP: "10.0.0.2", Incarnation: 1, SeenAt: now})

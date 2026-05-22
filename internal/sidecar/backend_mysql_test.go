@@ -34,6 +34,7 @@ func newMockMySQLBackend(t *testing.T) (*MySQLBackend, sqlmock.Sqlmock, func()) 
 }
 
 func TestMySQLBackendLoadFromMySQLDropsExpiredRecord(t *testing.T) {
+	t.Parallel()
 	backend, mock, cleanup := newMockMySQLBackend(t)
 	defer cleanup()
 
@@ -56,6 +57,7 @@ func TestMySQLBackendLoadFromMySQLDropsExpiredRecord(t *testing.T) {
 }
 
 func TestMySQLBackendLoadFromMySQLReturnsLiveRecord(t *testing.T) {
+	t.Parallel()
 	backend, mock, cleanup := newMockMySQLBackend(t)
 	defer cleanup()
 

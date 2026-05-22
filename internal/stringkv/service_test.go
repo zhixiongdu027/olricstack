@@ -10,6 +10,7 @@ import (
 )
 
 func TestSetDelegatesToOlricWithoutIngressBackingWrite(t *testing.T) {
+	t.Parallel()
 	backing := newRecordingStore()
 	dmap := newFakeDMap()
 	service := newTestService(t, newFakeProvider(dmap), backing)
@@ -26,6 +27,7 @@ func TestSetDelegatesToOlricWithoutIngressBackingWrite(t *testing.T) {
 }
 
 func TestSetIgnoresIngressBackingFailure(t *testing.T) {
+	t.Parallel()
 	backing := newRecordingStore()
 	backing.storeErr = errors.New("wal failed")
 	dmap := newFakeDMap()
@@ -43,6 +45,7 @@ func TestSetIgnoresIngressBackingFailure(t *testing.T) {
 }
 
 func TestDeleteDelegatesToOlricWithoutIngressTombstone(t *testing.T) {
+	t.Parallel()
 	backing := newRecordingStore()
 	dmap := newFakeDMap()
 	service := newTestService(t, newFakeProvider(dmap), backing)
@@ -56,6 +59,7 @@ func TestDeleteDelegatesToOlricWithoutIngressTombstone(t *testing.T) {
 }
 
 func TestGetDoesNotIngressRefillOnOlricMiss(t *testing.T) {
+	t.Parallel()
 	backing := newRecordingStore()
 	dmap := newFakeDMap()
 	service := newTestService(t, newFakeProvider(dmap), backing)
@@ -70,6 +74,7 @@ func TestGetDoesNotIngressRefillOnOlricMiss(t *testing.T) {
 }
 
 func TestExpireDelegatesToOlricWithoutIngressBackingWrite(t *testing.T) {
+	t.Parallel()
 	backing := newRecordingStore()
 	dmap := newFakeDMap()
 	dmap.values["alice"] = "A"
@@ -87,6 +92,7 @@ func TestExpireDelegatesToOlricWithoutIngressBackingWrite(t *testing.T) {
 }
 
 func TestLeaseRequired(t *testing.T) {
+	t.Parallel()
 	backing := newRecordingStore()
 	dmap := newFakeDMap()
 	service := newTestService(t, newFakeProvider(dmap), backing)

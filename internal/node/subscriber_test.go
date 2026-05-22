@@ -13,6 +13,7 @@ import (
 )
 
 func TestNewSubscriberRequiresIdentity(t *testing.T) {
+	t.Parallel()
 	_, err := NewSubscriber(SubscriberConfig{StackID: "demo", PodIP: "10.0.0.2"})
 	if err == nil {
 		t.Fatal("expected missing node id error")
@@ -25,6 +26,7 @@ func TestNewSubscriberRequiresIdentity(t *testing.T) {
 }
 
 func TestLeaseTrackerRejectsExpiredEnvelope(t *testing.T) {
+	t.Parallel()
 	tracker := NewLeaseTracker()
 	err := tracker.Apply(&topologypb.TopologyEnvelope{
 		WatchdogRole:       topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY,
@@ -37,6 +39,7 @@ func TestLeaseTrackerRejectsExpiredEnvelope(t *testing.T) {
 }
 
 func TestLeaseTrackerRejectsStandbyEnvelope(t *testing.T) {
+	t.Parallel()
 	tracker := NewLeaseTracker()
 	err := tracker.Apply(&topologypb.TopologyEnvelope{
 		WatchdogRole:       topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY,
@@ -49,6 +52,7 @@ func TestLeaseTrackerRejectsStandbyEnvelope(t *testing.T) {
 }
 
 func TestLeaseTrackerRejectsStaleGeneration(t *testing.T) {
+	t.Parallel()
 	tracker := NewLeaseTracker()
 	now := time.Now()
 	if err := tracker.Apply(&topologypb.TopologyEnvelope{
@@ -68,6 +72,7 @@ func TestLeaseTrackerRejectsStaleGeneration(t *testing.T) {
 }
 
 func TestLeaseTrackerRejectsStaleEpoch(t *testing.T) {
+	t.Parallel()
 	tracker := NewLeaseTracker()
 	now := time.Now()
 	if err := tracker.Apply(&topologypb.TopologyEnvelope{
@@ -89,6 +94,7 @@ func TestLeaseTrackerRejectsStaleEpoch(t *testing.T) {
 }
 
 func TestLeaseTrackerServingAllowed(t *testing.T) {
+	t.Parallel()
 	tracker := NewLeaseTracker()
 	now := time.Now()
 	if tracker.ServingAllowed(now) {
@@ -107,6 +113,7 @@ func TestLeaseTrackerServingAllowed(t *testing.T) {
 }
 
 func TestLeaseTrackerWaitExpired(t *testing.T) {
+	t.Parallel()
 	tracker := NewLeaseTracker()
 	now := time.Now()
 	if err := tracker.Apply(&topologypb.TopologyEnvelope{
@@ -125,6 +132,7 @@ func TestLeaseTrackerWaitExpired(t *testing.T) {
 }
 
 func TestLeaseTrackerRevokeClearsServing(t *testing.T) {
+	t.Parallel()
 	tracker := NewLeaseTracker()
 	now := time.Now()
 	if err := tracker.Apply(&topologypb.TopologyEnvelope{
@@ -141,6 +149,7 @@ func TestLeaseTrackerRevokeClearsServing(t *testing.T) {
 }
 
 func TestLeaseTrackerNewGenerationResetsEpochBaseline(t *testing.T) {
+	t.Parallel()
 	tracker := NewLeaseTracker()
 	now := time.Now()
 
@@ -182,6 +191,7 @@ func TestLeaseTrackerNewGenerationResetsEpochBaseline(t *testing.T) {
 }
 
 func TestLeaseTrackerSnapshotForWriteHonorsExpiry(t *testing.T) {
+	t.Parallel()
 	tracker := NewLeaseTracker()
 	now := time.Now()
 	if err := tracker.Apply(&topologypb.TopologyEnvelope{
@@ -202,6 +212,7 @@ func TestLeaseTrackerSnapshotForWriteHonorsExpiry(t *testing.T) {
 }
 
 func TestSubscriberRunRevokesLeaseOnStandbyEnvelope(t *testing.T) {
+	t.Parallel()
 	now := time.Now()
 	lease := NewLeaseTracker()
 	if err := lease.Apply(&topologypb.TopologyEnvelope{
@@ -262,6 +273,7 @@ func (j *recordingJoiner) Join(ctx context.Context, envelope *topologypb.Topolog
 }
 
 func TestNewSubscriberDefaults(t *testing.T) {
+	t.Parallel()
 	sub, err := NewSubscriber(SubscriberConfig{
 		StackID: "demo",
 		NodeID:  "node-a",

@@ -7,6 +7,7 @@ import (
 )
 
 func TestRoundTripSet(t *testing.T) {
+	t.Parallel()
 	in := Entry{
 		Op:           OpSet,
 		DMap:         "users",
@@ -43,6 +44,7 @@ func TestRoundTripSet(t *testing.T) {
 }
 
 func TestDecodeRejectsUnknownVersion(t *testing.T) {
+	t.Parallel()
 	payload := []byte(`{"v":99,"op":"set","dmap":"u","g":1,"s":1,"w":"x"}`)
 	if _, err := Decode(payload); err == nil || !strings.Contains(err.Error(), "version") {
 		t.Fatalf("expected version error, got %v", err)
@@ -50,6 +52,7 @@ func TestDecodeRejectsUnknownVersion(t *testing.T) {
 }
 
 func TestDecodeRejectsUnknownOp(t *testing.T) {
+	t.Parallel()
 	bad := Entry{Op: "noop", DMap: "u", Generation: 1, OwnerSeq: 1, WriterID: "x"}
 	payload, err := Encode(bad)
 	if err != nil {
@@ -61,6 +64,7 @@ func TestDecodeRejectsUnknownOp(t *testing.T) {
 }
 
 func TestDecodeRejectsMissingFence(t *testing.T) {
+	t.Parallel()
 	bad := Entry{Op: OpSet, DMap: "u", WriterID: "x"}
 	payload, err := Encode(bad)
 	if err != nil {
@@ -73,6 +77,7 @@ func TestDecodeRejectsMissingFence(t *testing.T) {
 }
 
 func TestDecodeRejectsCorruption(t *testing.T) {
+	t.Parallel()
 	_, err := Decode([]byte("not-json"))
 	if err == nil || !errors.Is(err, err) {
 		t.Fatalf("expected decode error, got nil")

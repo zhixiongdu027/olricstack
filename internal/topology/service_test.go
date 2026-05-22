@@ -15,6 +15,7 @@ import (
 )
 
 func TestServiceRegistersHeartbeatAndReturnsTopology(t *testing.T) {
+	t.Parallel()
 	service := NewService()
 	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1)})
 
@@ -35,6 +36,7 @@ func TestServiceRegistersHeartbeatAndReturnsTopology(t *testing.T) {
 }
 
 func TestGetTopologyPersistsEpochBeforeReturning(t *testing.T) {
+	t.Parallel()
 	store := &recordingEpochStore{}
 	service := NewServiceWithConfig(Config{EpochStore: store})
 	if err := service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1)}); err != nil {
@@ -51,6 +53,7 @@ func TestGetTopologyPersistsEpochBeforeReturning(t *testing.T) {
 }
 
 func TestServiceKeepsStacksIsolated(t *testing.T) {
+	t.Parallel()
 	service := NewService()
 	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1)})
 	service.registerHeartbeat(heartbeat("stack-b", "node-b", "pod-b", "10.0.1.2", 1), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1)})
@@ -66,6 +69,7 @@ func TestServiceKeepsStacksIsolated(t *testing.T) {
 }
 
 func TestServicePrunesExpiredHeartbeats(t *testing.T) {
+	t.Parallel()
 	service := NewServiceWithConfig(Config{SuspectAfter: time.Millisecond, ExpireAfter: 2 * time.Millisecond})
 	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1)})
 
@@ -84,6 +88,7 @@ func TestServicePrunesExpiredHeartbeats(t *testing.T) {
 }
 
 func TestServiceBookwormPushesSnapshotWithoutEpochChange(t *testing.T) {
+	t.Parallel()
 	service := NewService()
 	sub := &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 4)}
 	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), sub)
@@ -101,6 +106,7 @@ func TestServiceBookwormPushesSnapshotWithoutEpochChange(t *testing.T) {
 }
 
 func TestServicePodObservationDoesNotCreateTopologyMembership(t *testing.T) {
+	t.Parallel()
 	service := NewService()
 	service.ObservePods("stack-a", []stackwatchdog.PodObservation{{
 		PodName: "pod-a",
@@ -120,6 +126,7 @@ func TestServicePodObservationDoesNotCreateTopologyMembership(t *testing.T) {
 }
 
 func TestServicePodObservationCanExcludeHeartbeatingTerminalNode(t *testing.T) {
+	t.Parallel()
 	service := NewService()
 	sub := &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 4)}
 	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), sub)
@@ -143,6 +150,7 @@ func TestServicePodObservationCanExcludeHeartbeatingTerminalNode(t *testing.T) {
 }
 
 func TestStandbyRejectsTopologyOwnership(t *testing.T) {
+	t.Parallel()
 	service := NewServiceWithConfig(Config{Role: topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY})
 	service.ObservePods("stack-a", []stackwatchdog.PodObservation{{
 		PodName: "pod-a",
@@ -165,6 +173,7 @@ func TestStandbyRejectsTopologyOwnership(t *testing.T) {
 }
 
 func TestStandbyGetTopologyDoesNotReturnOwnedMembers(t *testing.T) {
+	t.Parallel()
 	service := NewServiceWithConfig(Config{Role: topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY})
 	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1)})
 	service.SetLeadership(topologypb.WatchdogRole_WATCHDOG_ROLE_STANDBY, 1)
@@ -182,6 +191,7 @@ func TestStandbyGetTopologyDoesNotReturnOwnedMembers(t *testing.T) {
 }
 
 func TestServiceReplacesOlderSubscriberWithNewerIncarnation(t *testing.T) {
+	t.Parallel()
 	service := NewService()
 	oldSub := &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1), done: make(chan struct{})}
 	newSub := &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1), done: make(chan struct{})}
@@ -205,6 +215,7 @@ func TestServiceReplacesOlderSubscriberWithNewerIncarnation(t *testing.T) {
 }
 
 func TestServiceDoesNotReplaceWithStaleIncarnation(t *testing.T) {
+	t.Parallel()
 	service := NewService()
 	currentSub := &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1), done: make(chan struct{})}
 	staleSub := &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1), done: make(chan struct{})}
@@ -228,6 +239,7 @@ func TestServiceDoesNotReplaceWithStaleIncarnation(t *testing.T) {
 }
 
 func TestServiceRecordsEpochPersistenceFailure(t *testing.T) {
+	t.Parallel()
 	service := NewServiceWithConfig(Config{EpochStore: failingEpochStore{err: errors.New("boom")}})
 	health := stackwatchdog.NewLeadershipHealth()
 	service.AddLeadershipObserver(health)
@@ -242,6 +254,7 @@ func TestServiceRecordsEpochPersistenceFailure(t *testing.T) {
 }
 
 func TestServiceDoesNotBroadcastWhenEpochSaveFails(t *testing.T) {
+	t.Parallel()
 	store := &flakyEpochStore{err: errors.New("boom")}
 	service := NewServiceWithConfig(Config{EpochStore: store})
 
@@ -262,6 +275,7 @@ func TestServiceDoesNotBroadcastWhenEpochSaveFails(t *testing.T) {
 }
 
 func TestServiceBookwormPausedWhenDegraded(t *testing.T) {
+	t.Parallel()
 	store := &flakyEpochStore{err: errors.New("boom")}
 	service := NewServiceWithConfig(Config{
 		EpochStore:       store,
@@ -290,17 +304,18 @@ func TestServiceBookwormPausedWhenDegraded(t *testing.T) {
 	go service.RunBookworm(ctx)
 	go service.RunReaper(ctx)
 
-	// Give bookworm/reaper several tick windows. Neither must enqueue a
-	// degraded envelope.
-	time.Sleep(50 * time.Millisecond)
+	// Watch bookworm/reaper for a generous window. Neither must enqueue a
+	// degraded envelope; the test exits immediately if one arrives, otherwise
+	// waits up to the deadline.
 	select {
 	case env := <-sub.ch:
 		t.Fatalf("bookworm/reaper must not broadcast while degraded, got %#v", env)
-	default:
+	case <-time.After(2 * time.Second):
 	}
 }
 
 func TestServiceClearsEpochPersistenceFailureAfterSuccess(t *testing.T) {
+	t.Parallel()
 	store := &flakyEpochStore{err: errors.New("boom")}
 	service := NewServiceWithConfig(Config{EpochStore: store})
 	health := stackwatchdog.NewLeadershipHealth()
@@ -324,6 +339,7 @@ func TestServiceClearsEpochPersistenceFailureAfterSuccess(t *testing.T) {
 }
 
 func TestServiceObserverAddedAfterEpochErrorSeesDegradedHealth(t *testing.T) {
+	t.Parallel()
 	service := NewService()
 	service.setEpochError(errors.New("boom"))
 
@@ -336,6 +352,7 @@ func TestServiceObserverAddedAfterEpochErrorSeesDegradedHealth(t *testing.T) {
 }
 
 func TestServiceRetriesEpochLoadAfterFailure(t *testing.T) {
+	t.Parallel()
 	store := &flakyEpochStore{loadErr: errors.New("boom"), epoch: 7}
 	service := NewServiceWithConfig(Config{EpochStore: store})
 	health := stackwatchdog.NewLeadershipHealth()
@@ -374,6 +391,7 @@ func TestServiceRetriesEpochLoadAfterFailure(t *testing.T) {
 }
 
 func TestServiceRegisterHeartbeatFailsClosedWhenEpochLoadFails(t *testing.T) {
+	t.Parallel()
 	store := &flakyEpochStore{loadErr: errors.New("boom")}
 	service := NewServiceWithConfig(Config{EpochStore: store})
 	sub := &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1), done: make(chan struct{})}
@@ -391,6 +409,7 @@ func TestServiceRegisterHeartbeatFailsClosedWhenEpochLoadFails(t *testing.T) {
 }
 
 func TestServiceDemotionClosesSubscribers(t *testing.T) {
+	t.Parallel()
 	service := NewServiceWithConfig(Config{Role: topologypb.WatchdogRole_WATCHDOG_ROLE_PRIMARY, Generation: 1})
 	sub := &subscriber{ch: make(chan *topologypb.TopologyEnvelope, 1), done: make(chan struct{})}
 	service.registerHeartbeat(heartbeat("stack-a", "node-a", "pod-a", "10.0.0.2", 1), sub)

@@ -21,6 +21,7 @@ func newRing(t *testing.T, capacity uint64) string {
 }
 
 func TestRoundTripSingleEntry(t *testing.T) {
+	t.Parallel()
 	path := newRing(t, minCapacity)
 	prod, err := OpenProducer(path)
 	if err != nil {
@@ -50,6 +51,7 @@ func TestRoundTripSingleEntry(t *testing.T) {
 }
 
 func TestFifoOrder(t *testing.T) {
+	t.Parallel()
 	path := newRing(t, minCapacity)
 	prod, _ := OpenProducer(path)
 	defer prod.Close()
@@ -74,6 +76,7 @@ func TestFifoOrder(t *testing.T) {
 }
 
 func TestWrapAround(t *testing.T) {
+	t.Parallel()
 	path := newRing(t, minCapacity)
 	prod, _ := OpenProducer(path)
 	defer prod.Close()
@@ -103,6 +106,7 @@ func TestWrapAround(t *testing.T) {
 }
 
 func TestFullErrors(t *testing.T) {
+	t.Parallel()
 	path := newRing(t, minCapacity)
 	prod, _ := OpenProducer(path)
 	defer prod.Close()
@@ -136,6 +140,7 @@ func TestFullErrors(t *testing.T) {
 }
 
 func TestPayloadTooLarge(t *testing.T) {
+	t.Parallel()
 	path := newRing(t, minCapacity)
 	prod, _ := OpenProducer(path)
 	defer prod.Close()
@@ -145,6 +150,7 @@ func TestPayloadTooLarge(t *testing.T) {
 }
 
 func TestReopenPreservesCursors(t *testing.T) {
+	t.Parallel()
 	path := newRing(t, minCapacity)
 	prod, _ := OpenProducer(path)
 	if err := prod.Append([]byte("first")); err != nil {
@@ -171,6 +177,7 @@ func TestReopenPreservesCursors(t *testing.T) {
 }
 
 func TestSPSCConcurrentAppendAndPop(t *testing.T) {
+	t.Parallel()
 	path := newRing(t, minCapacity)
 	prod, err := OpenProducer(path)
 	if err != nil {

@@ -16,6 +16,7 @@ import (
 )
 
 func TestControllerReconcilesOlricResourcesForOwnStack(t *testing.T) {
+	t.Parallel()
 	scheme := newTestScheme(t)
 	replicas := int32(2)
 	stack := &olricv1alpha1.OlricStack{
@@ -98,6 +99,7 @@ func TestControllerReconcilesOlricResourcesForOwnStack(t *testing.T) {
 }
 
 func TestControllerReportsPodObservations(t *testing.T) {
+	t.Parallel()
 	scheme := newTestScheme(t)
 	stack := &olricv1alpha1.OlricStack{
 		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "default"},
@@ -142,6 +144,7 @@ func TestControllerReportsPodObservations(t *testing.T) {
 }
 
 func TestControllerPreservesExistingDeploymentImmutableFields(t *testing.T) {
+	t.Parallel()
 	scheme := newTestScheme(t)
 	replicas := int32(2)
 	stack := &olricv1alpha1.OlricStack{

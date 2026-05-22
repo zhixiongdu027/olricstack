@@ -172,6 +172,7 @@ func decodeRing(t *testing.T, payload []byte) oplog.Entry {
 }
 
 func TestBeforeSetStampsFenceWithoutPublishing(t *testing.T) {
+	t.Parallel()
 	r := newRecordingRing()
 	c := &stubControl{}
 	hook := newTestDurableHook(t, r, c, fenceAt(7, 3))
@@ -192,6 +193,7 @@ func TestBeforeSetStampsFenceWithoutPublishing(t *testing.T) {
 }
 
 func TestBeforeSetRejectsExpiredLease(t *testing.T) {
+	t.Parallel()
 	r := newRecordingRing()
 	hook := newTestDurableHook(t, r, &stubControl{}, &fakeFenceLease{})
 
@@ -208,6 +210,7 @@ func TestBeforeSetRejectsExpiredLease(t *testing.T) {
 }
 
 func TestAfterSetSuccessPublishesToRing(t *testing.T) {
+	t.Parallel()
 	r := newRecordingRing()
 	c := &stubControl{}
 	hook := newTestDurableHook(t, r, c, fenceAt(7, 3))
@@ -242,6 +245,7 @@ func TestAfterSetSuccessPublishesToRing(t *testing.T) {
 }
 
 func TestAfterSetWithMutationErrorPublishesNothing(t *testing.T) {
+	t.Parallel()
 	r := newRecordingRing()
 	c := &stubControl{}
 	hook := newTestDurableHook(t, r, c, fenceAt(7, 3))
@@ -266,6 +270,7 @@ func TestAfterSetWithMutationErrorPublishesNothing(t *testing.T) {
 }
 
 func TestAfterDeletePublishesTombstone(t *testing.T) {
+	t.Parallel()
 	r := newRecordingRing()
 	hook := newTestDurableHook(t, r, &stubControl{}, fenceAt(11, 4))
 
@@ -289,6 +294,7 @@ func TestAfterDeletePublishesTombstone(t *testing.T) {
 }
 
 func TestAfterExpirePublishesExpire(t *testing.T) {
+	t.Parallel()
 	r := newRecordingRing()
 	hook := newTestDurableHook(t, r, &stubControl{}, fenceAt(2, 9))
 
@@ -313,6 +319,7 @@ func TestAfterExpirePublishesExpire(t *testing.T) {
 }
 
 func TestVerifyAfterLockPassesOnUnchangedFence(t *testing.T) {
+	t.Parallel()
 	hook := newTestDurableHook(t, newRecordingRing(), &stubControl{}, fenceAt(7, 3))
 	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
 		DMap: "users", Key: "alice", HKey: 1, Entry: newTestEntry("alice", "A", 0, 1),
@@ -326,6 +333,7 @@ func TestVerifyAfterLockPassesOnUnchangedFence(t *testing.T) {
 }
 
 func TestVerifyAfterLockRejectsLeaseRevocation(t *testing.T) {
+	t.Parallel()
 	lease := fenceAt(7, 3)
 	hook := newTestDurableHook(t, newRecordingRing(), &stubControl{}, lease)
 	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
@@ -341,6 +349,7 @@ func TestVerifyAfterLockRejectsLeaseRevocation(t *testing.T) {
 }
 
 func TestVerifyAfterLockRejectsGenerationChange(t *testing.T) {
+	t.Parallel()
 	lease := fenceAt(7, 3)
 	hook := newTestDurableHook(t, newRecordingRing(), &stubControl{}, lease)
 	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
@@ -357,6 +366,7 @@ func TestVerifyAfterLockRejectsGenerationChange(t *testing.T) {
 }
 
 func TestLoadOnMissDelegatesToSidecar(t *testing.T) {
+	t.Parallel()
 	c := &stubControl{
 		loadFound: true,
 		loadResp: store.EntryRecord{
@@ -378,6 +388,7 @@ func TestLoadOnMissDelegatesToSidecar(t *testing.T) {
 }
 
 func TestLoadOnMissPropagatesNotFoundFromSidecar(t *testing.T) {
+	t.Parallel()
 	hook := newTestDurableHook(t, newRecordingRing(), &stubControl{}, fenceAt(1, 1))
 	_, err := hook.LoadOnMiss(context.Background(), olricconfig.DurableOperation{
 		DMap: "users", Key: "missing", HKey: 1, Entry: newTestEntry("", "", 0, 0),
@@ -388,6 +399,7 @@ func TestLoadOnMissPropagatesNotFoundFromSidecar(t *testing.T) {
 }
 
 func TestDrainForHandoffCallsDrainPartition(t *testing.T) {
+	t.Parallel()
 	c := &stubControl{}
 	hook := newTestDurableHook(t, newRecordingRing(), c, fenceAt(1, 1))
 	if err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{
@@ -405,6 +417,7 @@ func TestDrainForHandoffCallsDrainPartition(t *testing.T) {
 }
 
 func TestDrainForHandoffSurfacesError(t *testing.T) {
+	t.Parallel()
 	c := &stubControl{drainErr: errors.New("mysql is down")}
 	hook := newTestDurableHook(t, newRecordingRing(), c, fenceAt(1, 1))
 	err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{
@@ -416,6 +429,7 @@ func TestDrainForHandoffSurfacesError(t *testing.T) {
 }
 
 func TestDrainForHandoffNoOpOnZeroPartitionCount(t *testing.T) {
+	t.Parallel()
 	c := &stubControl{}
 	hook := newTestDurableHook(t, newRecordingRing(), c, fenceAt(1, 1))
 	if err := hook.DrainForHandoff(context.Background(), olricconfig.DurableHandoff{DMap: "users"}); err != nil {
@@ -427,6 +441,7 @@ func TestDrainForHandoffNoOpOnZeroPartitionCount(t *testing.T) {
 }
 
 func TestAppendRetriesOnTransientFull(t *testing.T) {
+	t.Parallel()
 	r := newRecordingRing()
 	r.errs = []error{ring.ErrRingFull, ring.ErrRingFull, nil}
 	hook := newTestDurableHook(t, r, &stubControl{}, fenceAt(1, 1))
@@ -448,6 +463,7 @@ func TestAppendRetriesOnTransientFull(t *testing.T) {
 }
 
 func TestAppendBudgetExceededReturnsError(t *testing.T) {
+	t.Parallel()
 	r := newRecordingRing()
 	for i := 0; i < 100; i++ {
 		r.errs = append(r.errs, ring.ErrRingFull)
@@ -486,6 +502,7 @@ func (s *countingSequencer) Stamp(g, e int64) (int64, int64, int64, error) {
 // must NOT stamp owner_seq, NOT append to the ring, and NOT notify the
 // sidecar. There is no prepared state to roll back.
 func TestAfterXDoesNotPublishOnMutationError(t *testing.T) {
+	t.Parallel()
 	mutErr := errors.New("simulated fork mutation failure")
 
 	type op string
@@ -506,6 +523,7 @@ func TestAfterXDoesNotPublishOnMutationError(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			r := newRecordingRing()
 			c := &stubControl{}
 			seq := &countingSequencer{fakeFenceSequencer: newFakeFenceSequencer()}
@@ -563,6 +581,7 @@ func TestAfterXDoesNotPublishOnMutationError(t *testing.T) {
 }
 
 func TestFenceSequenceIsMonotonic(t *testing.T) {
+	t.Parallel()
 	r := newRecordingRing()
 	hook := newTestDurableHook(t, r, &stubControl{}, fenceAt(1, 1))
 	for i := 0; i < 3; i++ {
