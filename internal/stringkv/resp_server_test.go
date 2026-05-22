@@ -3,6 +3,7 @@ package stringkv
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -286,5 +287,97 @@ func TestRESPServerShutdownIsIdempotent(t *testing.T) {
 	}
 	if err := server.Shutdown(); err != nil {
 		t.Fatalf("second shutdown should be a no-op, got %v", err)
+	}
+}
+
+// recordingProvider fails the test if its DMap method is invoked. It pins the
+// invariant that requireLease() gates every command BEFORE the backing
+// provider is consulted, so a denied lease must not reach the DMap layer.
+type recordingProvider struct {
+	t      *testing.T
+	called int
+}
+
+func (p *recordingProvider) DMap(string) (DMap, error) {
+	p.called++
+	p.t.Errorf("backing provider unexpectedly called when lease is denied")
+	return nil, errors.New("provider should not be called")
+}
+
+// TestRESPReturnsTRYAGAINWhenLeaseExpired pins the wire-level mapping in
+// resp_server.go:282-283: when Service.requireLease() denies the request,
+// every mutation/read RESP command must emit the literal
+// "-TRYAGAIN serving lease is expired\r\n" error and the backing DMap
+// provider must never be invoked.
+func TestRESPReturnsTRYAGAINWhenLeaseExpired(t *testing.T) {
+	provider := &recordingProvider{t: t}
+	service, err := NewService(provider, &fakeLease{allowed: false})
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := listener.Addr().String()
+	_ = listener.Close()
+
+	server, err := NewRESPServer(service, RESPServerConfig{
+		Addr:           addr,
+		CommandTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new resp server: %v", err)
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.ListenAndServe() }()
+	t.Cleanup(func() {
+		_ = server.Shutdown()
+		select {
+		case <-errCh:
+		case <-time.After(time.Second):
+			t.Fatal("resp server did not stop")
+		}
+	})
+	waitForTCP(t, addr)
+
+	const wantWire = "-TRYAGAIN serving lease is expired\r\n"
+
+	cases := []struct {
+		name string
+		cmd  string
+	}{
+		{"SET", "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"},
+		{"GET", "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"},
+		{"DEL", "*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n"},
+		{"EXPIRE", "*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$1\r\n5\r\n"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+			if _, err := conn.Write([]byte(tc.cmd)); err != nil {
+				t.Fatalf("write %s: %v", tc.name, err)
+			}
+
+			buf := make([]byte, len(wantWire))
+			if _, err := io.ReadFull(conn, buf); err != nil {
+				t.Fatalf("read %s: %v", tc.name, err)
+			}
+			if got := string(buf); got != wantWire {
+				t.Fatalf("%s wire mismatch:\nwant %q\n got %q", tc.name, wantWire, got)
+			}
+		})
+	}
+
+	if provider.called != 0 {
+		t.Fatalf("expected backing provider to be untouched, got %d calls", provider.called)
 	}
 }

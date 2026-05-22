@@ -468,6 +468,100 @@ func TestAppendBudgetExceededReturnsError(t *testing.T) {
 	}
 }
 
+// countingSequencer wraps fakeFenceSequencer and counts Stamp invocations so
+// the test can pin that AfterX did not allocate an owner sequence when the
+// mutation reported failure.
+type countingSequencer struct {
+	*fakeFenceSequencer
+	stamps int
+}
+
+func (s *countingSequencer) Stamp(g, e int64) (int64, int64, int64, error) {
+	s.stamps++
+	return s.fakeFenceSequencer.Stamp(g, e)
+}
+
+// TestAfterXDoesNotPublishOnMutationError pins the AfterX contract documented
+// at durable_hook.go:53-58: when the fork reports a mutation error, AfterX
+// must NOT stamp owner_seq, NOT append to the ring, and NOT notify the
+// sidecar. There is no prepared state to roll back.
+func TestAfterXDoesNotPublishOnMutationError(t *testing.T) {
+	mutErr := errors.New("simulated fork mutation failure")
+
+	type op string
+	const (
+		opSet    op = "set"
+		opDelete op = "delete"
+		opExpire op = "expire"
+	)
+
+	cases := []struct {
+		name string
+		op   op
+	}{
+		{"AfterSet", opSet},
+		{"AfterDelete", opDelete},
+		{"AfterExpire", opExpire},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRecordingRing()
+			c := &stubControl{}
+			seq := &countingSequencer{fakeFenceSequencer: newFakeFenceSequencer()}
+			hook, err := NewDurableHook(r, c, fenceAt(1, 1), seq, "test-writer", Config{})
+			if err != nil {
+				t.Fatalf("new durable hook: %v", err)
+			}
+
+			ctx := context.Background()
+			base := olricconfig.DurableOperation{
+				DMap: "users", Key: "alice", HKey: HKey("users", "alice"),
+			}
+
+			var (
+				stamped olricconfig.DurableOperation
+				afterFn func(context.Context, olricconfig.DurableOperation, error) error
+			)
+			switch tc.op {
+			case opSet:
+				base.Entry = newTestEntry("alice", "A", 0, 1)
+				stamped, err = hook.BeforeSet(ctx, base)
+				afterFn = hook.AfterSet
+			case opDelete:
+				// BeforeDelete tolerates a nil entry per the production code.
+				stamped, err = hook.BeforeDelete(ctx, base)
+				afterFn = hook.AfterDelete
+			case opExpire:
+				base.Entry = newTestEntry("alice", "A", time.Now().Add(time.Hour).UnixMilli(), 1)
+				stamped, err = hook.BeforeExpire(ctx, base)
+				afterFn = hook.AfterExpire
+			}
+			if err != nil {
+				t.Fatalf("before %s: %v", tc.name, err)
+			}
+			if stamped.FenceGeneration != 1 || stamped.FenceEpoch != 1 {
+				t.Fatalf("before %s expected fence (1,1), got (%d,%d)",
+					tc.name, stamped.FenceGeneration, stamped.FenceEpoch)
+			}
+
+			if err := afterFn(ctx, stamped, mutErr); err != nil {
+				t.Fatalf("%s with mutation error must be a silent no-op, got %v", tc.name, err)
+			}
+
+			if got := r.snapshot(); len(got) != 0 {
+				t.Fatalf("%s must not append to ring on mutation error, got %d entries", tc.name, len(got))
+			}
+			if c.notifyCalls != 0 {
+				t.Fatalf("%s must not notify sidecar on mutation error, got %d calls", tc.name, c.notifyCalls)
+			}
+			if seq.stamps != 0 {
+				t.Fatalf("%s must not allocate owner_seq on mutation error, got %d Stamp calls", tc.name, seq.stamps)
+			}
+		})
+	}
+}
+
 func TestFenceSequenceIsMonotonic(t *testing.T) {
 	r := newRecordingRing()
 	hook := newTestDurableHook(t, r, &stubControl{}, fenceAt(1, 1))
