@@ -1,4 +1,4 @@
-.PHONY: test test-third-party e2e e2e-host e2e-kind fmt-check vet test-race test-third-party-race coverage build verify
+.PHONY: test test-third-party e2e e2e-host e2e-kind fmt-check vet test-race test-third-party-race coverage build verify lint tidy-check govulncheck verify-pr
 
 test:
 	go test -count=1 ./...
@@ -35,3 +35,19 @@ build:
 	go build ./cmd/olric-node ./cmd/olric-sidecar ./cmd/watchdog ./cmd/operator ./cmd/olric-e2e-client
 
 verify: vet test build
+
+lint:
+	@command -v golangci-lint >/dev/null 2>&1 || { \
+		echo "golangci-lint not found on PATH."; \
+		echo "Install with: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.5.0"; \
+		exit 1; \
+	}
+	golangci-lint run --timeout=5m
+
+tidy-check:
+	go mod tidy -diff
+
+govulncheck:
+	govulncheck ./...
+
+verify-pr: vet lint tidy-check fmt-check test test-race build

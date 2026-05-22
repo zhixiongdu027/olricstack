@@ -1,0 +1,83 @@
+version: "2"
+
+# Olric/OlricStack lint policy. Conservative by design: a CI lint failure must
+# represent a real defect, not a stylistic preference. Add to enable list only
+# after the project agrees on the rule; never disable a rule mid-PR without
+# discussion.
+
+run:
+  timeout: 5m
+  tests: true
+  build-tags:
+    - e2e
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosec
+    - misspell
+    - unconvert
+    - bodyclose
+    - rowserrcheck
+    - sqlclosecheck
+    - copyloopvar
+    - durationcheck
+    - errorlint
+    - nilerr
+    - prealloc
+  settings:
+    errcheck:
+      # Calls whose return value is intentionally discarded. Keep tight.
+      exclude-functions:
+        - (io.Closer).Close
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - fmt.Fprintln
+        - fmt.Fprintf
+        - fmt.Fprint
+    gosec:
+      excludes:
+        # G104: errcheck already covers unhandled errors more precisely.
+        - G104
+        # G115: integer overflow on int <-> int64 conversion. The codebase
+        # already treats fence counters as int64 throughout; explicit guards
+        # are pervasive and the lint produces too many false positives on
+        # benign cursor arithmetic.
+        - G115
+    staticcheck:
+      checks:
+        - all
+        # ST1000: package comment requirement is over-strict for internal/.
+        - "-ST1000"
+        # ST1003: naming rules (initialisms) collide with proto-gen code.
+        - "-ST1003"
+  exclusions:
+    rules:
+      # Generated protobuf and gRPC bindings — third-party style, not ours.
+      - path: api/topology/v1/.*\.pb\.go$
+        linters:
+          - all
+      # Third-party fork: not in our authority to change.
+      - path: third_party/.*
+        linters:
+          - all
+      # Test files relax some rules.
+      - path: _test\.go$
+        linters:
+          - errcheck
+          - gosec
+          - prealloc
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/zhixiongdu/olricstack
