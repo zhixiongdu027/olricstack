@@ -101,7 +101,7 @@ func TestControllerReportsPodObservations(t *testing.T) {
 	scheme := newTestScheme(t)
 	stack := &olricv1alpha1.OlricStack{
 		ObjectMeta: metav1.ObjectMeta{Name: "demo", Namespace: "default"},
-		Spec: olricv1alpha1.OlricStackSpec{},
+		Spec:       olricv1alpha1.OlricStackSpec{},
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{

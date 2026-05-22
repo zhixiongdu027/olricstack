@@ -45,7 +45,13 @@ lint:
 	golangci-lint run --timeout=5m
 
 tidy-check:
-	go mod tidy -diff
+	@if go mod tidy -diff >/dev/null 2>&1; then \
+		go mod tidy -diff; \
+	else \
+		echo "go mod tidy -diff unavailable (need Go 1.23+); falling back to tidy + git diff"; \
+		go mod tidy; \
+		git diff --exit-code go.mod go.sum; \
+	fi
 
 govulncheck:
 	govulncheck ./...

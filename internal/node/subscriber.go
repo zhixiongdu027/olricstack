@@ -162,8 +162,8 @@ func NewLeaseTracker() *LeaseTracker {
 //   - env.generation <  cur.generation  ⇒ ErrStaleWatchdogGeneration
 //   - env.generation >  cur.generation  ⇒ accept, reset epoch baseline (N1)
 //   - env.generation == cur.generation:
-//       env.epoch    <  cur.epoch       ⇒ ErrStaleTopologyEpoch
-//       env.epoch    >= cur.epoch       ⇒ accept
+//     env.epoch    <  cur.epoch       ⇒ ErrStaleTopologyEpoch
+//     env.epoch    >= cur.epoch       ⇒ accept
 //
 // On accept (generation, epoch, validUntilUnixMs) are persisted atomically
 // under l.mu so that ServingAllowed/SnapshotForWrite cannot read a torn state.
