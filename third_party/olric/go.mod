@@ -15,7 +15,7 @@ require (
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529
 	github.com/stretchr/testify v1.10.0
 	github.com/tidwall/btree v1.7.0
-	github.com/tidwall/match v1.1.1
+	github.com/tidwall/match v1.2.0
 	github.com/tidwall/redcon v1.6.2
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	golang.org/x/sync v0.14.0
