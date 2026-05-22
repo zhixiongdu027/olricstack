@@ -12,7 +12,7 @@ require (
 	github.com/tidwall/redcon v1.6.2
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	golang.org/x/sys v0.42.0
-	google.golang.org/grpc v1.81.0
+	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
 	gorm.io/driver/mysql v1.6.0
 	gorm.io/gorm v1.31.1
