@@ -397,6 +397,182 @@ func TestPurgeBelowGenerationCleansPending(t *testing.T) {
 	}
 }
 
+// pendingSize returns the number of entries currently held in srv.pending,
+// taking srv.pending.mu so the read is race-free. Lives in the test file
+// because srv.pending is unexported and we deliberately do not add an
+// accessor to production code for pin tests.
+func pendingSize(srv *Server) int {
+	srv.pending.mu.Lock()
+	defer srv.pending.mu.Unlock()
+	return len(srv.pending.entries)
+}
+
+// PIN TEST for D5: sidecar pending map has no upper bound and no
+// back-pressure to the producer when MySQL is unavailable. A future fix
+// should add a cap (e.g., MaxPending in Config) plus a mechanism that
+// either drops oldest, blocks the consumer's drainRing, or signals the
+// producer to stop. When that fix lands, this test must be updated to
+// assert the new bounded behavior.
+func TestPendingGrowsUnboundedWhenMySQLFails(t *testing.T) {
+	backend := newStubBackend()
+	backend.upsertErr = errors.New("mysql down")
+
+	path := t.TempDir() + "/ring.dat"
+	if err := ring.Create(path, 64*1024); err != nil {
+		t.Fatalf("ring create: %v", err)
+	}
+	prod, err := ring.OpenProducer(path)
+	if err != nil {
+		t.Fatalf("ring open producer: %v", err)
+	}
+	defer prod.Close()
+	cons, err := ring.OpenConsumer(path)
+	if err != nil {
+		t.Fatalf("ring open consumer: %v", err)
+	}
+	defer cons.Close()
+
+	srv, err := NewServer(cons, backend, Config{
+		BatchSize:    256,
+		IdlePoll:     10 * time.Millisecond,
+		FlushTimeout: time.Second,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	const n = 50
+	for i := 1; i <= n; i++ {
+		appendEntry(t, prod, oplog.Entry{
+			Op:           oplog.OpSet,
+			DMap:         "users",
+			Key:          "k" + itoa(i),
+			HKey:         uint64(i),
+			Generation:   1,
+			Epoch:        1,
+			OwnerSeq:     int64(i),
+			WriterID:     "node-A",
+			EncodedEntry: []byte("v"),
+		})
+	}
+
+	// Drive drainRing manually. We cannot use Run() because Run exits on
+	// the first flushOnce error and would terminate before all entries
+	// land in pending.
+	for {
+		drained, err := srv.drainRing()
+		if err != nil {
+			t.Fatalf("drain ring: %v", err)
+		}
+		if drained == 0 {
+			break
+		}
+	}
+
+	flushErr := srv.flushOnce(context.Background())
+	if flushErr == nil {
+		t.Fatal("expected flushOnce to surface backend error")
+	}
+	if !errors.Is(flushErr, backend.upsertErr) {
+		t.Fatalf("expected flush error to wrap %q, got %v", backend.upsertErr, flushErr)
+	}
+
+	if got := pendingSize(srv); got != n {
+		t.Fatalf("pending map should still hold all %d entries after failed flush "+
+			"(no cap, no back-pressure); got %d. If you added bounding, update this pin test.", n, got)
+	}
+}
+
+// REGRESSION TEST for D11: Server.Run currently exits on the first
+// flushOnce error (see control.go:237-239). This means a transient MySQL
+// error stops the consumer permanently. A proper fix should keep Run
+// alive across transient errors with bounded backoff while surfacing
+// repeated failures via metrics/health. When that fix lands, update this
+// test to assert continued operation across N errors followed by
+// recovery.
+func TestRunExitsOnFlushError(t *testing.T) {
+	backend := newStubBackend()
+	backend.upsertErr = errors.New("transient mysql error")
+
+	path := t.TempDir() + "/ring.dat"
+	if err := ring.Create(path, 64*1024); err != nil {
+		t.Fatalf("ring create: %v", err)
+	}
+	prod, err := ring.OpenProducer(path)
+	if err != nil {
+		t.Fatalf("ring open producer: %v", err)
+	}
+	defer prod.Close()
+	cons, err := ring.OpenConsumer(path)
+	if err != nil {
+		t.Fatalf("ring open consumer: %v", err)
+	}
+	defer cons.Close()
+
+	srv, err := NewServer(cons, backend, Config{
+		BatchSize:    16,
+		IdlePoll:     5 * time.Millisecond,
+		FlushTimeout: 500 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	appendEntry(t, prod, oplog.Entry{
+		Op:           oplog.OpSet,
+		DMap:         "users",
+		Key:          "only",
+		HKey:         1,
+		Generation:   1,
+		Epoch:        1,
+		OwnerSeq:     1,
+		WriterID:     "node-A",
+		EncodedEntry: []byte("v"),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runDone := make(chan error, 1)
+	go func() { runDone <- srv.Run(ctx) }()
+
+	select {
+	case err := <-runDone:
+		if err == nil {
+			t.Fatal("expected Run to return an error on flush failure")
+		}
+		if !errors.Is(err, backend.upsertErr) {
+			t.Fatalf("expected Run error to wrap %q, got %v", backend.upsertErr, err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not exit on flush error within 2s")
+	}
+}
+
+// itoa is a tiny test-local int-to-string to avoid importing strconv just
+// for crafting distinct keys.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	pos := len(buf)
+	neg := false
+	if n < 0 {
+		neg = true
+		n = -n
+	}
+	for n > 0 {
+		pos--
+		buf[pos] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		pos--
+		buf[pos] = '-'
+	}
+	return string(buf[pos:])
+}
+
 func TestFlushDoesNotDropNewerPendingEntryForSameRef(t *testing.T) {
 	backend := newStubBackend()
 	backend.blockUpsert = make(chan struct{})
