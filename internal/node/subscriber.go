@@ -77,7 +77,16 @@ func (s *Subscriber) Run(ctx context.Context, client topologypb.TopologyControlC
 	if err != nil {
 		return err
 	}
+	// The heartbeat goroutine below calls stream.Send concurrently with the
+	// rest of Run. gRPC clientStream's CloseSend and SendMsg share internal
+	// state and are not mutually safe, so the deferred CloseSend must wait
+	// for the heartbeat goroutine to fully exit before running. Cancelling
+	// runCtx unblocks any in-flight Send (gRPC honors the stream context),
+	// so wg.Wait is bounded.
+	var wg sync.WaitGroup
 	defer func() {
+		cancel()
+		wg.Wait()
 		_ = stream.CloseSend()
 	}()
 
@@ -100,7 +109,9 @@ func (s *Subscriber) Run(ctx context.Context, client topologypb.TopologyControlC
 	}
 
 	errCh := make(chan error, 1)
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		ticker := time.NewTicker(s.cfg.HeartbeatInterval)
 		defer ticker.Stop()
 
