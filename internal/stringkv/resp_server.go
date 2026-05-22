@@ -41,6 +41,11 @@ type RESPServer struct {
 
 	running  atomic.Bool
 	stopping atomic.Bool
+	// mu serializes the stopping-check + inflight.Add pair in handle against
+	// Shutdown's inflight.Wait. Without it, handle could observe stopping==false,
+	// then race with Shutdown flipping stopping and calling Wait on an empty
+	// WaitGroup — a textbook Add-after-Wait race flagged by -race.
+	mu       sync.RWMutex
 	inflight sync.WaitGroup
 }
 
@@ -98,6 +103,13 @@ func (s *RESPServer) Shutdown() error {
 		return nil
 	}
 
+	// Drain any handle goroutine that already passed the stopping check but
+	// has not yet completed inflight.Add. Once we have held the write lock,
+	// every subsequent handle call will observe stopping==true under the
+	// read lock and bail out before touching inflight.
+	s.mu.Lock()
+	s.mu.Unlock() //nolint:staticcheck // intentional barrier, not a guarded section
+
 	done := make(chan struct{})
 	go func() {
 		s.inflight.Wait()
@@ -124,12 +136,18 @@ func (s *RESPServer) handle(conn redcon.Conn, cmd redcon.Command) {
 		conn.WriteError("ERR empty command")
 		return
 	}
+	// Pair the stopping check with inflight.Add under a read lock so Shutdown
+	// (which takes the write lock after flipping stopping) cannot observe a
+	// zero WaitGroup, call Wait, and then race with a late Add from here.
+	s.mu.RLock()
 	if s.stopping.Load() {
+		s.mu.RUnlock()
 		conn.WriteError("ERR server is shutting down")
 		_ = conn.Close()
 		return
 	}
 	s.inflight.Add(1)
+	s.mu.RUnlock()
 	defer s.inflight.Done()
 
 	name := strings.ToUpper(argString(cmd.Args[0]))
