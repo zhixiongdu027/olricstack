@@ -5,6 +5,15 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+      - 'LICENSE'
+      - 'LICENSE*'
+      - '**/*.png'
+      - '**/*.jpg'
+      - '**/*.svg'
+      - '.gitignore'
+      - '.editorconfig'
+      - '.vscode/**'
+      - '.idea/**'
   push:
     branches:
       - master
@@ -13,6 +22,15 @@ on:
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
+      - 'LICENSE'
+      - 'LICENSE*'
+      - '**/*.png'
+      - '**/*.jpg'
+      - '**/*.svg'
+      - '.gitignore'
+      - '.editorconfig'
+      - '.vscode/**'
+      - '.idea/**'
   workflow_dispatch:
 
 permissions:
@@ -51,6 +69,7 @@ jobs:
   unit-and-race:
     name: unit, build, race
     runs-on: ubuntu-latest
+    needs: [lint]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -73,6 +92,7 @@ jobs:
   security:
     name: security
     runs-on: ubuntu-latest
+    needs: [lint]
     timeout-minutes: 15
     permissions:
       contents: read
@@ -88,7 +108,7 @@ jobs:
       - name: Run govulncheck
         run: govulncheck ./...
       - name: Run gosec
-        uses: securego/gosec@master
+        uses: securego/gosec@d4617f51baf75f4f809066386a4f9d27b3ac3e46 # v2.21.4
         with:
           args: '-no-fail -fmt sarif -out gosec.sarif ./...'
       - name: Upload SARIF
@@ -100,6 +120,7 @@ jobs:
   integration:
     name: integration and host smoke
     runs-on: ubuntu-latest
+    needs: [lint]
     timeout-minutes: 30
     services:
       mysql:
@@ -110,9 +131,10 @@ jobs:
           - 13306:3306
         options: >-
           --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ppassword"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=30
+          --health-interval=3s
+          --health-timeout=3s
+          --health-retries=20
+          --health-start-period=10s
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -121,7 +143,7 @@ jobs:
           cache: true
       - name: Sidecar and topology tests
         run: |
-          go test -count=1 ./internal/sidecar ./internal/topology ./internal/watchdog ./internal/node ./internal/operator ./internal/stringkv
+          go test ./internal/sidecar ./internal/topology ./internal/watchdog ./internal/node ./internal/operator ./internal/stringkv
       - name: Host lifecycle e2e
         env:
           E2E_MYSQL_PORT: "13306"
@@ -135,7 +157,8 @@ jobs:
   host-e2e:
     name: host e2e deep
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    needs: [lint]
+    timeout-minutes: 60
     services:
       mysql:
         image: mysql:8.4
@@ -145,9 +168,10 @@ jobs:
           - 13306:3306
         options: >-
           --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ppassword"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=30
+          --health-interval=3s
+          --health-timeout=3s
+          --health-retries=20
+          --health-start-period=10s
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -167,6 +191,7 @@ jobs:
   kind-e2e:
     name: kind cluster smoke
     runs-on: ubuntu-latest
+    needs: [unit-and-race]
     timeout-minutes: 35
     services:
       mysql:
@@ -178,9 +203,10 @@ jobs:
           - 3306:3306
         options: >-
           --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ppassword"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=30
+          --health-interval=3s
+          --health-timeout=3s
+          --health-retries=20
+          --health-start-period=10s
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -228,7 +254,8 @@ jobs:
   kind-e2e-deep:
     name: kind cluster deep
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    needs: [unit-and-race]
+    timeout-minutes: 60
     services:
       mysql:
         image: mysql:8.4
@@ -239,9 +266,10 @@ jobs:
           - 3306:3306
         options: >-
           --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ppassword"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=30
+          --health-interval=3s
+          --health-timeout=3s
+          --health-retries=20
+          --health-start-period=10s
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
