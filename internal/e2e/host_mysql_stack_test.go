@@ -993,6 +993,11 @@ type hostOlricNode struct {
 	errCh        chan error
 	sidecarErrCh chan error
 	logs         *lockedBuffer
+	nodeLog       *lockedBuffer  // node stdout+stderr only, raw
+	sidecarLog    *lockedBuffer  // sidecar stdout+stderr only, raw
+	diagDir       string         // <tempdir>/diag/nodes/<nodeID>
+	nodePrefix    *prefixWriter  // for Flush on stop
+	sidecarPrefix *prefixWriter  // for Flush on stop
 }
 
 type hostNodeBinaries struct {
@@ -1018,6 +1023,8 @@ func (n *hostOlricNode) kill(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatalf("host olric-sidecar did not exit after SIGKILL\nlogs:\n%s", strings.TrimSpace(n.logs.String()))
 	}
+	n.nodePrefix.Flush()
+	n.sidecarPrefix.Flush()
 }
 
 func (n *hostOlricNode) suspend(t *testing.T) {
@@ -1109,7 +1116,19 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 	if memberQuorum <= 0 {
 		memberQuorum = 1
 	}
-	logs := &lockedBuffer{}
+	merged := &lockedBuffer{}
+	nodeBuf := &lockedBuffer{}
+	sidecarBuf := &lockedBuffer{}
+
+	nodeDiagDir := diagDirForNode(t, cfg.nodeID)
+	nodeFile := openDiagFile(t, nodeDiagDir, "node.log")
+	sidecarFile := openDiagFile(t, nodeDiagDir, "sidecar.log")
+
+	nodePfx := newPrefixWriter("node", merged)
+	sidecarPfx := newPrefixWriter("sidecar", merged)
+
+	nodeW := newTeeWriter(nodeBuf, nodeFile, nodePfx)
+	sidecarW := newTeeWriter(sidecarBuf, sidecarFile, sidecarPfx)
 
 	sharedDir := t.TempDir()
 	ringPath := filepath.Join(sharedDir, "oplog.ring")
@@ -1118,8 +1137,8 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 	sidecarBinary := buildBinary(t, parent, repoRoot, filepath.Join(t.TempDir(), "olric-sidecar"), "./cmd/olric-sidecar", nil)
 	sidecarCmd := exec.Command(sidecarBinary)
 	sidecarCmd.Dir = repoRoot
-	sidecarCmd.Stdout = logs
-	sidecarCmd.Stderr = logs
+	sidecarCmd.Stdout = sidecarW
+	sidecarCmd.Stderr = sidecarW
 	sidecarCmd.Env = append(os.Environ(),
 		"MYSQL_DSN="+cfg.mysqlDSNOrFallback(),
 		"RING_PATH="+ringPath,
@@ -1132,8 +1151,8 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 
 	cmd := exec.Command(nodeBinary)
 	cmd.Dir = repoRoot
-	cmd.Stdout = logs
-	cmd.Stderr = logs
+	cmd.Stdout = nodeW
+	cmd.Stderr = nodeW
 	cmd.Env = append(os.Environ(),
 		"STACK_ID=host-only",
 		"WATCHDOG_SVC_NAME="+cfg.watchdogAddr,
@@ -1167,17 +1186,22 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 	}
 
 	node := &hostOlricNode{
-		nodeID:       cfg.nodeID,
-		repoRoot:     repoRoot,
-		clientBinary: clientBinary,
-		bindAddr:     cfg.bindAddr,
-		olricPort:    olricPort,
-		respPort:     respPort,
-		cmd:          cmd,
-		sidecarCmd:   sidecarCmd,
-		errCh:        make(chan error, 1),
-		sidecarErrCh: make(chan error, 1),
-		logs:         logs,
+		nodeID:        cfg.nodeID,
+		repoRoot:      repoRoot,
+		clientBinary:  clientBinary,
+		bindAddr:      cfg.bindAddr,
+		olricPort:     olricPort,
+		respPort:      respPort,
+		cmd:           cmd,
+		sidecarCmd:    sidecarCmd,
+		errCh:         make(chan error, 1),
+		sidecarErrCh:  make(chan error, 1),
+		logs:          merged,
+		nodeLog:       nodeBuf,
+		sidecarLog:    sidecarBuf,
+		diagDir:       nodeDiagDir,
+		nodePrefix:    nodePfx,
+		sidecarPrefix: sidecarPfx,
 	}
 	go func() {
 		node.errCh <- cmd.Wait()
@@ -1186,9 +1210,9 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 		node.sidecarErrCh <- sidecarCmd.Wait()
 	}()
 
-	waitForText(t, parent, logs, "received topology push")
-	waitForText(t, parent, logs, "olric node bootstrap complete")
-	waitForText(t, parent, logs, "sidecar bootstrap complete")
+	waitForText(t, parent, merged, "received topology push")
+	waitForText(t, parent, merged, "olric node bootstrap complete")
+	waitForText(t, parent, merged, "sidecar bootstrap complete")
 	return node
 }
 
@@ -1293,6 +1317,8 @@ func (n *hostOlricNode) stop(t *testing.T) {
 		_ = n.sidecarCmd.Process.Kill()
 		t.Fatalf("host olric-sidecar did not exit after SIGTERM\nlogs:\n%s", strings.TrimSpace(n.logs.String()))
 	}
+	n.nodePrefix.Flush()
+	n.sidecarPrefix.Flush()
 }
 
 func bestEffortStopHostNode(n *hostOlricNode) {
@@ -1321,6 +1347,12 @@ func bestEffortStopHostNode(n *hostOlricNode) {
 		if n.sidecarCmd != nil && n.sidecarCmd.Process != nil {
 			_ = n.sidecarCmd.Process.Kill()
 		}
+	}
+	if n.nodePrefix != nil {
+		n.nodePrefix.Flush()
+	}
+	if n.sidecarPrefix != nil {
+		n.sidecarPrefix.Flush()
 	}
 }
 
@@ -2035,4 +2067,86 @@ func (p *tcpProxy) snapshotConnsLocked() []net.Conn {
 		conns = append(conns, conn)
 	}
 	return conns
+}
+
+// prefixWriter wraps an io.Writer and prepends "[tag] " at the start of
+// every line. It buffers partial lines. Safe for concurrent use.
+type prefixWriter struct {
+	mu    sync.Mutex
+	tag   string
+	out   *lockedBuffer
+	carry []byte
+}
+
+func newPrefixWriter(tag string, out *lockedBuffer) *prefixWriter {
+	return &prefixWriter{tag: tag, out: out}
+}
+
+func (p *prefixWriter) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.carry = append(p.carry, b...)
+	for {
+		i := bytes.IndexByte(p.carry, '\n')
+		if i < 0 {
+			break
+		}
+		line := p.carry[:i+1]
+		p.carry = p.carry[i+1:]
+		p.out.Write([]byte("[" + p.tag + "] "))
+		p.out.Write(line)
+	}
+	return len(b), nil
+}
+
+func (p *prefixWriter) Flush() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.carry) > 0 {
+		p.out.Write([]byte("[" + p.tag + "] "))
+		p.out.Write(p.carry)
+		p.out.Write([]byte("\n"))
+		p.carry = nil
+	}
+}
+
+// teeWriter fans out one Write call to multiple writers; errors on
+// non-primary (first) writers are ignored so a disk-full doesn't break the test.
+type teeWriter struct {
+	primary io.Writer
+	extras  []io.Writer
+}
+
+func newTeeWriter(primary io.Writer, extras ...io.Writer) *teeWriter {
+	return &teeWriter{primary: primary, extras: extras}
+}
+
+func (tw *teeWriter) Write(b []byte) (int, error) {
+	n, err := tw.primary.Write(b)
+	for _, w := range tw.extras {
+		_, _ = w.Write(b)
+	}
+	return n, err
+}
+
+// openDiagFile creates a log file under dir and registers t.Cleanup to close it.
+func openDiagFile(t *testing.T, dir, name string) *os.File {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("openDiagFile mkdir: %v", err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatalf("openDiagFile open: %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f
+}
+
+// diagDirForNode returns "<t.TempDir()>/diag/nodes/<nodeID>" and ensures it exists.
+func diagDirForNode(t *testing.T, nodeID string) string {
+	t.Helper()
+	d := filepath.Join(t.TempDir(), "diag", "nodes", nodeID)
+	_ = os.MkdirAll(d, 0o755)
+	return d
 }
