@@ -3,11 +3,15 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,13 +70,70 @@ func provisionHostMySQL(t *testing.T, clusterHost string) *hostMySQL {
 		_ = db.Close()
 	})
 
-	return &hostMySQL{
+	result := &hostMySQL{
 		clusterHost: base.clusterHost,
 		hostPort:    base.hostPort,
 		database:    database,
 		user:        base.user,
 		password:    base.password,
 	}
+
+	// Register failure-dump hook: snapshot the olric_cache_records table as CSV.
+	// Registered AFTER the drop-DB cleanup above so that LIFO ordering runs the
+	// diag dump first (while the database still exists).
+	{
+		dsn := result.hostDSN()
+		bundle := e2eDiagFor(t)
+		bundle.addDumper(func(ctx context.Context, root string) {
+			mysqlDiagDir := filepath.Join(root, "mysql")
+			_ = os.MkdirAll(mysqlDiagDir, 0o755)
+
+			dumpDB, err := sql.Open("mysql", dsn)
+			if err != nil {
+				_ = os.WriteFile(filepath.Join(mysqlDiagDir, "open-error.txt"), []byte(err.Error()), 0o644)
+				return
+			}
+			defer dumpDB.Close()
+
+			rows, err := dumpDB.QueryContext(ctx,
+				"SELECT dmap, `key`, hkey, ttl, timestamp, tombstone, generation, epoch, owner_seq, writer_id, updated_at FROM olric_cache_records ORDER BY dmap, hkey")
+			if err != nil {
+				_ = os.WriteFile(filepath.Join(mysqlDiagDir, "olric_cache_records-error.txt"), []byte(err.Error()), 0o644)
+				return
+			}
+			defer rows.Close()
+
+			var buf bytes.Buffer
+			cols, _ := rows.Columns()
+			buf.WriteString(strings.Join(cols, ",") + "\n")
+
+			vals := make([]any, len(cols))
+			ptrs := make([]any, len(cols))
+			for i := range ptrs {
+				ptrs[i] = &vals[i]
+			}
+			for rows.Next() {
+				if err := rows.Scan(ptrs...); err != nil {
+					break
+				}
+				for i, v := range vals {
+					if i > 0 {
+						buf.WriteByte(',')
+					}
+					switch tv := v.(type) {
+					case []byte:
+						buf.WriteString(string(tv))
+					default:
+						fmt.Fprintf(&buf, "%v", tv)
+					}
+				}
+				buf.WriteByte('\n')
+			}
+			_ = os.WriteFile(filepath.Join(mysqlDiagDir, "olric_cache_records.csv"), buf.Bytes(), 0o644)
+		})
+	}
+
+	return result
 }
 
 type mysqlRecord struct {

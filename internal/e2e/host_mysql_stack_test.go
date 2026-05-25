@@ -5,8 +5,10 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -23,6 +25,7 @@ import (
 	"github.com/zhixiongdu/olricstack/internal/stringkv"
 	"github.com/zhixiongdu/olricstack/internal/topology"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 const hostRESPDMap = stringkv.DefaultDMap
@@ -1210,6 +1213,57 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 		node.sidecarErrCh <- sidecarCmd.Wait()
 	}()
 
+	// Register failure-dump hook for this node: ring file copy + hexdump,
+	// per-process log path log, and best-effort ps/lsof per PID.
+	{
+		n := node
+		ringSrc := ringPath
+		bundle := e2eDiagFor(t)
+		bundle.addDumper(func(ctx context.Context, root string) {
+			nodeDiagDir := filepath.Join(root, "nodes", n.nodeID)
+			_ = os.MkdirAll(nodeDiagDir, 0o755)
+
+			// Per-process logs are already on disk from Commit 1's teeWriter.
+			t.Logf("e2eDiag: node %s logs at %s/{node,sidecar}.log", n.nodeID, n.diagDir)
+
+			// Ring file copy + hexdump of first 4 KiB.
+			if data, err := os.ReadFile(ringSrc); err == nil {
+				_ = os.WriteFile(filepath.Join(nodeDiagDir, "oplog.ring"), data, 0o644)
+				limit := 4096
+				if len(data) < limit {
+					limit = len(data)
+				}
+				_ = os.WriteFile(
+					filepath.Join(nodeDiagDir, "oplog.ring.hexdump"),
+					[]byte(hex.Dump(data[:limit])),
+					0o644,
+				)
+			}
+
+			// Best-effort ps/lsof per PID. Processes are usually torn down by
+			// the time t.Cleanup fires (defer stop runs first); the output may
+			// be empty, but it's cheap and useful when a test fails mid-flight.
+			pids := []int{}
+			if n.cmd != nil && n.cmd.Process != nil {
+				pids = append(pids, n.cmd.Process.Pid)
+			}
+			if n.sidecarCmd != nil && n.sidecarCmd.Process != nil {
+				pids = append(pids, n.sidecarCmd.Process.Pid)
+			}
+			for _, pid := range pids {
+				if pid <= 0 {
+					continue
+				}
+				if out, err := exec.CommandContext(ctx, "ps", "-p", strconv.Itoa(pid), "-o", "pid,ppid,stat,cmd").CombinedOutput(); err == nil {
+					_ = os.WriteFile(filepath.Join(nodeDiagDir, fmt.Sprintf("ps-%d.txt", pid)), out, 0o644)
+				}
+				if out, err := exec.CommandContext(ctx, "lsof", "-p", strconv.Itoa(pid)).CombinedOutput(); err == nil {
+					_ = os.WriteFile(filepath.Join(nodeDiagDir, fmt.Sprintf("lsof-%d.txt", pid)), out, 0o644)
+				}
+			}
+		})
+	}
+
 	waitForText(t, parent, merged, "received topology push")
 	waitForText(t, parent, merged, "olric node bootstrap complete")
 	waitForText(t, parent, merged, "sidecar bootstrap complete")
@@ -1501,6 +1555,15 @@ func newHostDataScenario(t *testing.T, ctx context.Context, cfg hostDataScenario
 		memberPort: memberlistPort,
 	}
 	suite.waitForTopology()
+
+	// Scenario-level failure dump: global ps aux snapshot.
+	bundle := e2eDiagFor(t)
+	bundle.addDumper(func(ctx context.Context, root string) {
+		if out, err := exec.CommandContext(ctx, "ps", "aux").CombinedOutput(); err == nil {
+			_ = os.WriteFile(filepath.Join(root, "ps-aux.txt"), out, 0o644)
+		}
+	})
+
 	return suite
 }
 
@@ -1814,6 +1877,28 @@ func startHostWatchdogWithConfig(t *testing.T, ctx context.Context, cfg hostWatc
 	go func() {
 		_ = server.Serve(listener)
 	}()
+
+	// Register failure-dump hook: topology JSON snapshot.
+	{
+		svc := service
+		bundle := e2eDiagFor(t)
+		bundle.addDumper(func(ctx context.Context, root string) {
+			wdDiagDir := filepath.Join(root, "watchdog")
+			_ = os.MkdirAll(wdDiagDir, 0o755)
+
+			env, err := svc.GetTopology(ctx, &topologypb.TopologyQuery{StackId: "host-only"})
+			if err != nil {
+				_ = os.WriteFile(filepath.Join(wdDiagDir, "topology-error.txt"), []byte(err.Error()), 0o644)
+				return
+			}
+			data, err := protojson.Marshal(env)
+			if err != nil {
+				_ = os.WriteFile(filepath.Join(wdDiagDir, "topology-marshal-error.txt"), []byte(err.Error()), 0o644)
+				return
+			}
+			_ = os.WriteFile(filepath.Join(wdDiagDir, "topology.json"), data, 0o644)
+		})
+	}
 
 	return listener.Addr().String(), service, func() {
 		server.GracefulStop()
@@ -2149,4 +2234,100 @@ func diagDirForNode(t *testing.T, nodeID string) string {
 	d := filepath.Join(t.TempDir(), "diag", "nodes", nodeID)
 	_ = os.MkdirAll(d, 0o755)
 	return d
+}
+
+// --- e2eDiag: failure diagnostics framework ---
+
+// e2eDiagBundle collects diagnostic dumpers for one test. Each subsystem
+// (node, watchdog, mysql) registers its dumper during setup. On t.Cleanup,
+// if t.Failed(), all dumpers run and write into the test's diag root.
+type e2eDiagBundle struct {
+	mu      sync.Mutex
+	dumpers []func(ctx context.Context, root string)
+}
+
+// diagBundles is keyed by t.Name() so that subsystem helpers can locate the
+// per-test bundle without threading it through every function signature.
+var diagBundles sync.Map // map[string]*e2eDiagBundle
+
+// e2eDiagFor returns (or creates) the per-test diag bundle. The cleanup that
+// fires the dumpers is registered exactly once per test, on first call.
+func e2eDiagFor(t *testing.T) *e2eDiagBundle {
+	t.Helper()
+	if v, ok := diagBundles.Load(t.Name()); ok {
+		return v.(*e2eDiagBundle)
+	}
+	b := &e2eDiagBundle{}
+	actual, loaded := diagBundles.LoadOrStore(t.Name(), b)
+	if loaded {
+		return actual.(*e2eDiagBundle)
+	}
+	t.Cleanup(func() {
+		diagBundles.Delete(t.Name())
+		if !t.Failed() {
+			return
+		}
+		root := filepath.Join(t.TempDir(), "diag")
+		_ = os.MkdirAll(root, 0o755)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		b.mu.Lock()
+		dumpers := append([]func(ctx context.Context, root string){}, b.dumpers...)
+		b.mu.Unlock()
+		for _, d := range dumpers {
+			func() {
+				defer func() { _ = recover() }() // never let a dumper panic kill the cleanup
+				d(ctx, root)
+			}()
+		}
+		t.Logf("e2eDiag: failure diagnostics written to %s", root)
+		if dir := os.Getenv("E2E_DIAG_DIR"); dir != "" {
+			ts := time.Now().UTC().Format("20060102T150405")
+			dst := filepath.Join(dir, sanitizeTestName(t.Name()), ts)
+			if err := copyTree(root, dst); err != nil {
+				t.Logf("e2eDiag: failed to mirror to E2E_DIAG_DIR: %v", err)
+			} else {
+				t.Logf("e2eDiag: mirrored to %s", dst)
+			}
+		}
+	})
+	return b
+}
+
+func (b *e2eDiagBundle) addDumper(fn func(ctx context.Context, root string)) {
+	b.mu.Lock()
+	b.dumpers = append(b.dumpers, fn)
+	b.mu.Unlock()
+}
+
+func sanitizeTestName(name string) string {
+	return strings.NewReplacer("/", "_", " ", "_", ":", "_").Replace(name)
+}
+
+func copyTree(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(src, path)
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		in, err := os.Open(path)
+		if err != nil {
+			return nil
+		}
+		defer in.Close()
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return nil
+		}
+		out, err := os.Create(target)
+		if err != nil {
+			return nil
+		}
+		defer out.Close()
+		_, _ = io.Copy(out, in)
+		return nil
+	})
 }
