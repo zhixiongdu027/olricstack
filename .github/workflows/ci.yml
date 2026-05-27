@@ -107,11 +107,17 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Cache third-party Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-third-party-${{ hashFiles('third_party/olric/go.sum') }}
+          restore-keys: ${{ runner.os }}-go-third-party-
       - uses: actions/setup-go@v5
         with:
-          go-version-file: third_party/olric/go.mod
-          cache: true
-          cache-dependency-path: third_party/olric/go.sum
+          go-version: "1.24"
       - name: test third-party fork
         run: make test-third-party
 
@@ -175,7 +181,7 @@ jobs:
           path: .build/
       - run: chmod +x .build/*
       - name: all host e2e
-        run: go test -count=1 -tags e2e -timeout=50m -run 'TestHost(Only|DataLifecycleMatrix|DataLifecycleUnderBackgroundTraffic)' ./internal/e2e/
+        run: go test -count=1 -tags e2e -timeout=50m -run 'TestHost(Only$|DataLifecycleMatrix|DataLifecycleUnderBackgroundTraffic)' ./internal/e2e/
 
   kind-e2e-smoke:
     needs: build-and-test
@@ -222,5 +228,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: validate Dockerfile
-        run: docker build --check .
+      - name: Validate Dockerfile
+        timeout-minutes: 15
+        run: docker build .
