@@ -1,7 +1,7 @@
-.PHONY: test test-third-party e2e e2e-host e2e-kind fmt-check vet test-race test-third-party-race coverage build verify lint tidy-check govulncheck verify-pr
+.PHONY: test test-third-party e2e e2e-host e2e-host-race e2e-kind fmt-check vet test-race test-third-party-race coverage coverage-third-party build verify lint tidy-check govulncheck verify-pr
 
 test:
-	go test -count=1 ./...
+	go test -count=1 ./cmd/... ./internal/... ./api/...
 
 test-third-party:
 	cd third_party/olric && go test -p 1 -count=1 ./...
@@ -11,6 +11,9 @@ e2e:
 
 e2e-host:
 	go test -tags=e2e ./internal/e2e -run '^TestHostOnly' -count=1 -v
+
+e2e-host-race:
+	go test -tags=e2e -count=1 -race -timeout=60m ./internal/e2e -run '^TestHost' -v
 
 e2e-kind:
 	sh scripts/e2e-kind.sh
@@ -30,9 +33,14 @@ test-third-party-race:
 coverage:
 	mkdir -p .build
 	go test -coverprofile=.build/coverage.out ./cmd/... ./internal/... ./api/...
+	$(MAKE) coverage-third-party
+
+coverage-third-party:
+	cd third_party/olric && go test -p 1 -count=1 -coverprofile=../../.build/coverage-third-party.out ./...
 
 build:
-	go build ./cmd/olric-node ./cmd/olric-sidecar ./cmd/watchdog ./cmd/operator ./cmd/olric-e2e-client
+	mkdir -p .build
+	go build -o .build/ ./cmd/olric-node ./cmd/olric-sidecar ./cmd/watchdog ./cmd/operator ./cmd/olric-e2e-client
 
 verify: vet test build
 
