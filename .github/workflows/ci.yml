@@ -1,48 +1,20 @@
-name: ci
+name: CI
 
 on:
   pull_request:
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - 'LICENSE*'
-      - '**/*.png'
-      - '**/*.jpg'
-      - '**/*.svg'
-      - '.gitignore'
-      - '.editorconfig'
-      - '.vscode/**'
-      - '.idea/**'
+    paths-ignore: ['docs/**', '*.md', '*.png', '*.jpg']
   push:
-    branches:
-      - master
-      - main
-      - "harden-*"
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - 'LICENSE*'
-      - '**/*.png'
-      - '**/*.jpg'
-      - '**/*.svg'
-      - '.gitignore'
-      - '.editorconfig'
-      - '.vscode/**'
-      - '.idea/**'
+    branches: [master, main, 'harden-*']
   workflow_dispatch:
-
-permissions:
-  contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # ===================== Phase 1: Fast Checks (parallel) =====================
+
   lint:
-    name: lint
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -51,52 +23,19 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      - name: go mod tidy check
+        run: make tidy-check
+      - name: format check
+        run: make fmt-check
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
         with:
           version: v2.5.0
-          args: --timeout=5m
-          verify: false
-      - name: go mod tidy diff
-        run: |
-          if ! go mod tidy -diff; then
-            echo "go mod tidy -diff failed; falling back to tidy + git diff"
-            go mod tidy
-            git diff --exit-code go.mod go.sum
-          fi
-      - name: fmt-check
-        run: make fmt-check
-
-  unit-and-race:
-    name: unit, build, race
-    runs-on: ubuntu-latest
-    needs: [lint]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Verify
-        run: make verify
-      - name: Race tests
-        run: make test-race
-      - name: Coverage
-        run: make coverage
-      - name: Upload coverage
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-out
-          path: .build/coverage.out
 
   security:
-    name: security
     runs-on: ubuntu-latest
-    needs: [lint]
     timeout-minutes: 15
     permissions:
-      contents: read
       security-events: write
     steps:
       - uses: actions/checkout@v4
@@ -106,220 +45,66 @@ jobs:
           cache: true
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
-      - name: Run govulncheck
-        run: govulncheck ./...
-      - name: Run gosec
-        uses: securego/gosec@d4617f51baf75f4f809066386a4f9d27b3ac3e46 # v2.21.4
+      - name: govulncheck
+        run: make govulncheck
+      - name: gosec
+        uses: securego/gosec@master
         with:
-          args: '-no-fail -fmt sarif -out gosec.sarif ./...'
-      - name: Upload SARIF
+          args: '-no-fail -fmt sarif -out results.sarif ./...'
+        continue-on-error: true
+      - name: upload SARIF
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: gosec.sarif
+          sarif_file: results.sarif
 
-  integration:
-    name: integration and host smoke
+  # ===================== Phase 2: Core Tests =====================
+
+  build-and-test:
+    needs: lint
     runs-on: ubuntu-latest
-    needs: [lint]
     timeout-minutes: 30
-    services:
-      mysql:
-        image: mysql:8.4
-        env:
-          MYSQL_ROOT_PASSWORD: password
-        ports:
-          - 13306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ppassword"
-          --health-interval=3s
-          --health-timeout=3s
-          --health-retries=20
-          --health-start-period=10s
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - name: Sidecar and topology tests
-        run: |
-          go test ./internal/sidecar ./internal/topology ./internal/watchdog ./internal/node ./internal/operator ./internal/stringkv
-      - name: Host lifecycle e2e
-        env:
-          E2E_MYSQL_PORT: "13306"
-          E2E_MYSQL_USER: root
-          E2E_MYSQL_PASSWORD: password
-        run: |
-          go test -tags=e2e ./internal/e2e \
-          -run '^TestHost(OnlyMySQLDurableWritePath|OnlyWatchdogDemotionBlocksAndPromotionRestoresWrites|OnlyRestartReadsThroughMySQL|OnlyTwoNodeCRUDAndReadThroughCorrectness|OnlyTwoNodeSetWithTTLExpiresAndDoesNotReviveOnRestart)$' \
-            -count=1 -v
+      - name: build all binaries
+        run: make build
+      - name: unit tests
+        run: go test -count=1 -timeout=120s ./cmd/... ./internal/... ./api/...
+      - name: upload binaries (for e2e jobs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: .build/
+          retention-days: 1
 
-  host-e2e:
-    name: host e2e deep
+  race-and-coverage:
+    needs: lint
     runs-on: ubuntu-latest
-    needs: [lint]
-    timeout-minutes: 60
-    services:
-      mysql:
-        image: mysql:8.4
-        env:
-          MYSQL_ROOT_PASSWORD: password
-        ports:
-          - 13306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ppassword"
-          --health-interval=3s
-          --health-timeout=3s
-          --health-retries=20
-          --health-start-period=10s
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - name: Host lifecycle e2e
-        env:
-          E2E_MYSQL_PORT: "13306"
-          E2E_MYSQL_USER: root
-          E2E_MYSQL_PASSWORD: password
-        run: |
-          go test -tags=e2e ./internal/e2e \
-            -run '^TestHost(DataLifecycleMatrix|DataLifecycleUnderBackgroundTraffic|OnlyTwoNodeClusterJoinsFromWatchdogTopologyOnly|OnlyKilledNodePrunedAndReplacementRejoins|OnlyTwoNodeWriteStorm|OnlyWatchdogNetworkJitterExpiresAndRecoversLease|OnlyFiveNodeJoinCrashReplacementJitterAndStorm|OnlyRollingRestartPreservesLiveDataAndDropsExpiredData)$' \
-            -count=1 -v
-
-  kind-e2e:
-    name: kind cluster smoke
-    runs-on: ubuntu-latest
-    needs: [unit-and-race]
-    timeout-minutes: 35
-    services:
-      mysql:
-        image: mysql:8.4
-        env:
-          MYSQL_DATABASE: olric_e2e
-          MYSQL_ROOT_PASSWORD: password
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ppassword"
-          --health-interval=3s
-          --health-timeout=3s
-          --health-retries=20
-          --health-start-period=10s
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: race detector
+        run: make test-race
+      - name: coverage
+        run: make coverage
+      - name: upload coverage
+        uses: actions/upload-artifact@v4
         with:
-          go-version-file: go.mod
-          cache: true
-      - name: Install kind
-        env:
-          KIND_VERSION: v0.31.0
-        run: |
-          curl -fsSL -o kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          chmod +x kind
-          sudo mv kind /usr/local/bin/kind
-      - name: Install kubectl
-        run: |
-          KUBECTL_VERSION="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
-          curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/kubectl
-      - name: Create kind cluster
-        run: kind create cluster --name olric-e2e --wait 120s
-      - name: Run kind e2e
-        env:
-          E2E_KIND_CLUSTER: olric-e2e
-          E2E_MYSQL_PORT: "3306"
-          E2E_MYSQL_USER: root
-          E2E_MYSQL_PASSWORD: password
-          E2E_MYSQL_DATABASE: olric_e2e
-          E2E_TEST_RUN: 'TestKind(StackReconcilesThroughWatchdog|WatchdogFailoverReconnectsOlricNode|MySQLDurableWritePath)$'
-        run: make e2e-kind
-      - name: Collect kind diagnostics
-        if: failure()
-        run: |
-          mkdir -p artifacts/kind
-          kubectl --context kind-olric-e2e get pods -A -o wide > artifacts/kind/pods.txt || true
-          kubectl --context kind-olric-e2e get events -A --sort-by=.lastTimestamp > artifacts/kind/events.txt || true
-          kubectl --context kind-olric-e2e logs -n olric-system deploy/olricstack-operator --all-containers=true > artifacts/kind/operator.log || true
-          kind export logs --name olric-e2e artifacts/kind/cluster || true
-      - uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: kind-diagnostics
-          path: artifacts/kind
-
-  kind-e2e-deep:
-    name: kind cluster deep
-    runs-on: ubuntu-latest
-    needs: [unit-and-race]
-    timeout-minutes: 60
-    services:
-      mysql:
-        image: mysql:8.4
-        env:
-          MYSQL_DATABASE: olric_e2e
-          MYSQL_ROOT_PASSWORD: password
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ppassword"
-          --health-interval=3s
-          --health-timeout=3s
-          --health-retries=20
-          --health-start-period=10s
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-      - name: Install kind
-        env:
-          KIND_VERSION: v0.31.0
-        run: |
-          curl -fsSL -o kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          chmod +x kind
-          sudo mv kind /usr/local/bin/kind
-      - name: Install kubectl
-        run: |
-          KUBECTL_VERSION="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
-          curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/kubectl
-      - name: Create kind cluster
-        run: kind create cluster --name olric-e2e-deep --wait 120s
-      - name: Run kind deep e2e
-        env:
-          E2E_KIND_CLUSTER: olric-e2e-deep
-          E2E_MYSQL_PORT: "3306"
-          E2E_MYSQL_USER: root
-          E2E_MYSQL_PASSWORD: password
-          E2E_MYSQL_DATABASE: olric_e2e
-          E2E_TEST_RUN: 'TestKind'
-        run: make e2e-kind
-      - name: Collect kind diagnostics
-        if: failure()
-        run: |
-          mkdir -p artifacts/kind
-          kubectl --context kind-olric-e2e-deep get pods -A -o wide > artifacts/kind/pods.txt || true
-          kubectl --context kind-olric-e2e-deep get events -A --sort-by=.lastTimestamp > artifacts/kind/events.txt || true
-          kubectl --context kind-olric-e2e-deep logs -n olric-system deploy/olricstack-operator --all-containers=true > artifacts/kind/operator.log || true
-          kind export logs --name olric-e2e-deep artifacts/kind/cluster || true
-      - uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: kind-deep-diagnostics
-          path: artifacts/kind
+          name: coverage
+          path: .build/coverage.out
+          retention-days: 7
 
   third-party:
-    name: third party olric
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    continue-on-error: true  # TODO: pre-existing test failures in fork; unrelated to hardening branch
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -327,6 +112,115 @@ jobs:
           go-version-file: third_party/olric/go.mod
           cache: true
           cache-dependency-path: third_party/olric/go.sum
-      - name: Test fork
-        working-directory: third_party/olric
-        run: go test -count=1 ./...
+      - name: test third-party fork
+        run: make test-third-party
+
+  # ===================== Phase 3: E2E Tests =====================
+
+  host-e2e-smoke:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: olric_test
+        ports: ['3306:3306']
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: .build/
+      - run: chmod +x .build/*
+      - name: host e2e smoke
+        run: go test -count=1 -tags e2e -timeout=20m -run 'TestHostOnly(TwoNodeWriteStorm|TwoNodeClusterJoinsFromWatchdogTopologyOnly|MySQLDurableWritePath|WatchdogDemotionBlocksAndPromotionRestoresWrites)$' ./internal/e2e/
+      - name: collect diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== SIDECAR LOGS ===" && cat /tmp/olric-sidecar-*.log 2>/dev/null || true
+          echo "=== NODE LOGS ===" && cat /tmp/olric-node-*.log 2>/dev/null || true
+          echo "=== E2E DIAGNOSTICS ===" && find /tmp -name 'e2e-diag-*' -exec cat {} \; 2>/dev/null || true
+
+  host-e2e-full:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: olric_test
+        ports: ['3306:3306']
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: .build/
+      - run: chmod +x .build/*
+      - name: all host e2e
+        run: go test -count=1 -tags e2e -timeout=50m -run 'TestHost(Only|DataLifecycleMatrix|DataLifecycleUnderBackgroundTraffic)' ./internal/e2e/
+
+  kind-e2e-smoke:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: .build/
+      - run: chmod +x .build/*
+      - name: kind e2e smoke
+        run: E2E_TEST_RUN='TestKind(StackReconcilesThroughWatchdog|WatchdogFailoverReconnectsOlricNode|MySQLDurableWritePath)$' make e2e-kind
+
+  kind-e2e-full:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: .build/
+      - run: chmod +x .build/*
+      - name: all kind e2e
+        run: E2E_TEST_RUN='TestKind' make e2e-kind
+
+  # ===================== Phase 4: Docker validation =====================
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: validate Dockerfile
+        run: docker build --check .
