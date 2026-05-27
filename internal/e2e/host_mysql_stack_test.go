@@ -1090,9 +1090,19 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 	nodeBinary := cfg.binaries.nodeBinary
 	clientBinary := cfg.binaries.clientBinary
 	if nodeBinary == "" || clientBinary == "" {
-		binDir := t.TempDir()
-		nodeBinary = buildBinary(t, parent, repoRoot, filepath.Join(binDir, "olric-node"), "./cmd/olric-node", nil)
-		clientBinary = buildBinary(t, parent, repoRoot, filepath.Join(binDir, "olric-e2e-client"), "./cmd/olric-e2e-client", nil)
+		// Try pre-built binaries from CI artifacts first.
+		prebuiltNode := filepath.Join(repoRoot, ".build", "olric-node")
+		prebuiltClient := filepath.Join(repoRoot, ".build", "olric-e2e-client")
+		if _, err := os.Stat(prebuiltNode); err == nil {
+			nodeBinary = prebuiltNode
+		} else {
+			nodeBinary = buildBinary(t, parent, repoRoot, filepath.Join(t.TempDir(), "olric-node"), "./cmd/olric-node", nil)
+		}
+		if _, err := os.Stat(prebuiltClient); err == nil {
+			clientBinary = prebuiltClient
+		} else {
+			clientBinary = buildBinary(t, parent, repoRoot, filepath.Join(t.TempDir(), "olric-e2e-client"), "./cmd/olric-e2e-client", nil)
+		}
 	}
 	olricPort := mustFreeTCPPort(t)
 	memberlistPort := mustFreeTCPPort(t)
@@ -1137,7 +1147,14 @@ func startHostOlricNodeWithConfig(t *testing.T, parent context.Context, cfg host
 	ringPath := filepath.Join(sharedDir, "oplog.ring")
 	socketPath := filepath.Join(sharedDir, "oplog.sock")
 
-	sidecarBinary := buildBinary(t, parent, repoRoot, filepath.Join(t.TempDir(), "olric-sidecar"), "./cmd/olric-sidecar", nil)
+	// Try pre-built binary from CI artifacts first.
+	var sidecarBinary string
+	prebuiltSidecar := filepath.Join(repoRoot, ".build", "olric-sidecar")
+	if _, err := os.Stat(prebuiltSidecar); err == nil {
+		sidecarBinary = prebuiltSidecar
+	} else {
+		sidecarBinary = buildBinary(t, parent, repoRoot, filepath.Join(t.TempDir(), "olric-sidecar"), "./cmd/olric-sidecar", nil)
+	}
 	sidecarCmd := exec.Command(sidecarBinary)
 	sidecarCmd.Dir = repoRoot
 	sidecarCmd.Stdout = sidecarW
@@ -1916,6 +1933,24 @@ func buildBinary(t *testing.T, ctx context.Context, repoRoot, outputPath, pkg st
 		t.Fatalf("build %s: %v (%s)", pkg, err, strings.TrimSpace(string(out)))
 	}
 	return outputPath
+}
+
+func findProjectRoot() (string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	dir := wd
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("go.mod not found in any parent directory")
+		}
+		dir = parent
+	}
 }
 
 func repoRoot(t *testing.T) string {
