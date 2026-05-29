@@ -1,105 +1,50 @@
-name: nightly
+name: Nightly
 
 on:
   schedule:
     - cron: '17 2 * * *'
   workflow_dispatch:
 
-permissions:
-  contents: read
-
-concurrency:
-  group: nightly-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   actionlint:
-    name: actionlint
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Run actionlint
-        uses: docker://rhysd/actionlint:latest
-        with:
-          args: -color
+      - uses: reviewdog/action-actionlint@v1
 
-  deep-checks:
-    name: deep checks
+  deep:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     services:
       mysql:
-        image: mysql:8.4
+        image: mysql:8.0
         env:
-          MYSQL_DATABASE: olric_e2e
-          MYSQL_ROOT_PASSWORD: password
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -ppassword"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=30
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: olric_test
+        ports: ['3306:3306']
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - name: Install kind
-        env:
-          KIND_VERSION: v0.31.0
-        run: |
-          curl -fsSL -o kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          chmod +x kind
-          sudo mv kind /usr/local/bin/kind
-      - name: Install kubectl
-        run: |
-          KUBECTL_VERSION="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
-          curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/kubectl
-      - name: Create kind cluster
-        run: kind create cluster --name olric-e2e-nightly --wait 120s
-      - name: Unit race suite
+      - name: build
+        run: make build
+      - name: race detector
         run: make test-race
-      - name: Third-party race suite
+      - name: third-party race
         run: make test-third-party-race
-      - name: Coverage suite
+      - name: Host e2e (race)
+        timeout-minutes: 90
+        run: make e2e-host-race
+      - name: coverage
         run: make coverage
-      - uses: actions/upload-artifact@v4
-        with:
-          name: coverage
-          path: .build/coverage.out
-      - name: Host e2e
+      - name: host e2e (all)
         env:
-          E2E_MYSQL_PORT: "3306"
+          E2E_MYSQL_PORT: '3306'
           E2E_MYSQL_USER: root
-          E2E_MYSQL_PASSWORD: password
-        run: |
-          go test -tags=e2e ./internal/e2e \
-            -run '^TestHost(DataLifecycleMatrix|DataLifecycleUnderBackgroundTraffic|OnlyRollingRestartPreservesLiveDataAndDropsExpiredData|OnlyTwoNodeSetWithTTLExpiresAndDoesNotReviveOnRestart|OnlyTwoNodeWriteStorm|OnlyFiveNodeJoinCrashReplacementJitterAndStorm|OnlyFiveNodeConcurrentCrashJitterReplacementAndTraffic|OnlyWatchdogNetworkJitterExpiresAndRecoversLease)$' \
-            -count=1 -v
-      - name: Kind e2e
-        env:
-          E2E_KIND_CLUSTER: olric-e2e-nightly
-          E2E_MYSQL_PORT: "3306"
-          E2E_MYSQL_USER: root
-          E2E_MYSQL_PASSWORD: password
-          E2E_MYSQL_DATABASE: olric_e2e
-          E2E_TEST_RUN: 'TestKind'
-        run: make e2e-kind
-      - name: Collect kind diagnostics
-        if: failure()
-        run: |
-          mkdir -p artifacts/kind
-          kubectl --context kind-olric-e2e-nightly get pods -A -o wide > artifacts/kind/pods.txt || true
-          kubectl --context kind-olric-e2e-nightly get events -A --sort-by=.lastTimestamp > artifacts/kind/events.txt || true
-          kubectl --context kind-olric-e2e-nightly logs -n olric-system deploy/olricstack-operator --all-containers=true > artifacts/kind/operator.log || true
-          kind export logs --name olric-e2e-nightly artifacts/kind/cluster || true
-      - uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: nightly-kind-diagnostics
-          path: artifacts/kind
+          E2E_MYSQL_PASSWORD: test
+        run: go test -count=1 -tags e2e -timeout=50m -run 'TestHost' ./internal/e2e/
+      - name: kind e2e (all)
+        run: E2E_TEST_RUN='TestKind' make e2e-kind

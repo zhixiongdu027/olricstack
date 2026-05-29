@@ -1,6 +1,7 @@
 package olricstore
 
 import (
+	"errors"
 	"testing"
 
 	olricstorage "github.com/olric-data/olric/pkg/storage"
@@ -30,7 +31,7 @@ func TestEnginePutGetRoundTrip(t *testing.T) {
 func TestEngineGetReportsMissForUnknownKey(t *testing.T) {
 	t.Parallel()
 	engine := New()
-	if _, err := engine.Get(99); err != olricstorage.ErrKeyNotFound {
+	if _, err := engine.Get(99); !errors.Is(err, olricstorage.ErrKeyNotFound) {
 		t.Fatalf("expected ErrKeyNotFound, got %v", err)
 	}
 	if engine.Check(99) {
@@ -72,7 +73,7 @@ func TestEngineDeleteRemovesEntry(t *testing.T) {
 	if err := engine.Delete(9); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	if _, err := engine.Get(9); err != olricstorage.ErrKeyNotFound {
+	if _, err := engine.Get(9); !errors.Is(err, olricstorage.ErrKeyNotFound) {
 		t.Fatalf("expected miss after delete, got %v", err)
 	}
 }
@@ -107,7 +108,7 @@ func TestEngineUpdateTTLMissReturnsNotFound(t *testing.T) {
 	engine := New()
 	update := engine.NewEntry()
 	update.SetTTL(500)
-	if err := engine.UpdateTTL(11, update); err != olricstorage.ErrKeyNotFound {
+	if err := engine.UpdateTTL(11, update); !errors.Is(err, olricstorage.ErrKeyNotFound) {
 		t.Fatalf("expected ErrKeyNotFound, got %v", err)
 	}
 }

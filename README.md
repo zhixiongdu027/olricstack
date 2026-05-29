@@ -51,7 +51,10 @@ asynchronous MySQL-backed dirty-data path.
 - `CONTROL_SOCKET`: unix socket path for the sidecar control RPCs,
   default `/var/lib/olricstack/shared/oplog.sock`.
 - `RING_APPEND_BUDGET`: maximum wall time `AfterX` will retry a full
-  ring before surfacing an error, default `5s`.
+  ring before surfacing an error, default `5s`. If the in-memory
+  mutation has already succeeded and the durable publish still fails,
+  `olric-node` revokes its serving lease and shuts down instead of
+  continuing to serve potentially unlogged memory.
 - `RESP_BIND_ADDR`, `RESP_BIND_PORT`: user-facing RESP listener,
   default `0.0.0.0:3321`.
 - `RESP_DEFAULT_DMAP`: hidden internal DMap used by the user RESP API,
@@ -82,6 +85,12 @@ asynchronous MySQL-backed dirty-data path.
 - `CONSUMER_FLUSH_TIMEOUT`: deadline for a single MySQL flush call,
   default `30s`.
 - `FLUSH_BATCH_SIZE`: gorm `CreateInBatches` batch size, default `256`.
+- `MAX_PENDING_RECORDS`: optional cap for sidecar pending records. When
+  reached, the sidecar stops advancing the ring head so backpressure
+  reaches `olric-node`.
+- `MAX_PENDING_BYTES`: optional approximate cap for sidecar pending bytes.
+  This is a soft threshold because the ring cannot reject an entry after
+  `Pop`; once crossed, the sidecar stops draining more entries.
 
 `watchdog`:
 
@@ -157,6 +166,18 @@ acknowledgement returned to the RESP client.** The sidecar drains into
 MySQL on its own schedule. Pod reschedule loses any unconsumed ring
 entries; this is accepted by design.
 
+If a DMap mutation succeeds but the subsequent ring append fails, the
+node treats that as a fatal data-plane fault: it revokes its local
+serving lease and shuts down. This fail-stop rule prevents a node that
+may contain unlogged memory from continuing to serve traffic. The
+longer-term ring-as-WAL transaction design is tracked in
+[Ring-as-WAL Execution Plan](docs/ring-as-wal-execution-plan.md).
+
+Sidecar pending memory is bounded when `MAX_PENDING_RECORDS` or
+`MAX_PENDING_BYTES` is configured. Under MySQL pressure, the sidecar
+stops draining the ring instead of buffering indefinitely; the ring then
+fills and backpressures new writes before they mutate DMap memory.
+
 The fence comparator at MySQL upsert time is strict lex
 `(generation, epoch, owner_seq, writer_id)`. `writer_id` is a fresh
 per-Pod-instance UUID, so the in-memory `MemoryFenceSequencer` is safe
@@ -194,6 +215,12 @@ kubectl apply -f config/samples/olricstack.yaml
 go test ./...
 go build ./cmd/olric-node ./cmd/olric-sidecar ./cmd/watchdog ./cmd/operator
 ```
+
+GitHub Actions CI is the authoritative full validation path for this
+project. It runs unit tests, race tests, third-party fork tests, host
+e2e, kind e2e, Docker validation, security checks, and nightly deep
+suites. Local commands are useful for fast iteration, but CI is the
+release gate.
 
 Run the local gRPC e2e topology test:
 

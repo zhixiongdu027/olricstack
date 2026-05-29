@@ -7,10 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+
 	topologypb "github.com/zhixiongdu/olricstack/api/topology/v1"
 	"github.com/zhixiongdu/olricstack/internal/node"
 	"github.com/zhixiongdu/olricstack/internal/topology"
-	"google.golang.org/grpc"
 )
 
 func TestRunTopologySubscriptionReconnectsAfterPromotion(t *testing.T) {

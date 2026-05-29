@@ -19,6 +19,10 @@ import (
 
 	olric "github.com/olric-data/olric"
 	olricconfig "github.com/olric-data/olric/config"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"k8s.io/apimachinery/pkg/util/wait"
+
 	topologypb "github.com/zhixiongdu/olricstack/api/topology/v1"
 	"github.com/zhixiongdu/olricstack/internal/node"
 	"github.com/zhixiongdu/olricstack/internal/olricstore"
@@ -26,9 +30,6 @@ import (
 	"github.com/zhixiongdu/olricstack/internal/sidecar"
 	"github.com/zhixiongdu/olricstack/internal/store"
 	"github.com/zhixiongdu/olricstack/internal/stringkv"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 func main() {
@@ -62,6 +63,11 @@ func main() {
 	hookControl := &controlAdapter{client: control}
 	hook, err := stringkv.NewDurableHook(producer, hookControl, topologyLease, stringkv.NewMemoryFenceSequencer(), writerID, stringkv.Config{
 		AppendBudget: envDuration("RING_APPEND_BUDGET", 5*time.Second),
+		OnFatal: func(err error) {
+			log.Printf("fatal durable publish failure, revoking serving lease and shutting down: %v", err)
+			topologyLease.Revoke()
+			stop()
+		},
 	})
 	if err != nil {
 		log.Fatalf("create durable hook: %v", err)

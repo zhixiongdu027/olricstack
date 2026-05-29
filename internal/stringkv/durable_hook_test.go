@@ -23,10 +23,12 @@ type recordingRing struct {
 	errs      []error
 	notifyCh  chan struct{}
 	failCount int
+	capacity  uint64
+	pending   uint64
 }
 
 func newRecordingRing() *recordingRing {
-	return &recordingRing{notifyCh: make(chan struct{}, 64)}
+	return &recordingRing{notifyCh: make(chan struct{}, 64), capacity: 1 << 30}
 }
 
 func (r *recordingRing) Append(p []byte) error {
@@ -48,6 +50,18 @@ func (r *recordingRing) Append(p []byte) error {
 	default:
 	}
 	return nil
+}
+
+func (r *recordingRing) Pending() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pending
+}
+
+func (r *recordingRing) Capacity() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.capacity
 }
 
 func (r *recordingRing) snapshot() [][]byte {
@@ -481,6 +495,66 @@ func TestAppendBudgetExceededReturnsError(t *testing.T) {
 	err = hook.AfterSet(context.Background(), op, nil)
 	if err == nil || !errors.Is(err, ring.ErrRingFull) {
 		t.Fatalf("expected ring full error after budget exceeded, got %v", err)
+	}
+}
+
+func TestPublishFailureTriggersFatalOnce(t *testing.T) {
+	t.Parallel()
+	r := newRecordingRing()
+	for i := 0; i < 100; i++ {
+		r.errs = append(r.errs, ring.ErrRingFull)
+	}
+	var fatalCalls int
+	hook, err := NewDurableHook(r, &stubControl{}, fenceAt(1, 1), newFakeFenceSequencer(), "test-writer", Config{
+		AppendBudget: time.Millisecond,
+		OnFatal: func(error) {
+			fatalCalls++
+		},
+	})
+	if err != nil {
+		t.Fatalf("new hook: %v", err)
+	}
+	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+		DMap: "users", Key: "k", HKey: 1, Entry: newTestEntry("k", "v", 0, 1),
+	})
+	if err != nil {
+		t.Fatalf("before set: %v", err)
+	}
+	if err := hook.AfterSet(context.Background(), op, nil); err == nil {
+		t.Fatal("expected first publish failure")
+	}
+	if err := hook.AfterSet(context.Background(), op, nil); err == nil {
+		t.Fatal("expected second publish failure")
+	}
+	if fatalCalls != 1 {
+		t.Fatalf("expected fatal callback once, got %d", fatalCalls)
+	}
+}
+
+func TestMutationErrorDoesNotTriggerFatal(t *testing.T) {
+	t.Parallel()
+	r := newRecordingRing()
+	r.errs = []error{ring.ErrRingFull}
+	var fatalCalls int
+	hook, err := NewDurableHook(r, &stubControl{}, fenceAt(1, 1), newFakeFenceSequencer(), "test-writer", Config{
+		OnFatal: func(error) {
+			fatalCalls++
+		},
+	})
+	if err != nil {
+		t.Fatalf("new hook: %v", err)
+	}
+	op, err := hook.BeforeSet(context.Background(), olricconfig.DurableOperation{
+		DMap: "users", Key: "k", HKey: 1, Entry: newTestEntry("k", "v", 0, 1),
+	})
+	if err != nil {
+		t.Fatalf("before set: %v", err)
+	}
+	if err := hook.AfterSet(context.Background(), op, errors.New("mutation failed")); err != nil {
+		t.Fatalf("mutation error path should not publish: %v", err)
+	}
+	if fatalCalls != 0 {
+		t.Fatalf("expected no fatal callback on mutation error, got %d", fatalCalls)
 	}
 }
 

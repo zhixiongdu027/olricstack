@@ -175,6 +175,11 @@ func (p *Producer) Close() error {
 // Capacity returns the data region size in bytes.
 func (p *Producer) Capacity() uint64 { return p.m.capacity }
 
+// Pending reports the number of producer-written, consumer-unread bytes.
+func (p *Producer) Pending() uint64 {
+	return atomic.LoadUint64(p.m.tailPtr) - atomic.LoadUint64(p.m.headPtr)
+}
+
 // Append writes payload to the ring. Returns ErrRingFull if the consumer is
 // behind, or ErrPayloadTooLarge if the payload cannot fit even in an empty
 // ring.

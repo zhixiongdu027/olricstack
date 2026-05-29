@@ -26,6 +26,11 @@ Only two channels exist between `olric-node` and `olric-sidecar`:
      point. If the Pod is rescheduled, any unconsumed entries are lost.
      This is acceptable by design — durability is bounded by Pod
      lifetime.
+   - **Post-mutation append failure**: if Olric memory has already been
+     mutated but the append still fails, `olric-node` treats it as a
+     fatal data-plane fault. It revokes its local serving lease and shuts
+     down rather than continuing to serve memory that may not have an
+     oplog record.
 2. **unix-socket gRPC** (`/var/lib/olricstack/shared/oplog.sock`)
    - `Notify(pending)` — wake the consumer loop on demand.
    - `LoadFromMySQL(ref)` — miss-path read; returns pending entry first,
@@ -77,13 +82,24 @@ There is nothing on disk to recover. After Pod reschedule:
 - Stale rows in MySQL stamped by an older `(generation, epoch, writer)`
   cannot win the upsert comparator against the new write.
 
+Within a running Pod, the sidecar may stop advancing the ring head when
+its pending buffer reaches `MAX_PENDING_RECORDS` or `MAX_PENDING_BYTES`.
+This is the intended backpressure path: MySQL pressure fills sidecar
+pending, sidecar stops draining the ring, ring capacity falls, and node
+writes are rejected before mutating DMap memory.
+
+The current implementation still uses a post-mutation append. The
+formal next-step design for moving to prepared/committed ring slots is
+tracked in [Ring-as-WAL Execution Plan](ring-as-wal-execution-plan.md).
+
 ## Tests
 
 - `internal/ring`: round-trip, FIFO order, wrap-around, full back-pressure.
 - `internal/oplog`: encode/decode + version & op validation.
 - `internal/sidecar`: consumer drain, pending priority on read, partition
-  drain, purge.
+  drain, purge, bounded pending backpressure.
 - `internal/stringkv`: hook stamps fence in BeforeX, publishes to ring in
   AfterX(success), no-ops on AfterX(error), retries on transient
-  ring-full, surfaces budget-exceeded errors.
+  ring-full, surfaces budget-exceeded errors, and triggers fail-stop on
+  post-mutation publish failure.
 - `internal/watchdog`: Deployment-shaped reconcile.

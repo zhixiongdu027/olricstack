@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	olricconfig "github.com/olric-data/olric/config"
@@ -32,6 +33,8 @@ type FenceSequencer interface {
 // interface so tests can substitute a recording double.
 type RingProducer interface {
 	Append(payload []byte) error
+	Pending() uint64
+	Capacity() uint64
 }
 
 // SidecarControl is the subset of the sidecar gRPC client the hook depends on
@@ -47,8 +50,11 @@ type SidecarControl interface {
 // Invariants:
 //
 //  1. BeforeX stamps the fence (G, E) into op so VerifyAfterLock can verify
-//     it is still current after the fork acquires the fragment lock. No IPC,
-//     no WAL.
+//     it is still current after the fork acquires the fragment lock. It also
+//     pre-checks ring space by estimating the encoded oplog size and
+//     comparing against free capacity (under appendMu for accuracy).
+//     Rejects writes before the in-memory mutation when the ring is
+//     near full, holding a 64KB concurrent-write buffer.
 //
 //  2. AfterX(op, mutErr): if mutErr != nil, do nothing — there is no prepared
 //     state to roll back. If mutErr == nil, stamp the owner sequence S,
@@ -70,6 +76,8 @@ type DurableHook struct {
 	writerID     string
 	now          func() time.Time
 	appendBudget time.Duration
+	onFatal      func(error)
+	fatalCalled  atomic.Bool
 	appendMu     sync.Mutex
 }
 
@@ -80,6 +88,10 @@ type Config struct {
 	// means either success or a non-retryable error. Default: 5s.
 	AppendBudget time.Duration
 	Now          func() time.Time
+	// OnFatal is called once when a mutation has already succeeded but the
+	// durable publish path cannot record it. The node must stop serving after
+	// this point because memory may contain an unlogged value.
+	OnFatal func(error)
 }
 
 func (c Config) withDefaults() Config {
@@ -114,6 +126,7 @@ func NewDurableHook(ring RingProducer, control SidecarControl, lease FenceLease,
 		writerID:     writerID,
 		now:          cfg.Now,
 		appendBudget: cfg.AppendBudget,
+		onFatal:      cfg.OnFatal,
 	}, nil
 }
 
@@ -128,7 +141,11 @@ func (h *DurableHook) AfterSet(ctx context.Context, op olricconfig.DurableOperat
 	if mutationErr != nil {
 		return nil
 	}
-	return h.publish(ctx, op, oplog.OpSet)
+	if err := h.publish(ctx, op, oplog.OpSet); err != nil {
+		h.fatal(fmt.Errorf("durable set publish after mutation: %w", err))
+		return err
+	}
+	return nil
 }
 
 func (h *DurableHook) BeforeDelete(_ context.Context, op olricconfig.DurableOperation) (olricconfig.DurableOperation, error) {
@@ -139,7 +156,11 @@ func (h *DurableHook) AfterDelete(ctx context.Context, op olricconfig.DurableOpe
 	if mutationErr != nil {
 		return nil
 	}
-	return h.publish(ctx, op, oplog.OpDelete)
+	if err := h.publish(ctx, op, oplog.OpDelete); err != nil {
+		h.fatal(fmt.Errorf("durable delete publish after mutation: %w", err))
+		return err
+	}
+	return nil
 }
 
 func (h *DurableHook) BeforeExpire(_ context.Context, op olricconfig.DurableOperation) (olricconfig.DurableOperation, error) {
@@ -153,7 +174,20 @@ func (h *DurableHook) AfterExpire(ctx context.Context, op olricconfig.DurableOpe
 	if mutationErr != nil {
 		return nil
 	}
-	return h.publish(ctx, op, oplog.OpExpire)
+	if err := h.publish(ctx, op, oplog.OpExpire); err != nil {
+		h.fatal(fmt.Errorf("durable expire publish after mutation: %w", err))
+		return err
+	}
+	return nil
+}
+
+func (h *DurableHook) fatal(err error) {
+	if err == nil || h.onFatal == nil {
+		return
+	}
+	if h.fatalCalled.CompareAndSwap(false, true) {
+		h.onFatal(err)
+	}
 }
 
 // VerifyAfterLock re-checks that the fence stamped by BeforeX is still valid
@@ -208,6 +242,20 @@ func (h *DurableHook) DrainForHandoff(ctx context.Context, handoff olricconfig.D
 	return nil
 }
 
+// estimateOplogSize returns a conservative upper bound on the encoded
+// oplog payload size for this operation. It overestimates to avoid
+// falsely rejecting valid writes.
+func (h *DurableHook) estimateOplogSize(op olricconfig.DurableOperation) uint64 {
+	const jsonOverhead = 256 // JSON framing, field names, digits, braces
+	size := uint64(len(op.DMap)+len(op.Key)+len(h.writerID)) + jsonOverhead
+	if op.Entry != nil {
+		raw := uint64(len(op.Entry.Encode()))
+		// base64 expansion: ceil(raw/3)*4, conservatively use raw*2
+		size += raw * 2
+	}
+	return size
+}
+
 func (h *DurableHook) stamp(op olricconfig.DurableOperation) (olricconfig.DurableOperation, error) {
 	g, e, ok := h.lease.SnapshotForWrite(h.now())
 	if !ok {
@@ -215,6 +263,23 @@ func (h *DurableHook) stamp(op olricconfig.DurableOperation) (olricconfig.Durabl
 	}
 	op.FenceGeneration = g
 	op.FenceEpoch = e
+
+	// Pre-check ring space before allowing the in-memory mutation.
+	// Hold appendMu for an accurate snapshot of pending bytes and
+	// account for the estimated entry size plus a concurrent-write
+	// buffer. This prevents dirtying the in-memory engine for writes
+	// that have a high chance of failing to reach the oplog.
+	estimatedSize := h.estimateOplogSize(op)
+	h.appendMu.Lock()
+	free := h.ring.Capacity() - h.ring.Pending()
+	// Reserve room for this entry plus 64KB for concurrent writes
+	// that may slip in between this check and the actual Append.
+	const concurrentBuffer = 64 * 1024
+	if free < estimatedSize+concurrentBuffer {
+		h.appendMu.Unlock()
+		return op, ErrRingAlmostFull
+	}
+	h.appendMu.Unlock()
 	return op, nil
 }
 
@@ -285,6 +350,11 @@ func (h *DurableHook) appendWithBudget(ctx context.Context, payload []byte) erro
 // ErrRingFull is re-exported from internal/ring so callers don't need to
 // import the ring package just to test for the back-pressure condition.
 var ErrRingFull = ring.ErrRingFull
+
+// ErrRingAlmostFull is returned before mutation when the ring is near
+// capacity, so that the in-memory engine is not dirtied by a write that
+// has a high chance of failing to reach the oplog.
+var ErrRingAlmostFull = errors.New("stringkv: ring near full, rejecting write before mutation")
 
 // Compile-time guards.
 var (

@@ -63,9 +63,11 @@ func main() {
 	}()
 
 	srv, err := sidecar.NewServer(consumer, backend, sidecar.Config{
-		BatchSize:    envInt("CONSUMER_BATCH_SIZE", 256),
-		IdlePoll:     envDuration("CONSUMER_IDLE_POLL", 200*time.Millisecond),
-		FlushTimeout: envDuration("CONSUMER_FLUSH_TIMEOUT", 30*time.Second),
+		BatchSize:         envInt("CONSUMER_BATCH_SIZE", 256),
+		IdlePoll:          envDuration("CONSUMER_IDLE_POLL", 200*time.Millisecond),
+		FlushTimeout:      envDuration("CONSUMER_FLUSH_TIMEOUT", 30*time.Second),
+		MaxPendingRecords: envIntAllowZero("MAX_PENDING_RECORDS", 0),
+		MaxPendingBytes:   uint64(envIntAllowZero("MAX_PENDING_BYTES", 0)),
 	})
 	if err != nil {
 		log.Fatalf("build sidecar server: %v", err)
@@ -134,6 +136,19 @@ func envInt(name string, fallback int) int {
 	}
 	parsed, err := strconv.Atoi(value)
 	if err != nil || parsed <= 0 {
+		log.Printf("invalid %s=%q, using %d", name, value, fallback)
+		return fallback
+	}
+	return parsed
+}
+
+func envIntAllowZero(name string, fallback int) int {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
 		log.Printf("invalid %s=%q, using %d", name, value, fallback)
 		return fallback
 	}

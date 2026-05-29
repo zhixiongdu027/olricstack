@@ -419,13 +419,7 @@ func pendingSize(srv *Server) int {
 	return len(srv.pending.entries)
 }
 
-// PIN TEST for D5: sidecar pending map has no upper bound and no
-// back-pressure to the producer when MySQL is unavailable. A future fix
-// should add a cap (e.g., MaxPending in Config) plus a mechanism that
-// either drops oldest, blocks the consumer's drainRing, or signals the
-// producer to stop. When that fix lands, this test must be updated to
-// assert the new bounded behavior.
-func TestPendingGrowsUnboundedWhenMySQLFails(t *testing.T) {
+func TestPendingLimitStopsRingDrainWhenMySQLFails(t *testing.T) {
 	t.Parallel()
 	backend := newStubBackend()
 	backend.upsertErr = errors.New("mysql down")
@@ -446,9 +440,10 @@ func TestPendingGrowsUnboundedWhenMySQLFails(t *testing.T) {
 	defer cons.Close()
 
 	srv, err := NewServer(cons, backend, Config{
-		BatchSize:    256,
-		IdlePoll:     10 * time.Millisecond,
-		FlushTimeout: time.Second,
+		BatchSize:         256,
+		IdlePoll:          10 * time.Millisecond,
+		FlushTimeout:      time.Second,
+		MaxPendingRecords: 10,
 	})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
@@ -469,17 +464,12 @@ func TestPendingGrowsUnboundedWhenMySQLFails(t *testing.T) {
 		})
 	}
 
-	// Drive drainRing manually. We cannot use Run() because Run exits on
-	// the first flushOnce error and would terminate before all entries
-	// land in pending.
-	for {
-		drained, err := srv.drainRing()
-		if err != nil {
-			t.Fatalf("drain ring: %v", err)
-		}
-		if drained == 0 {
-			break
-		}
+	drained, err := srv.drainRing()
+	if err != nil {
+		t.Fatalf("drain ring: %v", err)
+	}
+	if drained != 10 {
+		t.Fatalf("expected drain to stop at pending limit 10, drained %d", drained)
 	}
 
 	flushErr := srv.flushOnce(context.Background())
@@ -490,9 +480,78 @@ func TestPendingGrowsUnboundedWhenMySQLFails(t *testing.T) {
 		t.Fatalf("expected flush error to wrap %q, got %v", backend.upsertErr, flushErr)
 	}
 
-	if got := pendingSize(srv); got != n {
-		t.Fatalf("pending map should still hold all %d entries after failed flush "+
-			"(no cap, no back-pressure); got %d. If you added bounding, update this pin test.", n, got)
+	if got := pendingSize(srv); got != 10 {
+		t.Fatalf("pending map should hold capped 10 entries after failed flush, got %d", got)
+	}
+	if got := cons.Pending(); got == 0 {
+		t.Fatalf("expected ring to retain unread entries for backpressure, pending bytes=%d", got)
+	}
+}
+
+func TestPendingByteLimitStopsAfterCrossingThreshold(t *testing.T) {
+	t.Parallel()
+	backend := newStubBackend()
+
+	path := t.TempDir() + "/ring.dat"
+	if err := ring.Create(path, 64*1024); err != nil {
+		t.Fatalf("ring create: %v", err)
+	}
+	prod, err := ring.OpenProducer(path)
+	if err != nil {
+		t.Fatalf("ring open producer: %v", err)
+	}
+	defer prod.Close()
+	cons, err := ring.OpenConsumer(path)
+	if err != nil {
+		t.Fatalf("ring open consumer: %v", err)
+	}
+	defer cons.Close()
+
+	srv, err := NewServer(cons, backend, Config{
+		BatchSize:       256,
+		IdlePoll:        10 * time.Millisecond,
+		FlushTimeout:    time.Second,
+		MaxPendingBytes: 120,
+	})
+	if err != nil {
+		t.Fatalf("new server: %v", err)
+	}
+
+	appendEntry(t, prod, oplog.Entry{
+		Op:           oplog.OpSet,
+		DMap:         "users",
+		Key:          "first",
+		HKey:         1,
+		Generation:   1,
+		Epoch:        1,
+		OwnerSeq:     1,
+		WriterID:     "node-A",
+		EncodedEntry: []byte("payload-large-enough-to-cross-soft-byte-limit"),
+	})
+	appendEntry(t, prod, oplog.Entry{
+		Op:           oplog.OpSet,
+		DMap:         "users",
+		Key:          "second",
+		HKey:         2,
+		Generation:   1,
+		Epoch:        1,
+		OwnerSeq:     2,
+		WriterID:     "node-A",
+		EncodedEntry: []byte("still-in-ring"),
+	})
+
+	drained, err := srv.drainRing()
+	if err != nil {
+		t.Fatalf("drain ring: %v", err)
+	}
+	if drained != 1 {
+		t.Fatalf("expected byte limit to stop after first accepted entry, drained %d", drained)
+	}
+	if got := pendingSize(srv); got != 1 {
+		t.Fatalf("expected one pending entry, got %d", got)
+	}
+	if got := cons.Pending(); got == 0 {
+		t.Fatal("expected second entry to remain unread in ring")
 	}
 }
 

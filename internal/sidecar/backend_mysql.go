@@ -4,9 +4,10 @@ import (
 	"context"
 	"errors"
 
-	"github.com/zhixiongdu/olricstack/internal/store"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+
+	"github.com/zhixiongdu/olricstack/internal/store"
 )
 
 // MySQLBackend adapts a gorm.DB to the Backend interface. The flusher upserts

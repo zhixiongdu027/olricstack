@@ -97,7 +97,9 @@ type Backend interface {
 // during LoadFromMySQL serve from here first to preserve read-your-write
 // after Append returned but before MySQL upsert completed.
 type pending struct {
-	mu      sync.Mutex
+	mu    sync.Mutex
+	bytes uint64
+
 	entries map[store.EntryRef]oplog.Entry
 }
 
@@ -108,7 +110,12 @@ func newPending() *pending {
 func (p *pending) put(e oplog.Entry) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.entries[store.EntryRef{DMap: e.DMap, Key: e.Key, HKey: e.HKey}] = e
+	ref := store.EntryRef{DMap: e.DMap, Key: e.Key, HKey: e.HKey}
+	if existing, ok := p.entries[ref]; ok {
+		p.bytes -= pendingEntryBytes(existing)
+	}
+	p.entries[ref] = e
+	p.bytes += pendingEntryBytes(e)
 }
 
 func (p *pending) snapshot() []oplog.Entry {
@@ -129,6 +136,7 @@ func (p *pending) drop(ref store.EntryRef, ownerSeq int64) {
 	defer p.mu.Unlock()
 	if e, ok := p.entries[ref]; ok && e.OwnerSeq <= ownerSeq {
 		delete(p.entries, ref)
+		p.bytes -= pendingEntryBytes(e)
 	}
 }
 
@@ -146,6 +154,7 @@ func (p *pending) purgeBelow(generation int64) int {
 	for ref, e := range p.entries {
 		if e.Generation < generation {
 			delete(p.entries, ref)
+			p.bytes -= pendingEntryBytes(e)
 			dropped++
 		}
 	}
@@ -168,6 +177,16 @@ func (p *pending) drainPartition(dmap string, partitionID, partitionCount uint64
 	return out
 }
 
+func (p *pending) size() (records int, bytes uint64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.entries), p.bytes
+}
+
+func pendingEntryBytes(e oplog.Entry) uint64 {
+	return uint64(len(e.DMap) + len(e.Key) + len(e.WriterID) + len(e.EncodedEntry) + 64)
+}
+
 // Server is the sidecar control RPC server plus the ring consumer loop.
 type Server struct {
 	consumer *ring.Consumer
@@ -177,9 +196,11 @@ type Server struct {
 	wakeCh chan struct{}
 	doneCh chan struct{}
 
-	batchSize    int
-	idlePoll     time.Duration
-	flushTimeout time.Duration
+	batchSize         int
+	idlePoll          time.Duration
+	flushTimeout      time.Duration
+	maxPendingRecords int
+	maxPendingBytes   uint64
 }
 
 // Config tunes consumer behavior.
@@ -187,6 +208,13 @@ type Config struct {
 	BatchSize    int
 	IdlePoll     time.Duration
 	FlushTimeout time.Duration
+	// MaxPendingRecords caps sidecar memory pending entries. When reached, the
+	// consumer stops advancing the ring head so backpressure reaches the node.
+	// Zero keeps the historical unbounded behavior.
+	MaxPendingRecords int
+	// MaxPendingBytes caps approximate pending payload bytes. Zero means
+	// unbounded by bytes.
+	MaxPendingBytes uint64
 }
 
 func (c Config) withDefaults() Config {
@@ -211,14 +239,16 @@ func NewServer(consumer *ring.Consumer, backend Backend, cfg Config) (*Server, e
 	}
 	cfg = cfg.withDefaults()
 	return &Server{
-		consumer:     consumer,
-		backend:      backend,
-		pending:      newPending(),
-		wakeCh:       make(chan struct{}, 1),
-		doneCh:       make(chan struct{}),
-		batchSize:    cfg.BatchSize,
-		idlePoll:     cfg.IdlePoll,
-		flushTimeout: cfg.FlushTimeout,
+		consumer:          consumer,
+		backend:           backend,
+		pending:           newPending(),
+		wakeCh:            make(chan struct{}, 1),
+		doneCh:            make(chan struct{}),
+		batchSize:         cfg.BatchSize,
+		idlePoll:          cfg.IdlePoll,
+		flushTimeout:      cfg.FlushTimeout,
+		maxPendingRecords: cfg.MaxPendingRecords,
+		maxPendingBytes:   cfg.MaxPendingBytes,
 	}, nil
 }
 
@@ -233,7 +263,7 @@ func (s *Server) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if drained > 0 {
+		if drained > 0 || s.pendingLen() > 0 {
 			if err := s.flushOnce(ctx); err != nil {
 				return err
 			}
@@ -258,6 +288,9 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) drainRing() (int, error) {
 	count := 0
 	for {
+		if s.pendingFull() {
+			return count, nil
+		}
 		payload, ok, err := s.consumer.Pop()
 		if err != nil {
 			return count, fmt.Errorf("ring pop: %w", err)
@@ -275,6 +308,22 @@ func (s *Server) drainRing() (int, error) {
 			return count, nil
 		}
 	}
+}
+
+func (s *Server) pendingFull() bool {
+	records, bytes := s.pending.size()
+	if s.maxPendingRecords > 0 && records >= s.maxPendingRecords {
+		return true
+	}
+	if s.maxPendingBytes > 0 && bytes >= s.maxPendingBytes {
+		return true
+	}
+	return false
+}
+
+func (s *Server) pendingLen() int {
+	records, _ := s.pending.size()
+	return records
 }
 
 func (s *Server) flushOnce(ctx context.Context) error {

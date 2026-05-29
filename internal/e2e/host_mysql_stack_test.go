@@ -985,22 +985,22 @@ func TestHostOnlyFiveNodeConcurrentCrashJitterReplacementAndTraffic(t *testing.T
 }
 
 type hostOlricNode struct {
-	nodeID       string
-	repoRoot     string
-	clientBinary string
-	bindAddr     string
-	olricPort    int
-	respPort     int
-	cmd          *exec.Cmd
-	sidecarCmd   *exec.Cmd
-	errCh        chan error
-	sidecarErrCh chan error
-	logs         *lockedBuffer
-	nodeLog       *lockedBuffer  // node stdout+stderr only, raw
-	sidecarLog    *lockedBuffer  // sidecar stdout+stderr only, raw
-	diagDir       string         // <tempdir>/diag/nodes/<nodeID>
-	nodePrefix    *prefixWriter  // for Flush on stop
-	sidecarPrefix *prefixWriter  // for Flush on stop
+	nodeID        string
+	repoRoot      string
+	clientBinary  string
+	bindAddr      string
+	olricPort     int
+	respPort      int
+	cmd           *exec.Cmd
+	sidecarCmd    *exec.Cmd
+	errCh         chan error
+	sidecarErrCh  chan error
+	logs          *lockedBuffer
+	nodeLog       *lockedBuffer // node stdout+stderr only, raw
+	sidecarLog    *lockedBuffer // sidecar stdout+stderr only, raw
+	diagDir       string        // <tempdir>/diag/nodes/<nodeID>
+	nodePrefix    *prefixWriter // for Flush on stop
+	sidecarPrefix *prefixWriter // for Flush on stop
 }
 
 type hostNodeBinaries struct {
